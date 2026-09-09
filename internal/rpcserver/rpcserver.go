@@ -31,6 +31,10 @@ func New(storage *taihu.Storage) *grpc.Server {
 		grpc.MaxSendMsgSize(chunkSize*16),
 		grpc.InitialWindowSize(4<<20),      // 4MB 流窗口（≥ 4 帧 1MiB 在途）
 		grpc.InitialConnWindowSize(64<<20), // 64MB 连接窗口（多流共享）
+		// 传输缓冲（实测热点）：syscall write 占 CPU 57%，默认 32KB 写缓冲 → 每次
+		// syscall 仅搬 32KB；放大到 1MiB 后每帧一次 syscall，大幅削减系统调用次数。
+		grpc.WriteBufferSize(1 << 20),
+		grpc.ReadBufferSize(1 << 20),
 		grpc.ForceServerCodecV2(rpc.RawCodec{}), // 数据帧裸字节透传（与 client 同步升级）
 	)
 	rpc.RegisterObjectStoreServer(gs, &server{storage: storage})
