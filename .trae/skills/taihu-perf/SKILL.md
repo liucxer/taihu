@@ -49,7 +49,9 @@ setsid nohup mpstat -P ALL 1 > /tmp/${TAG}.cpu  2>&1 &
 # 4) 磁盘回退方案 /proc/diskstats：按 dev sector 读写差 ×512 / 间隔
 ```
 
-关键坑（已踩过）：**不要**在本命令里用 `pkill -f taihu-bench.new`——它会匹配执行该命令的 shell 自身命令行并 SIGTERM 自己，导致整条命令 45ms 即被杀死。清进程改用精确 PID，或跳过 pkill。
+关键坑（均已踩过）：
+1. **不要**在本命令里用 `pkill -f taihu-bench.new`——它会匹配执行该命令的 shell 自身命令行并 SIGTERM 自己，导致整条命令 45ms 即被杀死。清进程改用精确 PID，或跳过 pkill。
+2. TOP 忙核解析：**不要**用 `sort -t= -k2` 排形如 `core=14 busy=73.1%` 的行——`-t= -k2` 的排序键是 `14 busy=...`（核号做数字前缀），会按**核号**而非 **busy** 排序，输出最大核号而非最忙核。应让行首直接是 busy 数值再 `sort -rn`。
 
 测试结束停止采样并解析：
 
@@ -57,7 +59,12 @@ setsid nohup mpstat -P ALL 1 > /tmp/${TAG}.cpu  2>&1 &
 kill $IOPID $CPUPID 2>/dev/null
 # 磁盘真实写带宽（iostat 列4=kB_wrtn/s，steady 样本求均值/峰值，剔除首行累计均值与末尾收尾样本）
 awk '/^'"$DEV"'/{k=$4/1024; if($4>0){sum+=k; n++; p=pk>k?pk:k}} END{printf "DISK_AVG=%.1fMiB DISK_PEAK=%.1fMiB SAMPLES=%d\n", sum/n, p, n}' /tmp/${TAG}.disk
-# CPU：mpstat 给出了 all 行（整机均值）与 cpu N 行；同时给出 us/sy/wa 分解与 TOP 忙核
+# CPU 整机均值：mpstat 的 all 行（$3=="all"，$NF=%idle）；usr=$4 sys=$6 iowait=$7
+awk '$3=="all"{b+=100-$NF; usr+=$4; sy+=$6; iow+=$7; n++}
+     END{printf "CPU_AVG_busy=%.1f%% idle=%.1f%% usr=%.1f%% sys=%.1f%% iowait=%.1f%%\n", b/n,100-b/n,usr/n,sy/n,iow/n}' /tmp/${TAG}.cpu
+# TOP 忙核：逐核行 $3 为核号、$NF=%idle；每核多帧求均值，行首即 busy 值再 sort -rn 取前 N
+awk '$3 ~ /^[0-9]+$/{nb[$3]+=100-$NF; nu[$3]+=$4; ni[$3]+=$7; c[$3]++}
+     END{for(k in nb) printf "%.1f core=%s usr=%.1f iowait=%.1f\n", nb[k]/c[k], k, nu[k]/c[k], ni[k]/c[k]}' /tmp/${TAG}.cpu | sort -rn | head -5
 ```
 
 ## 步骤 4：跑写测、读测
