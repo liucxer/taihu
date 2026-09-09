@@ -3,6 +3,7 @@ package taihu
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/cockroachdb/pebble"
 )
@@ -25,16 +26,18 @@ const (
 var _ store = (*pebbleStore)(nil)
 
 type pebbleStore struct {
-	db *pebble.DB
+	db    *pebble.DB
+	alloc *allocator
 }
 
 // openPebbleStore 打开 pebble DB。目录不存在时自动创建。
+// 写位置游标由内部的 allocator 在首次 AllocateSegment 时懒加载恢复，无需在启动时读取。
 func openPebbleStore(dir string) (*pebbleStore, error) {
 	db, err := pebble.Open(dir, &pebble.Options{})
 	if err != nil {
 		return nil, fmt.Errorf("taihu: open pebble %q: %w", dir, err)
 	}
-	return &pebbleStore{db: db}, nil
+	return &pebbleStore{db: db, alloc: &allocator{}}, nil
 }
 
 // syncWO 用于需要落盘持久化的写入（mapping / cursor）。
@@ -112,17 +115,71 @@ func (s *pebbleStore) IterMapping(ctx context.Context, fn func(key string, m Obj
 	return it.Error()
 }
 
-func (s *pebbleStore) GetCursor(ctx context.Context) (WriteCursor, bool, error) {
-	v, found, err := s.get(keyState([]byte(kvCursorKey)))
-	if err != nil || !found {
-		return WriteCursor{}, found, err
-	}
-	c, err := decodeWriteCursor(v)
-	return c, true, err
+// allocator 原子管理顺序写游标（curSeg/curOff）与游标持久化。持有独立锁，
+// 使「申请偏移」成为廉价原子操作，真正的设备写由调用方在锁外执行，从而支持并发写不同偏移。
+type allocator struct {
+	mu     sync.Mutex
+	db     *pebble.DB // 首次分配时从 pebbleStore 注入，persist 使用
+	curSeg int64
+	curOff int64
+
+	cursorLoaded bool // 是否已从持久化游标恢复
 }
 
-func (s *pebbleStore) PutCursor(ctx context.Context, c WriteCursor) error {
-	return s.db.Set(keyState([]byte(kvCursorKey)), c.encode(), syncWO)
+func (a *allocator) persist(ctx context.Context, seg, off int64) error {
+	return a.db.Set(keyState([]byte(kvCursorKey)), WriteCursor{SegmentID: seg, Offset: off}.encode(), syncWO)
+}
+
+// loadCursor 从持久化游标恢复写位置。游标不存在(首次)时保持 seg=0, off=0。
+func (a *allocator) loadCursor(s *pebbleStore) error {
+	v, found, err := s.get(keyState([]byte(kvCursorKey)))
+	if err != nil || !found {
+		return err
+	}
+	c, err := decodeWriteCursor(v)
+	if err != nil {
+		return err
+	}
+	a.curSeg, a.curOff = c.SegmentID, c.Offset
+	return nil
+}
+
+// AllocateSegment 原子申请 align4k(size) 的连续空间，返回 (segmentID, 段内 4K 对齐偏移)。
+// 首次调用时懒加载持久化游标；段放不下则滚动到下一段并持久化新游标；分配后推进并持久化游标。
+func (s *pebbleStore) AllocateSegment(size int64) (int64, int64, error) {
+	ctx := context.Background()
+	a := s.alloc
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.db == nil {
+		a.db = s.db
+	}
+	if !a.cursorLoaded {
+		if err := a.loadCursor(s); err != nil {
+			return 0, 0, err
+		}
+		a.cursorLoaded = true
+	}
+
+	aligned := align4k(size)
+	if a.curOff+aligned > SegmentSizeBytes {
+		a.curSeg++
+		if a.curSeg >= SegmentCount {
+			return 0, 0, ErrNoSpace
+		}
+		a.curOff = 0
+		if err := a.persist(ctx, a.curSeg, a.curOff); err != nil {
+			return 0, 0, err
+		}
+	}
+
+	seg, off := a.curSeg, a.curOff
+	a.curOff += aligned
+	if err := a.persist(ctx, seg, a.curOff); err != nil {
+		return 0, 0, err
+	}
+	return seg, off, nil
 }
 
 func (s *pebbleStore) GetSegment(ctx context.Context, segmentID int64) (SegmentMeta, bool, error) {

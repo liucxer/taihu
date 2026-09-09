@@ -3,22 +3,19 @@ package taihu
 import (
 	"context"
 	"io"
-	"sync"
 )
 
 // Storage 对外 object 存储。数据写底层裸设备，key→位置映射存 RocksDB，内存有界 LRU 缓存。
+//
+// Storage 不持有写游标状态；「申请写位置」下沉到 db（store.AllocateSegment），
+// 其内部锁只覆盖廉价的游标分配，真正的设备写在此锁外执行 → 多 Put 可并发写不同偏移。
 type Storage struct {
 	db    store
 	dev   *Device
 	cache *metaCache
-
-	// mu 串行化 Put 的「分配游标 + 写设备 + 写元数据」临界区，保证游标单调、互不覆盖。
-	mu     sync.Mutex
-	curSeg int64
-	curOff int64
 }
 
-// NewStorage 构建 Storage：打开 pebble、打开裸设备、恢复写游标。
+// NewStorage 构建 Storage：打开 pebble、打开裸设备。写游标由 db 首次分配时懒加载恢复。
 // 返回 (*Storage, error)，与 v1 文档略有出入，便于暴露初始化错误。
 func NewStorage(ctx context.Context, rocksdbDir, nvmePath string) (*Storage, error) {
 	db, err := openPebbleStore(rocksdbDir)
@@ -35,22 +32,6 @@ func NewStorage(ctx context.Context, rocksdbDir, nvmePath string) (*Storage, err
 		db:    db,
 		dev:   dev,
 		cache: &metaCache{},
-	}
-
-	cur, found, err := db.GetCursor(ctx)
-	if err != nil {
-		_ = dev.Close()
-		_ = db.Close()
-		return nil, err
-	}
-	if found {
-		s.curSeg, s.curOff = cur.SegmentID, cur.Offset
-	} else {
-		if err := db.PutCursor(ctx, WriteCursor{}); err != nil {
-			_ = dev.Close()
-			_ = db.Close()
-			return nil, err
-		}
 	}
 	return s, nil
 }
@@ -80,7 +61,8 @@ func (s *Storage) Close() error {
 }
 
 // Put 写入对象。size 由调用方提供（逻辑长度），不必预读 in 求得。
-// 顺序追加到当前 segment，写满自动切下一 segment。末尾自动补齐到 4K。
+// 先从 db 原子申请写位置（段满自动滚动），再写设备数据，最后写映射。
+// 设备写位于分配锁之外，并发 Put 可写不同偏移。
 func (s *Storage) Put(ctx context.Context, key string, size int64, in io.Reader) error {
 	if size < 0 {
 		return ErrInvalidRange
@@ -88,24 +70,11 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in io.Reader)
 	if size > SegmentSizeBytes {
 		return ErrTooLarge
 	}
-	aligned := align4k(size)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// 当前段放不下则切新段（前提：对象不大于段）。提前持久化新游标，避免崩溃回退到满段覆盖。
-	if s.curOff+aligned > SegmentSizeBytes {
-		s.curSeg++
-		if s.curSeg >= SegmentCount {
-			return ErrNoSpace
-		}
-		s.curOff = 0
-		if err := s.db.PutCursor(ctx, WriteCursor{SegmentID: s.curSeg, Offset: 0}); err != nil {
-			return err
-		}
+	seg, off, err := s.db.AllocateSegment(size)
+	if err != nil {
+		return err
 	}
-
-	seg, off := s.curSeg, s.curOff
 	if err := s.dev.append(ctx, seg, off, size, in); err != nil {
 		return err
 	}
@@ -113,11 +82,6 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in io.Reader)
 	// 顺序保证：先写设备数据，再写元数据，避免出现「有映射无数据」。
 	meta := ObjectMeta{SegmentID: seg, Offset: off, Size: size}
 	if err := s.db.PutMapping(ctx, key, meta); err != nil {
-		return err
-	}
-
-	s.curOff = off + aligned
-	if err := s.db.PutCursor(ctx, WriteCursor{SegmentID: seg, Offset: s.curOff}); err != nil {
 		return err
 	}
 	s.cache.put(key, meta)

@@ -10,8 +10,9 @@ type store interface {
 	DeleteMapping(ctx context.Context, key string) error
 	IterMapping(ctx context.Context, fn func(key string, m ObjectMeta) error) error // 遍历全部分映射
 
-	GetCursor(ctx context.Context) (WriteCursor, bool, error)
-	PutCursor(ctx context.Context, c WriteCursor) error
+	// AllocateSegment 原子申请一段连续空间，返回 (segmentID, 段内偏移)。内部管理写游标，
+	// 段写满自动滚动，返回的偏移恒 4K 对齐、单调不重叠，可并发调用。
+	AllocateSegment(size int64) (segmentID int64, offset int64, err error)
 
 	GetSegment(ctx context.Context, segmentID int64) (SegmentMeta, bool, error)
 	PutSegment(ctx context.Context, segmentID int64, m SegmentMeta) error
