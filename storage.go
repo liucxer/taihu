@@ -83,6 +83,7 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in io.Reader)
 }
 
 // Get 读取对象内 [off, off+size) 子区间。元数据由 store 内部缓存加速，命中免查 pebble。
+// 越界（off<0、size<0、off>Size、off+size>Size）返回 ErrInvalidRange。
 //
 // 对外不要求 off/size 对齐（Storage 层吸收 O_DIRECT 的 4K 对齐细节）：
 // 将物理读向下/向上对齐到 4K，仅返回请求的 [off, off+size) 区间；
@@ -93,11 +94,8 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) (io.Read
 		return nil, err
 	}
 
-	if off < 0 || size < 0 || off > meta.Size {
+	if off < 0 || size < 0 || off > meta.Size || off+size > meta.Size {
 		return nil, ErrInvalidRange
-	}
-	if size > meta.Size-off {
-		size = meta.Size - off
 	}
 
 	// 段内请求区间 [relStart, relStart+size)，向下/向上 4K 对齐出物理读区间。

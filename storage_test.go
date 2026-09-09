@@ -84,15 +84,19 @@ func TestStorageGetRange(t *testing.T) {
 		t.Fatal("aligned sub-range mismatch")
 	}
 
-	// 越界读到末尾（钳到对象结尾）
-	rc2, err := s.Get(context.Background(), "obj", int64(BlockSize), int64(4*BlockSize))
+	// 越界读（off+size > 对象结尾）返回 ErrInvalidRange
+	if _, gerr := s.Get(context.Background(), "obj", int64(BlockSize), int64(4*BlockSize)); gerr != ErrInvalidRange {
+		t.Fatalf("want ErrInvalidRange, got %v", gerr)
+	}
+	// 恰好的末尾子区间读
+	rc2, err := s.Get(context.Background(), "obj", int64(BlockSize), int64(BlockSize))
 	if err != nil {
 		t.Fatal(err)
 	}
 	got2, _ := io.ReadAll(rc2)
 	_ = rc2.Close()
 	if !bytes.Equal(got2, payload[BlockSize:]) {
-		t.Fatal("clamped range mismatch")
+		t.Fatal("tail sub-range mismatch")
 	}
 
 	// 非对齐 off/size 也能读（Storage 层吸收对齐），数据须正确
