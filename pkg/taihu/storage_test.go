@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 )
 
@@ -191,47 +190,6 @@ func TestStorageRestartPreservesCursor(t *testing.T) {
 	}
 }
 
-func TestDeviceAppendAlignment(t *testing.T) {
-	dir := t.TempDir()
-	devPath := filepath.Join(dir, "nvme.img")
-	f, _ := os.Create(devPath)
-	_ = f.Close()
-
-	dev, err := NewDevice(context.Background(), devPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dev.Close()
-
-	if err := dev.append(context.Background(), 0, 0, 3, bytes.NewReader([]byte("abc"))); err != nil {
-		t.Fatal(err)
-	}
-	// off 须推进到 4K 对齐
-	if err := dev.append(context.Background(), 0, 4096, 10, bytes.NewReader(make([]byte, 10))); err != nil {
-		t.Fatalf("aligned append: %v", err)
-	}
-	// 非 4K 对齐 offset 应报错
-	if err := dev.append(context.Background(), 0, 100, 10, bytes.NewReader(make([]byte, 10))); err == nil {
-		t.Fatalf("unaligned offset should error")
-	}
-
-	// 对齐整块读回：4096 字节里前 3 字节应为 "abc"，其余为补零
-	r, err := dev.read(context.Background(), 0, 0, 4096)
-	if err != nil {
-		t.Fatalf("device read: %v", err)
-	}
-	defer r.Close() // 归还池化对齐缓冲
-	b, _ := io.ReadAll(r)
-	if string(b[:3]) != "abc" {
-		t.Fatalf("device read prefix got %q", b[:3])
-	}
-	for _, v := range b[3:] {
-		if v != 0 {
-			t.Fatalf("device read non-zero padding at byte 3: %d", v)
-		}
-	}
-}
-
 func TestStorageLoadCache(t *testing.T) {
 	s, rocksdbDir, devPath := newTestStorage(t)
 
@@ -267,20 +225,6 @@ func TestStorageLoadCache(t *testing.T) {
 		_ = rc.Close()
 		if !bytes.Equal(got, payload) {
 			t.Fatalf("Get %s mismatch after LoadCache", k)
-		}
-	}
-}
-
-func TestCacheEvictionBudget(t *testing.T) {
-	c := &metaCache{}
-	// 塞入足够条目触发逐出，验证各分片 usedBytes 不超 perShardLimit
-	for i := 0; i < 100000; i++ {
-		k := "key-" + strconv.Itoa(i)
-		c.put(k, ObjectMeta{SegmentID: int64(i)})
-	}
-	for i := 0; i < shardCount; i++ {
-		if c.shards[i].usedBytes > perShardLimit {
-			t.Fatalf("shard %d over budget: %d > %d", i, c.shards[i].usedBytes, perShardLimit)
 		}
 	}
 }

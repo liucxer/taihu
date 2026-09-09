@@ -19,7 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/liucxer/taihu"
+	"github.com/liucxer/taihu/pkg/taihu"
 )
 
 type config struct {

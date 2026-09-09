@@ -1,4 +1,6 @@
-package taihu
+// Package layout 定义裸设备物理布局参数与对齐工具。
+// device（IO 层）与 metastore（分配层）共同依赖，故独立成包避免循环依赖。
+package layout
 
 // 裸设备物理布局参数。
 const (
@@ -10,8 +12,8 @@ const (
 	BlockSize int64 = 4096
 )
 
-// align4k 将 n 向上补齐到 BlockSize 的整数倍。
-func align4k(n int64) int64 {
+// Align4k 将 n 向上补齐到 BlockSize 的整数倍。
+func Align4k(n int64) int64 {
 	if n <= 0 {
 		return 0
 	}

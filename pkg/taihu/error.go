@@ -1,19 +1,20 @@
 package taihu
 
-import "errors"
+import "github.com/liucxer/taihu/internal/ierr"
 
-// 公共错误定义。
+// 公共错误定义（re-export internal/ierr，保证对外 API 不变）。
+// 内部各层的原始定义见 internal/ierr。
 var (
 	// ErrNotFound 表示 key 不存在。
-	ErrNotFound = errors.New("taihu: key not found")
+	ErrNotFound = ierr.ErrNotFound
 	// ErrInvalidRange 表示 Get 的读写范围非法（off<0 或 size<0）。
-	ErrInvalidRange = errors.New("taihu: invalid range")
+	ErrInvalidRange = ierr.ErrInvalidRange
 	// ErrTooLarge 表示对象超过单 segment 上限（不允许跨段）。
-	ErrTooLarge = errors.New("taihu: object too large, exceeds segment size")
+	ErrTooLarge = ierr.ErrTooLarge
 	// ErrNoSpace 表示无空闲 segment 可写。
-	ErrNoSpace = errors.New("taihu: no free segment")
+	ErrNoSpace = ierr.ErrNoSpace
 	// ErrShortWrite 表示设备实际写入字节数少于期望。
-	ErrShortWrite = errors.New("taihu: short write")
+	ErrShortWrite = ierr.ErrShortWrite
 	// ErrUnaligned 表示 Get 的 off/size 非 4K 对齐（O_DIRECT 读要求对齐）。
-	ErrUnaligned = errors.New("taihu: off and size must be 4K aligned for read")
+	ErrUnaligned = ierr.ErrUnaligned
 )

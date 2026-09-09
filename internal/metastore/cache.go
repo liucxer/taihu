@@ -1,4 +1,4 @@
-package taihu
+package metastore
 
 import (
 	"container/list"
@@ -7,8 +7,8 @@ import (
 )
 
 // 有界 LRU 元数据缓存，无锁（分片锁）设计。
-// 缓存 key → ObjectMeta；RocksDB 为真实源，本缓存为 read-through 加速层，
-// 任何时刻都可由 RocksDB 重建，淘汰/崩溃不丢失持久性。
+// 缓存 key → ObjectMeta；Pebble 为真实源，本缓存为 read-through 加速层，
+// 任何时刻都可由 Pebble 重建，淘汰/崩溃不丢失持久性。
 
 const (
 	// shardCount 分片数（2 的幂，用于取模）。

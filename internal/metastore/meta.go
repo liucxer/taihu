@@ -1,4 +1,4 @@
-package taihu
+package metastore
 
 import (
 	"encoding/binary"
@@ -11,10 +11,10 @@ import (
 // 每个 value 头部预留 1 字节 version（当前为 0），便于版本演进。
 
 const (
-	metaVersion      = byte(0)
-	objectMetaLen    = 1 + 8*3 // version + SegmentID + Offset + Size
-	writeCursorLen   = 1 + 8*2 // version + SegmentID + Offset
-	segmentMetaLen   = 1 + 1 + 8*2 // version + State + AliveCount + ReclaimSeq
+	metaVersion    = byte(0)
+	objectMetaLen  = 1 + 8*3    // version + SegmentID + Offset + Size
+	writeCursorLen = 1 + 8*2    // version + SegmentID + Offset
+	segmentMetaLen = 1 + 1 + 8*2 // version + State + AliveCount + ReclaimSeq
 )
 
 // ObjectMeta 存放在 mapping 列族：key = 用户 key。

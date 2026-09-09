@@ -37,7 +37,7 @@ SHA=$(git rev-parse --short HEAD)   # 作为后续包名与构建标识
 
 ```bash
 SHA=$(git rev-parse --short HEAD)
-PKG="taihu.${SHA}.tar.gz"
+PKG="dist/taihu.${SHA}.tar.gz"   # 打包产物统一收敛到 dist/，避免污染仓库一级目录
 git ls-files -z | tar --null -czf "$PKG" -T -
 ```
 
@@ -54,10 +54,10 @@ DIST=/tmp/taihu-src
 BIN=/tmp/taihu-bench.new
 
 curl -s --max-time 120 -X PUT -T "$PKG" -H "X-Token: $TOKEN" \
-  "http://$NODE:9527/upload?path=/tmp/$PKG"
+  "http://$NODE:9527/upload?path=/tmp/$(basename "$PKG")"
 
 curl -s -G -H "X-Token: $TOKEN" "http://$NODE:9527/exec" \
-  --data-urlencode "cmd=rm -rf $DIST && mkdir -p $DIST && tar -xzf /tmp/$PKG -C $DIST && cd $DIST && export PATH=/usr/local/go/bin:\$PATH && go build -o $BIN ./cmd/taihu-bench && echo BUILD_ALL_DONE" \
+  --data-urlencode "cmd=rm -rf $DIST && mkdir -p $DIST && tar -xzf /tmp/$(basename "$PKG") -C $DIST && cd $DIST && export PATH=/usr/local/go/bin:\$PATH && go build -o $BIN ./cmd/taihu-bench && echo BUILD_ALL_DONE" \
   --data-urlencode "timeout=280"
 ```
 

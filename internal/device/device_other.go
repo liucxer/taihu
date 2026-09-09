@@ -1,6 +1,6 @@
 //go:build !linux
 
-package taihu
+package device
 
 import (
 	"context"
@@ -13,9 +13,9 @@ func openDevice(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_RDWR|os.O_SYNC, 0)
 }
 
-// read 读取 segmentID 段、段内 offset 起 size 字节的只读流。
+// Read 读取 segmentID 段、段内 offset 起 size 字节的只读流。
 // 非 Linux 平台为 byte 级随机读，无需对齐，也不池化缓冲。
-func (d *Device) read(ctx context.Context, segmentID, off, size int64) (io.ReadCloser, error) {
+func (d *Device) Read(ctx context.Context, segmentID, off, size int64) (io.ReadCloser, error) {
 	pos := d.segmentBase(segmentID) + off
 	return io.NopCloser(io.NewSectionReader(d.f, pos, size)), nil
 }

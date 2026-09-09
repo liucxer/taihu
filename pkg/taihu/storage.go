@@ -3,26 +3,30 @@ package taihu
 import (
 	"context"
 	"io"
+
+	"github.com/liucxer/taihu/internal/device"
+	"github.com/liucxer/taihu/internal/layout"
+	"github.com/liucxer/taihu/internal/metastore"
 )
 
-// Storage 对外 object 存储。数据写底层裸设备，key→位置映射经由 store（kv_pebble）持久化，
+// Storage 对外 object 存储。数据写底层裸设备，key→位置映射经由 metastore（pebble）持久化，
 // 其内部自带元数据加速缓存；Storage 不感知缓存细节。
 //
-// Storage 不持有写游标状态；「申请写位置」下沉到 db（store.AllocateSegment），
+// Storage 不持有写游标状态；「申请写位置」下沉到 db（metastore.Store.AllocateSegment），
 // 其内部锁只覆盖廉价的游标分配，真正的设备写在此锁外执行 → 多 Put 可并发写不同偏移。
 type Storage struct {
-	db  store
-	dev *Device
+	db  metastore.Store
+	dev *device.Device
 }
 
 // NewStorage 构建 Storage：打开 pebble、打开裸设备。写游标由 db 首次分配时懒加载恢复。
 // 返回 (*Storage, error)，与 v1 文档略有出入，便于暴露初始化错误。
 func NewStorage(ctx context.Context, rocksdbDir, nvmePath string) (*Storage, error) {
-	db, err := openPebbleStore(rocksdbDir)
+	db, err := metastore.Open(rocksdbDir)
 	if err != nil {
 		return nil, err
 	}
-	dev, err := NewDevice(ctx, nvmePath)
+	dev, err := device.NewDevice(ctx, nvmePath)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -35,13 +39,13 @@ func NewStorage(ctx context.Context, rocksdbDir, nvmePath string) (*Storage, err
 	return s, nil
 }
 
-// LoadCache 预热 store（kv_pebble）内部的元数据加速缓存。用于 bench / 已知 key 集合场景，
+// LoadCache 预热 store（metastore）内部的元数据加速缓存。用于 bench / 已知 key 集合场景，
 // 消除 GetMapping 的未命中回查，从而测纯设备读写带宽。
 func (s *Storage) LoadCache(ctx context.Context) error {
 	return s.db.LoadCache(ctx)
 }
 
-// Close 关闭底层设备与 RocksDB。失败时合并返回首个错误。
+// Close 关闭底层设备与 pebble。失败时合并返回首个错误。
 func (s *Storage) Close() error {
 	var err error
 	if s.dev != nil {
@@ -62,7 +66,7 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in io.Reader)
 	if size < 0 {
 		return ErrInvalidRange
 	}
-	if size > SegmentSizeBytes {
+	if size > layout.SegmentSizeBytes {
 		return ErrTooLarge
 	}
 
@@ -70,7 +74,7 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in io.Reader)
 	if err != nil {
 		return err
 	}
-	if err := s.dev.append(ctx, seg, off, size, in); err != nil {
+	if err := s.dev.Append(ctx, seg, off, size, in); err != nil {
 		return err
 	}
 
@@ -100,10 +104,10 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) (io.Read
 
 	// 段内请求区间 [relStart, relStart+size)，向下/向上 4K 对齐出物理读区间。
 	relStart := meta.Offset + off
-	dstart := relStart &^ (BlockSize - 1)
-	dlen := align4k(relStart+size) - dstart
+	dstart := relStart &^ (layout.BlockSize - 1)
+	dlen := layout.Align4k(relStart+size) - dstart
 
-	r, err := s.dev.read(ctx, meta.SegmentID, dstart, dlen)
+	r, err := s.dev.Read(ctx, meta.SegmentID, dstart, dlen)
 	if err != nil {
 		return nil, err
 	}

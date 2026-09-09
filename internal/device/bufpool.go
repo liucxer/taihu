@@ -1,4 +1,4 @@
-package taihu
+package device
 
 import (
 	"math/bits"
@@ -6,14 +6,14 @@ import (
 )
 
 // 对齐缓冲池：按 2 的幂分桶（4KB~8GB），复用 O_DIRECT 读/写所需的 4K 对齐堆缓冲，
-// 消除读路径每次 make 大块缓冲带来的高频堆分配与 GC 压力
+// 消除每次 make 大块缓冲带来的高频堆分配与 GC 压力
 // （见 doc/461d092 读性能测试报告 §6.1：读路径 GC 热点 gcDrain ~64%）。
 //
 // 约定：
 //   - get 返回 4K 对齐、len>=n 的切片，len 为 2 的幂（分桶容量）；
 //   - put 必须原样归还 get 返回的切片（未 reslice），按 len 回到原桶。
 const (
-	// logBlockSize = log2(4096) = 12，O_DIRECT 对齐粒度。
+	// logBlockSize = log2(4096) = 12，O_DIRECT 对齐粒度（与 layout.BlockSize 一致）。
 	logBlockSize = 12
 	// maxBufBucket 覆盖到 2^33 = 8GB >= SegmentSizeBytes。
 	maxBufBucket = logBlockSize + 21 // 33，8GB

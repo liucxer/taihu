@@ -1,4 +1,4 @@
-package taihu
+package metastore
 
 import (
 	"context"
@@ -6,9 +6,12 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/pebble"
+
+	"github.com/liucxer/taihu/internal/ierr"
+	"github.com/liucxer/taihu/internal/layout"
 )
 
-// pebbleStore 基于 CockroachDB pebble（纯 Go LSM）实现 store。
+// pebbleStore 基于 CockroachDB pebble（纯 Go LSM）实现 Store。
 //
 // pebble 为单 keyspace、无列族；此处用 key 前缀隔离两个逻辑命名空间：
 //   - kvPrefixMapping：mapping（用户 key → ObjectMeta）
@@ -23,7 +26,7 @@ const (
 	kvPrefixState   = "s\x00"
 )
 
-var _ store = (*pebbleStore)(nil)
+var _ Store = (*pebbleStore)(nil)
 
 type pebbleStore struct {
 	db    *pebble.DB
@@ -31,9 +34,9 @@ type pebbleStore struct {
 	cache *metaCache // 加速层：mapping 的读缓存（read-through），pebble 仍为真实源
 }
 
-// openPebbleStore 打开 pebble DB。目录不存在时自动创建。
+// Open 打开 pebble DB。目录不存在时自动创建。
 // 写位置游标由内部的 allocator 在首次 AllocateSegment 时懒加载恢复，无需在启动时读取。
-func openPebbleStore(dir string) (*pebbleStore, error) {
+func Open(dir string) (Store, error) {
 	db, err := pebble.Open(dir, &pebble.Options{})
 	if err != nil {
 		return nil, fmt.Errorf("taihu: open pebble %q: %w", dir, err)
@@ -83,7 +86,7 @@ func (s *pebbleStore) GetMapping(ctx context.Context, key string) (ObjectMeta, e
 		return ObjectMeta{}, err
 	}
 	if !found {
-		return ObjectMeta{}, ErrNotFound
+		return ObjectMeta{}, ierr.ErrNotFound
 	}
 	m, err := decodeObjectMeta(v)
 	if err != nil {
@@ -172,7 +175,7 @@ func (a *allocator) loadCursor(s *pebbleStore) error {
 	return nil
 }
 
-// AllocateSegment 原子申请 align4k(size) 的连续空间，返回 (segmentID, 段内 4K 对齐偏移)。
+// AllocateSegment 原子申请 layout.Align4k(size) 的连续空间，返回 (segmentID, 段内 4K 对齐偏移)。
 // 首次调用时懒加载持久化游标；段放不下则滚动到下一段并持久化新游标；分配后推进并持久化游标。
 func (s *pebbleStore) AllocateSegment(size int64) (int64, int64, error) {
 	ctx := context.Background()
@@ -190,11 +193,11 @@ func (s *pebbleStore) AllocateSegment(size int64) (int64, int64, error) {
 		a.cursorLoaded = true
 	}
 
-	aligned := align4k(size)
-	if a.curOff+aligned > SegmentSizeBytes {
+	aligned := layout.Align4k(size)
+	if a.curOff+aligned > layout.SegmentSizeBytes {
 		a.curSeg++
-		if a.curSeg >= SegmentCount {
-			return 0, 0, ErrNoSpace
+		if a.curSeg >= layout.SegmentCount {
+			return 0, 0, ierr.ErrNoSpace
 		}
 		a.curOff = 0
 		if err := a.persist(ctx, a.curSeg, a.curOff); err != nil {
