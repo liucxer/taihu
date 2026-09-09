@@ -13,6 +13,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -160,6 +162,7 @@ func main() {
 		addr = flag.String("addr", ":50051", "listen address")
 		db   = flag.String("db", "", "pebble metadata directory (required)")
 		dev  = flag.String("dev", "", "raw device path (required)")
+		pprofAddr = flag.String("pprof", "", "pprof http listen address (e.g. :6060), disabled if empty")
 	)
 	flag.Parse()
 	if *db == "" || *dev == "" {
@@ -182,10 +185,20 @@ func main() {
 		// 流控参数（设计文档_v3 §4.3）：消息上限 ≥ chunk，窗口放大提升并发流吞吐
 		grpc.MaxRecvMsgSize(chunkSize*16),
 		grpc.MaxSendMsgSize(chunkSize*16),
-		grpc.InitialWindowSize(1<<20), // 1MB 流窗口
+		grpc.InitialWindowSize(1<<20),     // 1MB 流窗口
 		grpc.InitialConnWindowSize(4<<20), // 4MB 连接窗口
 	)
 	rpc.RegisterObjectStoreServer(gs, &server{storage: storage})
+
+	// 可选的 pprof 端点（仅压测/排查用，默认关闭），例：-pprof :6060
+	if *pprofAddr != "" {
+		go func() {
+			log.Printf("pprof listening on %s", *pprofAddr)
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+				log.Printf("pprof serve: %v", err)
+			}
+		}()
+	}
 
 	go func() {
 		sig := make(chan os.Signal, 1)
