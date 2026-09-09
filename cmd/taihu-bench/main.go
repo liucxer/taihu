@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime/pprof"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -30,6 +31,9 @@ type config struct {
 	dbDir       string
 	devPath     string
 	reportEvery time.Duration
+	latency     bool
+	cpuProfile  string
+	memProfile  string
 }
 
 func parseFlags() *config {
@@ -42,6 +46,9 @@ func parseFlags() *config {
 	flag.StringVar(&c.dbDir, "db", "", "pebble metadata directory")
 	flag.StringVar(&c.devPath, "dev", "", "raw device path")
 	flag.DurationVar(&c.reportEvery, "report-interval", 2*time.Second, "progress report interval")
+	flag.BoolVar(&c.latency, "latency", false, "record per-op latency (write and read)")
+	flag.StringVar(&c.cpuProfile, "cpuprofile", "", "write cpu profile to this file (pprof)")
+	flag.StringVar(&c.memProfile, "memprofile", "", "write memory profile to this file (pprof)")
 	flag.Parse()
 	return c
 }
@@ -54,8 +61,25 @@ func main() {
 	}
 
 	ctx := context.Background()
+
+	// pprof cpu profile
+	var cpuFile *os.File
+	if c.cpuProfile != "" {
+		var err error
+		cpuFile, err = os.Create(c.cpuProfile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cpuprofile: %v\n", err)
+			os.Exit(1)
+		}
+		if err := pprof.StartCPUProfile(cpuFile); err != nil {
+			fmt.Fprintf(os.Stderr, "StartCPUProfile: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	s, err := taihu.NewStorage(ctx, c.dbDir, c.devPath)
 	if err != nil {
+		stopCPUProfile(cpuFile)
 		fmt.Fprintf(os.Stderr, "NewStorage: %v\n", err)
 		os.Exit(1)
 	}
@@ -95,7 +119,33 @@ func main() {
 		os.Exit(1)
 	}
 
+	stopCPUProfile(cpuFile)
+	writeMemProfile(c)
+
 	report(c, ops.Load(), lat, elapsed)
+}
+
+// stopCPUProfile 结束 CPU profile（若开启了）。
+func stopCPUProfile(cpuFile *os.File) {
+	if cpuFile == nil {
+		return
+	}
+	pprof.StopCPUProfile()
+	_ = cpuFile.Close()
+}
+
+// writeMemProfile 若指定了 -memprofile，写入内存 profile。
+func writeMemProfile(c *config) {
+	if c.memProfile == "" {
+		return
+	}
+	f, err := os.Create(c.memProfile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "memprofile: %v\n", err)
+		return
+	}
+	defer func() { _ = f.Close() }()
+	_ = pprof.WriteHeapProfile(f)
 }
 
 func (c *config) validate() error {
@@ -143,6 +193,7 @@ func runWorker(ctx context.Context, s *taihu.Storage, c *config, s0, e0 int, ops
 	}
 	for k := s0; k < e0; k++ {
 		key := c.keyFor(k)
+		t0 := time.Now()
 		var err error
 		switch c.mode {
 		case "write":
@@ -153,6 +204,9 @@ func runWorker(ctx context.Context, s *taihu.Storage, c *config, s0, e0 int, ops
 			if err == nil && n != c.size {
 				err = fmt.Errorf("key %s: short read %d != %d", key, n, c.size)
 			}
+		}
+		if c.latency {
+			lat.add(time.Since(t0))
 		}
 		if err != nil {
 			return err
@@ -189,11 +243,11 @@ func readWhole(ctx context.Context, s *taihu.Storage, key string, size int64, la
 
 // progress 周期性打印已完成 op 数。
 type progress struct {
-	ops     *atomic.Int64
-	total   int
-	every   time.Duration
-	stopCh  chan struct{}
-	doneCh  chan struct{}
+	ops    *atomic.Int64
+	total  int
+	every  time.Duration
+	stopCh chan struct{}
+	doneCh chan struct{}
 }
 
 func newProgress(ops *atomic.Int64, total int, every time.Duration) *progress {
@@ -251,7 +305,7 @@ func report(c *config, done int64, lat *latencyCollector, elapsed time.Duration)
 	fmt.Printf("size=%d threads=%d count=%d\n", c.size, c.threads, c.count)
 	fmt.Printf("objects=%d bytes=%d elapsed=%s\n", done, totalBytes, elapsed.Round(time.Millisecond))
 	fmt.Printf("throughput: %8.2f ops/s  %8.2f MiB/s\n", opsPerSec, bw)
-	if c.mode == "read" {
+	if c.latency {
 		lat.mu.Lock()
 		vals := make([]time.Duration, len(lat.vals))
 		copy(vals, lat.vals)
