@@ -28,6 +28,7 @@ var _ store = (*pebbleStore)(nil)
 type pebbleStore struct {
 	db    *pebble.DB
 	alloc *allocator
+	cache *metaCache // 加速层：mapping 的读缓存（read-through），pebble 仍为真实源
 }
 
 // openPebbleStore 打开 pebble DB。目录不存在时自动创建。
@@ -37,7 +38,7 @@ func openPebbleStore(dir string) (*pebbleStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("taihu: open pebble %q: %w", dir, err)
 	}
-	return &pebbleStore{db: db, alloc: &allocator{}}, nil
+	return &pebbleStore{db: db, alloc: &allocator{}, cache: &metaCache{}}, nil
 }
 
 // syncWO 用于需要落盘持久化的写入（mapping / cursor）。
@@ -72,7 +73,11 @@ func (s *pebbleStore) get(key []byte) ([]byte, bool, error) {
 	return data, true, nil
 }
 
+// GetMapping 读 mapping，缓存命中直接返回；未命中回查 pebble 并回填缓存。
 func (s *pebbleStore) GetMapping(ctx context.Context, key string) (ObjectMeta, error) {
+	if m, ok := s.cache.get(key); ok {
+		return m, nil
+	}
 	v, found, err := s.get(keyMapping(key))
 	if err != nil {
 		return ObjectMeta{}, err
@@ -80,15 +85,38 @@ func (s *pebbleStore) GetMapping(ctx context.Context, key string) (ObjectMeta, e
 	if !found {
 		return ObjectMeta{}, ErrNotFound
 	}
-	return decodeObjectMeta(v)
+	m, err := decodeObjectMeta(v)
+	if err != nil {
+		return ObjectMeta{}, err
+	}
+	s.cache.put(key, m)
+	return m, nil
 }
 
+// PutMapping 写 mapping，写穿：pebble 成功后回填缓存。
 func (s *pebbleStore) PutMapping(ctx context.Context, key string, m ObjectMeta) error {
-	return s.db.Set(keyMapping(key), m.encode(), syncWO)
+	if err := s.db.Set(keyMapping(key), m.encode(), syncWO); err != nil {
+		return err
+	}
+	s.cache.put(key, m)
+	return nil
 }
 
+// DeleteMapping 删除 mapping，并失效缓存条目。
 func (s *pebbleStore) DeleteMapping(ctx context.Context, key string) error {
-	return s.db.Delete(keyMapping(key), syncWO)
+	if err := s.db.Delete(keyMapping(key), syncWO); err != nil {
+		return err
+	}
+	s.cache.del(key)
+	return nil
+}
+
+// LoadCache 预热加速缓存：全量扫描 mapping 命名空间回填，受同一 LRU 预算约束。
+func (s *pebbleStore) LoadCache(ctx context.Context) error {
+	return s.IterMapping(ctx, func(key string, m ObjectMeta) error {
+		s.cache.put(key, m)
+		return nil
+	})
 }
 
 // IterMapping 以 mapping 前缀区间顺序遍历全部 key → ObjectMeta。

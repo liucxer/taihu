@@ -5,14 +5,14 @@ import (
 	"io"
 )
 
-// Storage 对外 object 存储。数据写底层裸设备，key→位置映射存 RocksDB，内存有界 LRU 缓存。
+// Storage 对外 object 存储。数据写底层裸设备，key→位置映射经由 store（kv_pebble）持久化，
+// 其内部自带元数据加速缓存；Storage 不感知缓存细节。
 //
 // Storage 不持有写游标状态；「申请写位置」下沉到 db（store.AllocateSegment），
 // 其内部锁只覆盖廉价的游标分配，真正的设备写在此锁外执行 → 多 Put 可并发写不同偏移。
 type Storage struct {
-	db    store
-	dev   *Device
-	cache *metaCache
+	db  store
+	dev *Device
 }
 
 // NewStorage 构建 Storage：打开 pebble、打开裸设备。写游标由 db 首次分配时懒加载恢复。
@@ -29,21 +29,16 @@ func NewStorage(ctx context.Context, rocksdbDir, nvmePath string) (*Storage, err
 	}
 
 	s := &Storage{
-		db:    db,
-		dev:   dev,
-		cache: &metaCache{},
+		db:  db,
+		dev: dev,
 	}
 	return s, nil
 }
 
-// LoadCache 预热元数据缓存：全量扫描 mapping 命名空间，把 key→ObjectMeta 载入内存缓存。
-// 受同一 LRU 预算约束（超 1GB 自动逐出）。用于 bench / 已知 key 集合场景，
-// 消除 Get 的元数据未命中回查，从而测纯设备读写带宽。
+// LoadCache 预热 store（kv_pebble）内部的元数据加速缓存。用于 bench / 已知 key 集合场景，
+// 消除 GetMapping 的未命中回查，从而测纯设备读写带宽。
 func (s *Storage) LoadCache(ctx context.Context) error {
-	return s.db.IterMapping(ctx, func(key string, m ObjectMeta) error {
-		s.cache.put(key, m)
-		return nil
-	})
+	return s.db.LoadCache(ctx)
 }
 
 // Close 关闭底层设备与 RocksDB。失败时合并返回首个错误。
@@ -84,24 +79,18 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in io.Reader)
 	if err := s.db.PutMapping(ctx, key, meta); err != nil {
 		return err
 	}
-	s.cache.put(key, meta)
 	return nil
 }
 
-// Get 读取对象内 [off, off+size) 子区间。命中缓存则免查 pebble。
+// Get 读取对象内 [off, off+size) 子区间。元数据由 store 内部缓存加速，命中免查 pebble。
 //
 // 对外不要求 off/size 对齐（Storage 层吸收 O_DIRECT 的 4K 对齐细节）：
 // 将物理读向下/向上对齐到 4K，仅返回请求的 [off, off+size) 区间；
 // off、size 恰为 4K 对齐时对齐段与请求段重合，零额外读取开销。
 func (s *Storage) Get(ctx context.Context, key string, off, size int64) (io.ReadCloser, error) {
-	meta, ok := s.cache.get(key)
-	if !ok {
-		var err error
-		meta, err = s.db.GetMapping(ctx, key)
-		if err != nil {
-			return nil, err
-		}
-		s.cache.put(key, meta)
+	meta, err := s.db.GetMapping(ctx, key)
+	if err != nil {
+		return nil, err
 	}
 
 	if off < 0 || size < 0 || off > meta.Size {
@@ -114,7 +103,7 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) (io.Read
 	// 段内请求区间 [relStart, relStart+size)，向下/向上 4K 对齐出物理读区间。
 	relStart := meta.Offset + off
 	dstart := relStart &^ (BlockSize - 1)
-	dlen := align4k(relStart + size) - dstart
+	dlen := align4k(relStart+size) - dstart
 
 	r, err := s.dev.read(ctx, meta.SegmentID, dstart, dlen)
 	if err != nil {
@@ -128,15 +117,11 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) (io.Read
 	return io.NopCloser(io.LimitReader(r, size)), nil
 }
 
-// Delete 删除对象的持久化映射与缓存。物理空间回收留待 segment 级 GC。
+// Delete 删除对象的持久化映射。缓存失效由 store 内部处理。物理空间回收留待 segment 级 GC。
 // key 不存在时返回 ErrNotFound。
 func (s *Storage) Delete(ctx context.Context, key string) error {
 	if _, err := s.db.GetMapping(ctx, key); err != nil {
 		return err
 	}
-	if err := s.db.DeleteMapping(ctx, key); err != nil {
-		return err
-	}
-	s.cache.del(key)
-	return nil
+	return s.db.DeleteMapping(ctx, key)
 }
