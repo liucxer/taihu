@@ -11,6 +11,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/layout"
 )
 
@@ -32,18 +33,17 @@ func (d *Device) Read(ctx context.Context, segmentID, off, size int64) (io.ReadC
 	if size == 0 {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
-	buf := bufPool.get(int(size))
+	buf := bufpool.Get(int(size))
 	n, err := d.f.ReadAt(buf[:size], pos)
 	if err != nil && !errorsIsEOF(err) {
-		bufPool.put(buf)
+		bufpool.Put(buf)
 		return nil, err
 	}
-	return &pooledBufReader{pool: bufPool, buf: buf, r: bytes.NewReader(buf[:n])}, nil
+	return &pooledBufReader{buf: buf, r: bytes.NewReader(buf[:n])}, nil
 }
 
 // pooledBufReader 持有从池取出的对齐缓冲，Read 透传 bytes.Reader，Close 时归还缓冲。
 type pooledBufReader struct {
-	pool *alignedBufPool
 	buf  []byte
 	r    *bytes.Reader
 	once sync.Once
@@ -54,7 +54,7 @@ func (r *pooledBufReader) Read(p []byte) (int, error) { return r.r.Read(p) }
 func (r *pooledBufReader) Close() error {
 	r.once.Do(func() {
 		if r.buf != nil {
-			r.pool.put(r.buf)
+			bufpool.Put(r.buf)
 			r.buf = nil
 		}
 	})

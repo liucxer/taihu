@@ -13,8 +13,8 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"unsafe"
 
+	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/layout"
 )
@@ -69,8 +69,8 @@ func (d *Device) Append(ctx context.Context, segmentID, off, size int64, data io
 	}
 
 	pos := d.segmentBase(segmentID) + off
-	buf := bufPool.get(int(aligned))
-	defer bufPool.put(buf) // WriteAt 是同步落盘（O_DIRECT），返回后缓冲即可复用
+	buf := bufpool.Get(int(aligned))
+	defer bufpool.Put(buf) // WriteAt 是同步落盘（O_DIRECT），返回后缓冲即可复用
 	if _, err := io.ReadFull(data, buf[:size]); err != nil {
 		return fmt.Errorf("taihu: append short read: %w", err)
 	}
@@ -96,15 +96,4 @@ func (d *Device) Append(ctx context.Context, segmentID, off, size int64, data io
 func (d *Device) Delete(ctx context.Context, segmentID int64) error {
 	_ = segmentID
 	return nil
-}
-
-// alignedBuffer 返回长度 n 且首地址按 layout.BlockSize 对齐的字节切片，
-// 以满足 O_DIRECT 的缓冲对齐要求。多分配 BlockSize 用于对齐回退并切回正确长度。
-func alignedBuffer(n int) []byte {
-	backing := make([]byte, n+int(layout.BlockSize))
-	start := int(uintptr(unsafe.Pointer(&backing[0])) % uintptr(layout.BlockSize))
-	if start != 0 {
-		start = int(layout.BlockSize) - start
-	}
-	return backing[start : start+n]
 }

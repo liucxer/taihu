@@ -137,3 +137,13 @@ func (s *Storage) Delete(ctx context.Context, key string) error {
 	}
 	return s.db.DeleteMapping(ctx, key)
 }
+
+// Stat 返回对象逻辑大小。远程层（taihu-server）Get size=-1 全量读等场景使用。
+// key 不存在时返回 ErrNotFound。
+func (s *Storage) Stat(ctx context.Context, key string) (int64, error) {
+	meta, err := s.db.GetMapping(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+	return meta.Size, nil
+}
