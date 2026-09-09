@@ -23,6 +23,7 @@ type config struct {
 	mode        string
 	size        int64
 	threads     int
+	conns       int
 	count       int
 	prefix      string
 	reportEvery time.Duration
@@ -36,6 +37,7 @@ func parseFlags() *config {
 	flag.StringVar(&c.mode, "mode", "", "write | read")
 	flag.Int64Var(&c.size, "size", 4096, "object size in bytes")
 	flag.IntVar(&c.threads, "threads", 1, "number of concurrent goroutines")
+	flag.IntVar(&c.conns, "conns", 1, "number of client gRPC connections (DialPool)")
 	flag.IntVar(&c.count, "count", 1000, "total number of distinct objects")
 	flag.StringVar(&c.prefix, "keys-prefix", "rbench", "key prefix, keys are <prefix>/<seq>")
 	flag.DurationVar(&c.reportEvery, "report-interval", 2*time.Second, "progress report interval")
@@ -68,7 +70,7 @@ func main() {
 		}
 	}
 
-	s, err := rpcclient.Dial(ctx, c.addr)
+	s, err := rpcclient.DialPool(ctx, c.addr, c.conns)
 	if err != nil {
 		stopCPUProfile(cpuFile)
 		fmt.Fprintf(os.Stderr, "dial %s: %v\n", c.addr, err)
@@ -129,6 +131,8 @@ func (c *config) validate() error {
 		return fmt.Errorf("-size must be >= 0")
 	case c.threads <= 0:
 		return fmt.Errorf("-threads must be > 0")
+	case c.conns <= 0:
+		return fmt.Errorf("-conns must be > 0")
 	case c.count <= 0:
 		return fmt.Errorf("-count must be > 0")
 	}

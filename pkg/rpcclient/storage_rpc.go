@@ -17,24 +17,31 @@ import (
 )
 
 // Storage 远程对象存储实现，方法签名与 taihu.Storage 完全一致（设计文档_v3 §5.1）。
+// 内部可持有 1..n 条 gRPC 连接（DialPool），流式 RPC 按 round-robin 分发以提升单进程并发吞吐。
 type Storage struct {
-	conn *grpc.ClientConn
-	c    rpc.ObjectStoreClient
+	conns []*grpc.ClientConn
+	cs    []rpc.ObjectStoreClient
+	rr    uint64 // round-robin 分发计数器（原子）
 }
 
-// Close 关闭底层连接。
+// Close 关闭全部底层连接。
 func (s *Storage) Close() error {
-	if s.conn == nil {
-		return nil
+	var first error
+	for i := range s.conns {
+		if s.conns[i] != nil {
+			if err := s.conns[i].Close(); err != nil && first == nil {
+				first = err
+			}
+		}
 	}
-	err := s.conn.Close()
-	s.conn = nil
-	return err
+	s.conns = nil
+	s.cs = nil
+	return first
 }
 
 // Put 流式上传对象。首帧发送 key+size，后续从 in 读取数据块发送。
 func (s *Storage) Put(ctx context.Context, key string, size int64, in io.Reader) error {
-	stream, err := s.c.Put(ctx)
+	stream, err := s.pick().Put(ctx)
 	if err != nil {
 		return rpcToErr(err)
 	}
@@ -75,7 +82,7 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in io.Reader)
 // 同步读取首帧以尽早暴露服务端错误（NotFound / OutOfRange）。
 func (s *Storage) Get(ctx context.Context, key string, off, size int64) (io.ReadCloser, error) {
 	cctx, cancel := context.WithCancel(ctx)
-	stream, err := s.c.Get(cctx, &rpc.GetReq{Key: key, Off: off, Size: size})
+	stream, err := s.pick().Get(cctx, &rpc.GetReq{Key: key, Off: off, Size: size})
 	if err != nil {
 		cancel()
 		return nil, rpcToErr(err)
@@ -172,13 +179,13 @@ func (g *getStream) Close() error {
 
 // Delete 删除对象映射；key 不存在时返回 ErrNotFound。
 func (s *Storage) Delete(ctx context.Context, key string) error {
-	_, err := s.c.Delete(ctx, &rpc.DeleteReq{Key: key})
+	_, err := s.pick().Delete(ctx, &rpc.DeleteReq{Key: key})
 	return rpcToErr(err)
 }
 
 // Stat 返回对象逻辑大小；key 不存在时返回 ErrNotFound。
 func (s *Storage) Stat(ctx context.Context, key string) (int64, error) {
-	resp, err := s.c.Stat(ctx, &rpc.StatReq{Key: key})
+	resp, err := s.pick().Stat(ctx, &rpc.StatReq{Key: key})
 	if err != nil {
 		return 0, rpcToErr(err)
 	}
