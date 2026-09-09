@@ -19,66 +19,82 @@ type RawData struct {
 	Orig []byte
 }
 
-// RawFrame 接收端延迟物化数据帧：持有 gRPC wire 缓冲的引用（Unmarshal 时 Ref），
-// 消费时单次拷贝到目标缓冲（CopyTo）或零拷贝引用底层数据（Data，单缓冲时），
-// 用毕须 Free 归还引用，wire 缓冲由 gRPC 池回收。相比直接物化 []byte，
-// 省去每帧 1MiB 的堆分配 + 清零 + 整块拷贝（客户端读路径 CPU 大头）。
+// RawFrame 接收端延迟物化数据帧：持有单个 mem.Buffer（Unmarshal 时由 wire 缓冲
+// 合并得到——单缓冲零拷贝 Ref、多缓冲 bufpool 复用合并 1 次拷贝无 GC），
+// 消费时单次拷贝到目标缓冲（CopyTo）或零拷贝引用底层数据（Data），
+// 用毕须 Free 归还引用。相比直接物化 []byte，省去每帧 1MiB 的堆分配 + 清零 +
+// 整块拷贝（客户端读路径 CPU 大头）。
 type RawFrame struct {
-	bs  mem.BufferSlice
+	buf mem.Buffer
+	len int
 	off int
 }
 
 // Len 返回帧总字节数。
-func (f *RawFrame) Len() int { return f.bs.Len() }
+func (f *RawFrame) Len() int { return f.len }
 
 // Remaining 返回未消费字节数。
-func (f *RawFrame) Remaining() int { return f.Len() - f.off }
+func (f *RawFrame) Remaining() int { return f.len - f.off }
 
-// Data 返回剩余数据的连续视图。单缓冲时零拷贝直接引用 wire 缓冲（调用方须在
-// 下一次 Free/Next 前使用）；多缓冲时物化到新缓冲（兜底路径，帧通常单缓冲）。
+// Data 返回剩余数据的连续视图（零拷贝引用底层缓冲）。
+// 调用方须在下次 Free/Next 前使用。
 func (f *RawFrame) Data() []byte {
-	if len(f.bs) == 1 {
-		d := f.bs[0].ReadOnlyData()
-		return d[f.off:]
+	if f.buf == nil {
+		return nil
 	}
-	out := make([]byte, f.Remaining())
-	f.bs.CopyTo(out)
-	f.off = f.Len()
-	return out
+	return f.buf.ReadOnlyData()[f.off:]
 }
 
 // CopyTo 从当前偏移拷贝至多 len(dst) 字节到 dst，并推进偏移。
 func (f *RawFrame) CopyTo(dst []byte) int {
-	if len(f.bs) == 1 {
-		d := f.bs[0].ReadOnlyData()
-		n := copy(dst, d[f.off:])
-		f.off += n
-		return n
+	if f.buf == nil {
+		return 0
 	}
-	n := 0
-	for len(f.bs) > 0 && n < len(dst) {
-		d := f.bs[0].ReadOnlyData()
-		if f.off >= len(d) {
-			f.bs = f.bs[1:]
-			f.off = 0
-			continue
-		}
-		c := copy(dst[n:], d[f.off:])
-		f.off += c
-		n += c
-		if f.off == len(d) {
-			f.bs = f.bs[1:]
-			f.off = 0
-		}
-	}
+	n := copy(dst, f.buf.ReadOnlyData()[f.off:])
+	f.off += n
 	return n
 }
 
-// Free 释放全部剩余引用（归还 gRPC wire 缓冲池）。调用后不得再使用。
+// Free 释放引用（归还 gRPC wire 缓冲池 / bufpool）。调用后不得再使用。
 func (f *RawFrame) Free() {
-	f.bs.Free()
-	f.bs = nil
-	f.off = 0
+	if f.buf != nil {
+		f.buf.Free()
+		f.buf = nil
+	}
+	f.len, f.off = 0, 0
+}
+
+// bufpoolAdapter 把 taihu bufpool 适配为 mem.BufferPool（合并 wire 多缓冲用）。
+type bufpoolAdapter struct{}
+
+func (bufpoolAdapter) Get(length int) *[]byte {
+	b := bufpool.Get(length)
+	return &b
+}
+
+func (bufpoolAdapter) Put(b *[]byte) {
+	if b != nil {
+		bufpool.Put(*b)
+	}
+}
+
+// materializeFrame 把 wire 缓冲切片合并为单缓冲：
+// 单缓冲零拷贝 Ref（计数 +1，recv() 的 Free 释放原始引用后本帧仍持有）；
+// 多缓冲（gRPC 按 16KB 帧粒度累积）用 bufpool 复用缓冲合并，1 次拷贝且无 GC 分配。
+// 返回 nil + 0 表示空帧。
+func materializeFrame(data mem.BufferSlice) (mem.Buffer, int) {
+	l := data.Len()
+	if l == 0 {
+		return nil, 0
+	}
+	if len(data) == 1 {
+		data[0].Ref()
+		return data[0], l
+	}
+	buf := bufpool.Get(l)
+	data.CopyTo(buf)
+	buf = buf[:l] // reslice 到实际长度；bufpool 按向上取 2 幂分桶，归还回同桶
+	return mem.NewBuffer(&buf, bufpoolAdapter{}), l
 }
 
 // RawCodecName 是 RawCodec 的注册名（gRPC content-subtype）。
@@ -130,10 +146,11 @@ func (RawCodec) Unmarshal(data mem.BufferSlice, v any) error {
 		*t = data.Materialize()
 		return nil
 	case *RawFrame:
-		// 延迟物化：recv() 在 Unmarshal 返回后 Free 传入 data（rpc_util.go），
-		// 此处 Ref 持有一份引用，消费完成由 RawFrame.Free 归还。
-		data.Ref()
-		t.bs = data
+		// 延迟物化到单缓冲（单缓冲 Ref 零拷贝 / 多缓冲 bufpool 复用合并），
+		// 消费完成后由 RawFrame.Free 归还。
+		buf, l := materializeFrame(data)
+		t.buf = buf
+		t.len = l
 		t.off = 0
 		return nil
 	}
