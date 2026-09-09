@@ -17,7 +17,9 @@ type store interface {
 	// 段写满自动滚动，返回的偏移恒 4K 对齐、单调不重叠，可并发调用。
 	AllocateSegment(size int64) (segmentID int64, offset int64, err error)
 
+	// GetSegment gc使用，暂时未使用
 	GetSegment(ctx context.Context, segmentID int64) (SegmentMeta, bool, error)
+	// PutSegment gc使用，暂时未使用
 	PutSegment(ctx context.Context, segmentID int64, m SegmentMeta) error
 
 	Close() error
