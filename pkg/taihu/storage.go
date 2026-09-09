@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 
+	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/device"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
@@ -119,6 +120,48 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) (io.Read
 	}
 	// 包装 LimitReader 同时透传 Close：Linux 下 Close 归还池化对齐缓冲，调用方必须 Close。
 	return &limitReadCloser{Reader: io.LimitReader(r, size), c: r}, nil
+}
+
+// ReadAt 将对象内 [off, off+len(buf)) 的数据读入 buf，返回实际读取字节数（逻辑字节）。
+// off == Size 时返回 io.EOF。
+//
+// 快路径（off 与 len(buf) 均 4K 对齐、buf 地址 4K 对齐）：O_DIRECT 直读调用方缓冲，
+// 零额外拷贝——server Get 的零拷贝读路径依赖此保证；否则退化为临时对齐缓冲 + 一次拷贝。
+func (s *Storage) ReadAt(ctx context.Context, key string, off int64, buf []byte) (int, error) {
+	meta, err := s.db.GetMapping(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+	if off < 0 || off > meta.Size {
+		return 0, ErrInvalidRange
+	}
+	remaining := meta.Size - off
+	if remaining == 0 {
+		return 0, io.EOF
+	}
+	want := int64(len(buf))
+	if want > remaining {
+		want = remaining
+	}
+
+	// 段内物理读区间 [dstart, dstart+dlen)，向下/向上 4K 对齐。
+	relStart := meta.Offset + off
+	dstart := relStart &^ (layout.BlockSize - 1)
+	dlen := layout.Align4k(relStart+want) - dstart
+	skip := relStart - dstart
+
+	if skip == 0 && want == dlen {
+		// 快路径：请求区间本就 4K 对齐，直接读入调用方缓冲（0 拷贝）。
+		return s.dev.ReadAt(ctx, meta.SegmentID, dstart, buf[:dlen])
+	}
+	// 慢路径：读入临时对齐缓冲，再拷贝出有效窗口（非对齐请求兜底）。
+	tmp := bufpool.Get(int(dlen))
+	defer bufpool.Put(tmp)
+	if _, err := s.dev.ReadAt(ctx, meta.SegmentID, dstart, tmp[:dlen]); err != nil {
+		return 0, err
+	}
+	n := copy(buf, tmp[skip:skip+want])
+	return n, nil
 }
 
 // limitReadCloser 将 LimitReader 包装为 ReadCloser，Close 透传给内部实现（归还池缓冲）。

@@ -1,5 +1,9 @@
 // taihu 远程访问层协议定义（设计文档_v3 §3）。
 // Put client 流式上传（首帧带 key+size）；Get server 流式下发（支持 off/size 区间，size=-1 全量）。
+//
+// 注意：Get/Put 的【数据帧】在 wire 上为裸字节流（经 taihu-raw 自定义 codec 零拷贝透传，
+// 即 SendMsg/RecvMsg 直接收发 []byte），不再是 GetChunk/PutChunk 的 message 编码。
+// 下方 PutChunk/GetChunk 消息保留作为逻辑 schema 与 header 帧（PutChunk 首帧）使用。
 syntax = "proto3";
 
 package taihu.rpc;

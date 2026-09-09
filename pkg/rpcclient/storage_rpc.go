@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -40,20 +41,28 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in io.Reader)
 	if err := stream.Send(&rpc.PutChunk{Header: &rpc.PutHeader{Key: key, Size: size}}); err != nil {
 		return rpcToErr(err)
 	}
-	// 发送缓冲从池取，结束后归还，避免每次 Put 分配 256KB。
-	buf := bufpool.Get(chunkSize)
-	defer bufpool.Put(buf)
+	// 数据帧零拷贝透传：每块取新池缓冲并交予 gRPC（异步写完后经 reclaimBuf 归还 bufpool），
+	// 发送返回后不得复用该缓冲。短读（n < chunkSize 且 err == nil）也安全：缓冲已交给 gRPC。
 	for {
-		n, rerr := in.Read(buf[:chunkSize])
+		buf := bufpool.Get(chunkSize)
+		handed := false
+		n, rerr := in.Read(buf)
 		if n > 0 {
-			if serr := stream.Send(&rpc.PutChunk{Data: buf[:n]}); serr != nil {
-				return rpcToErr(serr)
+			if serr := stream.SendMsg(&rpc.RawData{Data: buf[:n], Orig: buf}); serr != nil {
+				return rpcToErr(serr) // 出错路径不归还：gRPC 可能在内部已 Free
 			}
+			handed = true
 		}
 		if rerr == io.EOF {
+			if !handed {
+				bufpool.Put(buf)
+			}
 			break
 		}
 		if rerr != nil {
+			if !handed {
+				bufpool.Put(buf)
+			}
 			return rerr
 		}
 	}
@@ -71,47 +80,93 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) (io.Read
 		cancel()
 		return nil, rpcToErr(err)
 	}
-	first, err := stream.Recv()
-	if err != nil {
+	g := &getStream{stream: stream, cancel: cancel}
+	g.cond = sync.NewCond(&g.mu)
+	// 同步读首帧，尽早暴露服务端错误。
+	var first []byte
+	if err := stream.RecvMsg(&first); err != nil {
 		cancel()
 		if err == io.EOF {
 			return io.NopCloser(bytes.NewReader(nil)), nil // 空对象
 		}
 		return nil, rpcToErr(err)
 	}
+	g.chunk = first
+	go g.pump()
+	return g, nil
+}
 
-	pr, pw := io.Pipe()
-	go func() {
-		defer pw.Close()
-		defer cancel()
-		if _, werr := pw.Write(first.GetData()); werr != nil {
+// getStream 实现 Get 的 io.ReadCloser：pump goroutine 持续 Recv，Read 把待消费
+// chunk 单次拷贝到调用方缓冲（替代 io.Pipe 的双拷贝）；背压由单槽 pending 保证
+// （pump 只有在 chunk 被消费后才继续 Recv）。
+type getStream struct {
+	stream rpc.ObjectStore_GetClient
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	cond   *sync.Cond
+	chunk  []byte // 待消费的 chunk；nil 表示等待更多数据
+	err    error  // 终态错误（nil 表示正常 EOF）
+	done   bool   // pump 已结束（流结束或出错）
+}
+
+// pump 持续 Recv 数据块，直到流结束或出错。
+func (g *getStream) pump() {
+	defer g.cancel()
+	for {
+		var b []byte
+		if err := g.stream.RecvMsg(&b); err != nil {
+			g.mu.Lock()
+			if err == io.EOF {
+				err = nil
+			} else {
+				err = rpcToErr(err)
+			}
+			g.err = err
+			g.done = true
+			g.cond.Broadcast()
+			g.mu.Unlock()
 			return
 		}
-		for {
-			chunk, rerr := stream.Recv()
-			if rerr == io.EOF {
-				return
-			}
-			if rerr != nil {
-				pw.CloseWithError(rpcToErr(rerr))
-				return
-			}
-			if _, werr := pw.Write(chunk.GetData()); werr != nil {
-				return
-			}
+		if len(b) == 0 {
+			continue
 		}
-	}()
-	return &rcCloser{Reader: pr, cancel: cancel}, nil
+		g.mu.Lock()
+		for g.chunk != nil {
+			g.cond.Wait() // 等消费者取走上一个 chunk（背压）
+		}
+		g.chunk = b
+		g.cond.Broadcast()
+		g.mu.Unlock()
+	}
 }
 
-// rcCloser 关闭时取消底层流 ctx，终止 Recv goroutine。
-type rcCloser struct {
-	io.Reader
-	cancel context.CancelFunc
+func (g *getStream) Read(p []byte) (int, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for {
+		if g.chunk != nil {
+			n := copy(p, g.chunk)
+			if n == len(g.chunk) {
+				g.chunk = nil
+				g.cond.Broadcast() // 放行 pump 继续 Recv
+			} else {
+				g.chunk = g.chunk[n:]
+			}
+			return n, nil
+		}
+		if g.done {
+			if g.err != nil {
+				return 0, g.err
+			}
+			return 0, io.EOF
+		}
+		g.cond.Wait()
+	}
 }
 
-func (r *rcCloser) Close() error {
-	r.cancel()
+// Close 取消底层流 ctx，终止 pump goroutine。
+func (g *getStream) Close() error {
+	g.cancel()
 	return nil
 }
 

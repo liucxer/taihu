@@ -91,6 +91,20 @@ func (d *Device) Append(ctx context.Context, segmentID, off, size int64, data io
 	return nil
 }
 
+// ReadAt 将段内 off 处至多 len(buf) 字节读入 buf，返回实际读入字节数（单次 O_DIRECT ReadAt）。
+//
+// 要求 off 与 len(buf) 均为 4K 对齐；buf 起始地址须 4K 对齐（O_DIRECT 约束，
+// bufpool.Get 保证）。用于 Storage.ReadAt 快路径：O_DIRECT 直接读入发送缓冲。
+func (d *Device) ReadAt(ctx context.Context, segmentID, off int64, buf []byte) (int, error) {
+	if off < 0 || off%layout.BlockSize != 0 {
+		return 0, fmt.Errorf("taihu: read offset %d not 4K aligned", off)
+	}
+	if int64(len(buf))%layout.BlockSize != 0 {
+		return 0, fmt.Errorf("taihu: read length %d not 4K aligned", len(buf))
+	}
+	return d.f.ReadAt(buf, d.segmentBase(segmentID)+off)
+}
+
 // Delete 将整段标记可回收。当前采用 append-only，物理擦除/重写延迟到 segment 级 GC 实现，
 // 此处仅作占位，返回 nil。
 func (d *Device) Delete(ctx context.Context, segmentID int64) error {
