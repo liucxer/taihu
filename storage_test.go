@@ -220,6 +220,7 @@ func TestDeviceAppendAlignment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("device read: %v", err)
 	}
+	defer r.Close() // 归还池化对齐缓冲
 	b, _ := io.ReadAll(r)
 	if string(b[:3]) != "abc" {
 		t.Fatalf("device read prefix got %q", b[:3])

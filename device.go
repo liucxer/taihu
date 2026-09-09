@@ -65,11 +65,12 @@ func (d *Device) append(ctx context.Context, segmentID, off, size int64, data io
 	}
 
 	pos := d.segmentBase(segmentID) + off
-	buf := alignedBuffer(int(aligned))
+	buf := bufPool.get(int(aligned))
+	defer bufPool.put(buf) // WriteAt 是同步落盘（O_DIRECT），返回后缓冲即可复用
 	if _, err := io.ReadFull(data, buf[:size]); err != nil {
 		return fmt.Errorf("taihu: append short read: %w", err)
 	}
-	clear(buf[size:]) // 末尾 0 填充
+	clear(buf[size:aligned]) // 末尾 0 填充到 aligned（buf 容量可能大于 aligned）
 
 	// 写 1：向下对齐的主体段（长度为 4K 倍数、偏移对齐，满足 O_DIRECT）。
 	if bulkEnd := size &^ (BlockSize - 1); bulkEnd > 0 {

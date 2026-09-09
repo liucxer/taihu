@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"syscall"
 )
 
@@ -19,21 +20,43 @@ func openDevice(path string) (*os.File, error) {
 }
 
 // read 读取 segmentID 段、段内 4K 对齐起点 off 起 size（4K 对齐）字节。
-// 经 O_DIRECT 读入对齐缓冲后返回。调用方（Storage.Get）已保证 off、size 均为 BlockSize 对齐。
-func (d *Device) read(ctx context.Context, segmentID, off, size int64) (io.Reader, error) {
+// 经 O_DIRECT 读入池化对齐缓冲后返回只读流；返回流的 Close 将缓冲归还池。
+// 调用方（Storage.Get）已保证 off、size 均为 BlockSize 对齐，且必须 Close。
+func (d *Device) read(ctx context.Context, segmentID, off, size int64) (io.ReadCloser, error) {
 	pos := d.segmentBase(segmentID) + off
 	if pos%BlockSize != 0 || size%BlockSize != 0 {
 		return nil, fmt.Errorf("taihu: O_DIRECT read requires %d-aligned pos/size", BlockSize)
 	}
 	if size == 0 {
-		return bytes.NewReader(nil), nil
+		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
-	buf := alignedBuffer(int(size))
-	n, err := d.f.ReadAt(buf, pos)
+	buf := bufPool.get(int(size))
+	n, err := d.f.ReadAt(buf[:size], pos)
 	if err != nil && !errorsIsEOF(err) {
+		bufPool.put(buf)
 		return nil, err
 	}
-	return bytes.NewReader(buf[:n]), nil
+	return &pooledBufReader{pool: bufPool, buf: buf, r: bytes.NewReader(buf[:n])}, nil
+}
+
+// pooledBufReader 持有从池取出的对齐缓冲，Read 透传 bytes.Reader，Close 时归还缓冲。
+type pooledBufReader struct {
+	pool *alignedBufPool
+	buf  []byte
+	r    *bytes.Reader
+	once sync.Once
+}
+
+func (r *pooledBufReader) Read(p []byte) (int, error) { return r.r.Read(p) }
+
+func (r *pooledBufReader) Close() error {
+	r.once.Do(func() {
+		if r.buf != nil {
+			r.pool.put(r.buf)
+			r.buf = nil
+		}
+	})
+	return nil
 }
 
 func errorsIsEOF(err error) bool {

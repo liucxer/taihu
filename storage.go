@@ -109,11 +109,21 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) (io.Read
 	}
 	if skip := relStart - dstart; skip > 0 {
 		if _, err := io.CopyN(io.Discard, r, skip); err != nil {
+			_ = r.Close() // 归还池化缓冲
 			return nil, err
 		}
 	}
-	return io.NopCloser(io.LimitReader(r, size)), nil
+	// 包装 LimitReader 同时透传 Close：Linux 下 Close 归还池化对齐缓冲，调用方必须 Close。
+	return &limitReadCloser{Reader: io.LimitReader(r, size), c: r}, nil
 }
+
+// limitReadCloser 将 LimitReader 包装为 ReadCloser，Close 透传给内部实现（归还池缓冲）。
+type limitReadCloser struct {
+	io.Reader
+	c io.Closer
+}
+
+func (l *limitReadCloser) Close() error { return l.c.Close() }
 
 // Delete 删除对象的持久化映射。缓存失效由 store 内部处理。物理空间回收留待 segment 级 GC。
 // key 不存在时返回 ErrNotFound。

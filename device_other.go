@@ -14,8 +14,8 @@ func openDevice(path string) (*os.File, error) {
 }
 
 // read 读取 segmentID 段、段内 offset 起 size 字节的只读流。
-// 非 Linux 平台为 byte 级随机读，无需对齐。
-func (d *Device) read(ctx context.Context, segmentID, off, size int64) (io.Reader, error) {
+// 非 Linux 平台为 byte 级随机读，无需对齐，也不池化缓冲。
+func (d *Device) read(ctx context.Context, segmentID, off, size int64) (io.ReadCloser, error) {
 	pos := d.segmentBase(segmentID) + off
-	return io.NewSectionReader(d.f, pos, size), nil
+	return io.NopCloser(io.NewSectionReader(d.f, pos, size)), nil
 }
