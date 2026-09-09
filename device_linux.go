@@ -8,11 +8,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"syscall"
 )
 
-// oDirectFlag 为 Linux O_DIRECT 打开标志。值为 0x4000（linux/open.h），
-// 不使用 x/sys/unix 以避免额外依赖。
-const oDirectFlag = 0x4000
+// oDirectFlag 为 Linux O_DIRECT 打开标志。用 syscall.O_DIRECT 按架构自动取值：
+// amd64 上为 0x4000，arm64(aarch64) 上为 0x10000，不可硬编码。
+const oDirectFlag = syscall.O_DIRECT
 
 // openDevice 打开设备：O_RDWR|O_SYNC|O_DIRECT。读写均绕过 page cache 做直接 IO。
 func openDevice(path string) (*os.File, error) {
