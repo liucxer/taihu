@@ -90,7 +90,7 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) (io.Read
 	g := &getStream{stream: stream, cancel: cancel}
 	g.cond = sync.NewCond(&g.mu)
 	// 同步读首帧，尽早暴露服务端错误。
-	var first []byte
+	var first rpc.RawFrame
 	if err := stream.RecvMsg(&first); err != nil {
 		cancel()
 		if err == io.EOF {
@@ -98,30 +98,111 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) (io.Read
 		}
 		return nil, rpcToErr(err)
 	}
-	g.chunk = first
+	if first.Remaining() > 0 {
+		g.chunk = &first
+	}
 	go g.pump()
 	return g, nil
 }
 
-// getStream 实现 Get 的 io.ReadCloser：pump goroutine 持续 Recv，Read 把待消费
-// chunk 单次拷贝到调用方缓冲（替代 io.Pipe 的双拷贝）；背压由单槽 pending 保证
-// （pump 只有在 chunk 被消费后才继续 Recv）。
+// GetRaw 与 Get 语义一致，但以帧方式返回原始数据，避免 Read 的中间拷贝
+// （帧数据单缓冲时零拷贝引用 wire 缓冲）。
+//
+// 用法：循环调用 Next() 获取下一帧 []byte，返回 io.EOF 结束；上一帧数据在
+// 下一次 Next() 后失效（底层缓冲复用），不得长期持有；用毕必须 Close。
+func (s *Storage) GetRaw(ctx context.Context, key string, off, size int64) (*RawStream, error) {
+	cctx, cancel := context.WithCancel(ctx)
+	stream, err := s.pick().Get(cctx, &rpc.GetReq{Key: key, Off: off, Size: size})
+	if err != nil {
+		cancel()
+		return nil, rpcToErr(err)
+	}
+	g := &getStream{stream: stream, cancel: cancel}
+	g.cond = sync.NewCond(&g.mu)
+	var first rpc.RawFrame
+	if err := stream.RecvMsg(&first); err != nil {
+		cancel()
+		if err == io.EOF {
+			g.done = true // 空对象：Next 直接 EOF
+			return &RawStream{g: g}, nil
+		}
+		return nil, rpcToErr(err)
+	}
+	if first.Remaining() > 0 {
+		g.chunk = &first
+	}
+	go g.pump()
+	return &RawStream{g: g}, nil
+}
+
+// RawStream 是 GetRaw 的帧式读取流。
+type RawStream struct {
+	g    *getStream
+	held *rpc.RawFrame // 已交给调用方的帧引用，下次 Next/Close 时 Free
+}
+
+// Next 返回下一帧数据；io.EOF 表示流结束。返回的切片在下一次 Next 或 Close 后失效。
+func (rs *RawStream) Next() ([]byte, error) {
+	rs.g.mu.Lock()
+	defer rs.g.mu.Unlock()
+	if rs.held != nil {
+		rs.held.Free()
+		rs.held = nil
+	}
+	for {
+		if rs.g.chunk != nil {
+			f := rs.g.chunk
+			rs.g.chunk = nil
+			rs.g.cond.Broadcast() // 放行 pump 继续 Recv
+			rs.held = f
+			return f.Data(), nil
+		}
+		if rs.g.done {
+			if rs.g.err != nil {
+				return nil, rs.g.err
+			}
+			return nil, io.EOF
+		}
+		rs.g.cond.Wait()
+	}
+}
+
+// Close 释放全部帧引用并终止底层流。
+func (rs *RawStream) Close() error {
+	rs.g.mu.Lock()
+	if rs.held != nil {
+		rs.held.Free()
+		rs.held = nil
+	}
+	if rs.g.chunk != nil {
+		rs.g.chunk.Free()
+		rs.g.chunk = nil
+	}
+	rs.g.cancel()
+	rs.g.cond.Broadcast()
+	rs.g.mu.Unlock()
+	return nil
+}
+
+// getStream 实现 Get 的 io.ReadCloser：pump goroutine 持续 Recv（RawFrame 延迟物化），
+// Read 把待消费帧单次拷贝到调用方缓冲（替代 io.Pipe 的双拷贝）；背压由单槽 pending
+// 保证（pump 只有在 chunk 被消费后才继续 Recv）。
 type getStream struct {
 	stream rpc.ObjectStore_GetClient
 	cancel context.CancelFunc
 	mu     sync.Mutex
 	cond   *sync.Cond
-	chunk  []byte // 待消费的 chunk；nil 表示等待更多数据
-	err    error  // 终态错误（nil 表示正常 EOF）
-	done   bool   // pump 已结束（流结束或出错）
+	chunk  *rpc.RawFrame // 待消费帧；nil 表示等待更多数据
+	err    error         // 终态错误（nil 表示正常 EOF）
+	done   bool          // pump 已结束（流结束或出错）
 }
 
 // pump 持续 Recv 数据块，直到流结束或出错。
 func (g *getStream) pump() {
 	defer g.cancel()
 	for {
-		var b []byte
-		if err := g.stream.RecvMsg(&b); err != nil {
+		var f rpc.RawFrame
+		if err := g.stream.RecvMsg(&f); err != nil {
 			g.mu.Lock()
 			if err == io.EOF {
 				err = nil
@@ -134,14 +215,14 @@ func (g *getStream) pump() {
 			g.mu.Unlock()
 			return
 		}
-		if len(b) == 0 {
+		if f.Len() == 0 {
 			continue
 		}
 		g.mu.Lock()
 		for g.chunk != nil {
-			g.cond.Wait() // 等消费者取走上一个 chunk（背压）
+			g.cond.Wait() // 等消费者取走上一帧（背压）
 		}
-		g.chunk = b
+		g.chunk = &f
 		g.cond.Broadcast()
 		g.mu.Unlock()
 	}
@@ -152,12 +233,17 @@ func (g *getStream) Read(p []byte) (int, error) {
 	defer g.mu.Unlock()
 	for {
 		if g.chunk != nil {
-			n := copy(p, g.chunk)
-			if n == len(g.chunk) {
+			if g.chunk.Remaining() == 0 {
+				g.chunk.Free()
+				g.chunk = nil
+				g.cond.Broadcast()
+				continue
+			}
+			n := g.chunk.CopyTo(p)
+			if g.chunk.Remaining() == 0 {
+				g.chunk.Free()
 				g.chunk = nil
 				g.cond.Broadcast() // 放行 pump 继续 Recv
-			} else {
-				g.chunk = g.chunk[n:]
 			}
 			return n, nil
 		}
@@ -173,7 +259,14 @@ func (g *getStream) Read(p []byte) (int, error) {
 
 // Close 取消底层流 ctx，终止 pump goroutine。
 func (g *getStream) Close() error {
+	g.mu.Lock()
+	if g.chunk != nil {
+		g.chunk.Free()
+		g.chunk = nil
+	}
 	g.cancel()
+	g.cond.Broadcast()
+	g.mu.Unlock()
 	return nil
 }
 

@@ -119,7 +119,7 @@ func stopCPUProfile(cpuFile *os.File) {
 
 func (c *config) validate() error {
 	switch c.mode {
-	case "write", "read":
+	case "write", "read", "rawread":
 	default:
 		return fmt.Errorf("invalid -mode %q: must be write or read", c.mode)
 	}
@@ -174,6 +174,28 @@ func runWorker(ctx context.Context, s *rpcclient.Storage, c *config, s0, e0 int,
 			if gerr == nil {
 				n, err = io.Copy(io.Discard, rc)
 				_ = rc.Close()
+			} else {
+				err = gerr
+			}
+			if err == nil && n != c.size {
+				err = fmt.Errorf("key %s: short read %d != %d", key, n, c.size)
+			}
+		case "rawread":
+			var n int64
+			rs, gerr := s.GetRaw(ctx, key, 0, c.size)
+			if gerr == nil {
+				for {
+					b, rerr := rs.Next()
+					if rerr == io.EOF {
+						break
+					}
+					if rerr != nil {
+						err = rerr
+						break
+					}
+					n += int64(len(b))
+				}
+				_ = rs.Close()
 			} else {
 				err = gerr
 			}

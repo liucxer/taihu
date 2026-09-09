@@ -82,6 +82,26 @@ func TestDialPoolRoundTrip(t *testing.T) {
 		if err != nil || sz != int64(len(payload)) {
 			t.Fatalf("Stat %s: sz=%d err=%v", key, sz, err)
 		}
+		// GetRaw 帧式路径复读，验证延迟物化数据一致。
+		rs, err := s.GetRaw(context.Background(), key, 0, int64(len(payload)))
+		if err != nil {
+			t.Fatalf("GetRaw %s: %v", key, err)
+		}
+		var gotRaw []byte
+		for {
+			b, rerr := rs.Next()
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				t.Fatalf("GetRaw Next %s: %v", key, rerr)
+			}
+			gotRaw = append(gotRaw, b...)
+		}
+		_ = rs.Close()
+		if !bytes.Equal(gotRaw, payload) {
+			t.Fatalf("GetRaw mismatch key=%s got=%dB want=%dB", key, len(gotRaw), len(payload))
+		}
 		if err := s.Delete(context.Background(), key); err != nil {
 			t.Fatalf("Delete %s: %v", key, err)
 		}
