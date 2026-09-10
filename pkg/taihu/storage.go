@@ -160,3 +160,8 @@ func (s *Storage) Stat(ctx context.Context, key string) (int64, error) {
 	}
 	return meta.Size, nil
 }
+
+// IOStats 返回底层设备磁盘 IO 尺寸统计（4MiB 整块 vs 其他）。压测/验证用。
+func (s *Storage) IOStats() (io4M, ioOther, bytes4M, bytesOther int64) {
+	return s.dev.Stats()
+}

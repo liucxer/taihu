@@ -17,6 +17,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -35,6 +36,8 @@ const (
 	pumpTimeout = 200 * time.Millisecond
 	// submitRetry 提交队列满（ErrFull）时的重试间隔。
 	submitRetry = 100 * time.Microsecond
+	// chunk4MiB 典型整块 IO 尺寸（与传输层 chunkSize 一致），用于大小统计分档。
+	chunk4MiB = 1 << 22
 )
 
 // errDeviceClosed 设备已关闭后仍尝试提交。
@@ -45,13 +48,19 @@ type Device struct {
 	f    *os.File
 	path string
 
-	ring   aio.Ring
-	mu     sync.Mutex // 保护 m/pending/inSubmit/closed
-	m      map[uint64]chan aio.Event
-	pending map[uint64]aio.Event
-	inSubmit int        // 处于「已提交 io 但尚未注册/消费事件」的请求数
+	ring     aio.Ring
+	mu       sync.Mutex // 保护 m/pending/inSubmit/closed
+	m        map[uint64]chan aio.Event
+	pending  map[uint64]aio.Event
+	inSubmit int // 处于「已提交 io 但尚未注册/消费事件」的请求数
 	closed   bool
 	pumpDone chan struct{}
+
+	// io4M/ioOther 磁盘 IO 尺寸统计（原子计数，供压测/验证单次 IO 是否整块 4MiB）。
+	io4M       atomic.Int64 // 单次 IO == 4MiB 次数
+	ioOther    atomic.Int64 // 单次 IO != 4MiB 次数
+	bytes4M    atomic.Int64 // 4MiB IO 总字节
+	bytesOther atomic.Int64 // 其他尺寸 IO 总字节
 }
 
 // NewDevice 打开裸设备文件并创建异步 IO 队列。平台差异（O_DIRECT / 普通打开）在 openDevice 中处理。
@@ -181,6 +190,8 @@ func (d *Device) submitOp(buf []byte, off int64, read bool) (aio.Event, error) {
 			}
 			return aio.Event{}, err
 		}
+		// 仅统计成功提交的 IO（ErrFull 重试不重复计数）。
+		d.recordIO(int64(len(buf)))
 		if ev, ok := d.pending[seq]; ok { // 泵已取回本事件，直接消费
 			delete(d.pending, seq)
 			d.mu.Unlock()
@@ -190,6 +201,22 @@ func (d *Device) submitOp(buf []byte, off int64, read bool) (aio.Event, error) {
 		d.mu.Unlock()
 		return <-ch, nil
 	}
+}
+
+// recordIO 累计一次成功提交的磁盘 IO 尺寸（4MiB 整块 vs 其他）。
+func (d *Device) recordIO(size int64) {
+	if size == chunk4MiB {
+		d.io4M.Add(1)
+		d.bytes4M.Add(size)
+		return
+	}
+	d.ioOther.Add(1)
+	d.bytesOther.Add(size)
+}
+
+// Stats 返回磁盘 IO 尺寸统计：4MiB 整块次数/字节 与 其他尺寸次数/字节。
+func (d *Device) Stats() (io4M, ioOther, bytes4M, bytesOther int64) {
+	return d.io4M.Load(), d.ioOther.Load(), d.bytes4M.Load(), d.bytesOther.Load()
 }
 
 func (d *Device) submitWrite(buf []byte, off int64) (aio.Event, error) {

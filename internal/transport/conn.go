@@ -213,6 +213,15 @@ func (c *Conn) await(ctx context.Context, st *stream) (frameMsg, error) {
 // writeFrame 串行写一帧。payload > 4K 时 WriteBinary 零拷贝引用原缓冲，
 // Flush 阻塞至输出排空（waitFlush），返回后调用方即可安全复用/归还 payload。
 func (c *Conn) writeFrame(sid uint32, op OpCode, payload []byte) error {
+	statTxFrames.Add(1)
+	statTxBytes.Add(int64(len(payload)))
+	if op == opGetData {
+		statTxDataFrames.Add(1)
+		statTxDataBytes.Add(int64(len(payload)))
+		if len(payload) == chunkSize {
+			statTxData4M.Add(1)
+		}
+	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	var hdr [4 + frameHeaderLen]byte // len(4)+sid(4)+op(1)
@@ -356,6 +365,11 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 		switch msg.op {
 		case opGetData:
 			rem := int64(msg.r.Len())
+			statRxFrames.Add(1)
+			statRxBytes.Add(rem)
+			if rem == chunkSize {
+				statRxData4M.Add(1)
+			}
 			if rem > size-pos {
 				msg.r.Release()
 				dispose()
@@ -368,6 +382,7 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 					// Reader（所有权已移交，避免双归还）；不满足单节点条件回退对齐汇入。
 					if tt, ok := msg.r.(interface{ TakeTry() ([]byte, []byte, bool) }); ok {
 						if b, full, ok := tt.TakeTry(); ok {
+							statRxTake.Add(1)
 							taken = b
 							fullBuf = full
 							out = b
@@ -382,6 +397,7 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 			// 直写调用方缓冲：多节点帧由 ReadCopy 一次拷入，消除 Next 的中间搬移；
 			// 断言失败（如 race 变体未实现）回退现有 Next+copy 路径。
 			if rc, ok := msg.r.(interface{ ReadCopy([]byte) (int, error) }); ok {
+				statRxCopy.Add(1)
 				n, err := rc.ReadCopy(out[pos : pos+int64(rem)])
 				if err != nil {
 					msg.r.Release()
@@ -390,6 +406,7 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 				}
 				pos += int64(n)
 			} else {
+				statRxCopy.Add(1)
 				p, err := msg.r.Next(int(rem))
 				if err != nil {
 					msg.r.Release()

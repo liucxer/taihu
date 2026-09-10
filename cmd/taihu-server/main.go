@@ -16,8 +16,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/liucxer/taihu/internal/rpcserver"
+	"github.com/liucxer/taihu/internal/transport"
 	"github.com/liucxer/taihu/pkg/taihu"
 )
 
@@ -53,6 +55,16 @@ func main() {
 			log.Printf("pprof listening on %s", *pprofAddr)
 			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
 				log.Printf("pprof serve: %v", err)
+			}
+		}()
+		// 链路尺寸统计：5s 一次打到 stderr（验证磁盘/回帧是否整块 4MiB）。
+		go func() {
+			t := time.NewTicker(5 * time.Second)
+			defer t.Stop()
+			for range t.C {
+				io4M, ioOther, b4M, bOther := storage.IOStats()
+				log.Printf("[stat] disk-io 4MiB=%d other=%d bytes4MiB=%d bytesOther=%d", io4M, ioOther, b4M, bOther)
+				log.Printf("[stat] %s", transport.StatsString())
 			}
 		}()
 	}

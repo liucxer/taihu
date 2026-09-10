@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/liucxer/taihu/internal/transport"
 	"github.com/liucxer/taihu/pkg/rpcclient"
 )
 
@@ -106,6 +107,8 @@ func main() {
 
 	stopCPUProfile(cpuFile)
 	report(c, ops.Load(), lat, elapsed)
+	// 客户端收帧尺寸统计（验证每帧是否整块 4MiB、TakeTry 命中率）。
+	fmt.Printf("==== frame stats ====\n%s", transport.StatsString())
 }
 
 func stopCPUProfile(cpuFile *os.File) {
