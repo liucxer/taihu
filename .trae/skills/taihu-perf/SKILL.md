@@ -62,6 +62,8 @@ setsid nohup mpstat -P ALL 1 > /tmp/${TAG}.cpu  2>&1 &
 8. **临时诊断代码不要直接 commit**（会被拒/污染历史）：交叉编译上传 `/tmp` 覆盖验证后，必须清理工作区诊断代码再提交。诊断期间如遇 `Text file busy`，先杀占用进程再上传。
 9. **bufpool 冷分配异常排查**：若 server pprof 中 memclr/makeslice 占比高（读路径曾达 ~18-20%），用 `go tool pprof -peek 'runtime.memclrNoHeapPointers'` / `-peek 'runtime.makeslice'` 看 callers。曾因 alignedBuffer 返回 `backing[start:start+n]`（cap = (n+4096)-start > n），Put 按 cap 归一化后落入高一档桶、Get 永远取不到 → 复用率 0、每 op 冷分配（`get=put=alloc`、reuse_rate=0）。修复：三索引切片 `backing[start:start+n:start+n]` 使 cap==n 归桶一致。可在 bufpool 临时加 get/put/alloc 计数验证 reuse_rate。
 10. **跨机压测 128.12 链路仅 ~2-4MB/s**（Mac→128.12 TCP），客户端必须放 128.12 本机走 loopback；跨机客户端会淹没在链路带宽上限，测不出 server 真实能力。
+11. **勿注入自定义 BufferPool 到 gRPC 收帧**：`experimental.WithBufferPool(自定义池)` 使 16T8C 读从 1361 ops/s 暴跌至 ~20 ops/s（~60 倍）。gRPC transport 收帧热路径依赖默认 tiered pool 的分片/缓冲优化；自定义池（即使 4K 对齐）会走低效路径。改为只做 L90 层池化（Get 返回 bufpool 缓冲）。
+12. **gRPC 读路径"零拷贝移交帧缓冲"不可行**（RawFrame.Take 尝试）：跳过 `buffer.Free()` 会使流控窗口不归还（16M 窗口 4 帧耗尽），高并发下 server 停发、RecvMsg 永久阻塞；goroutine dump 定位为 `Get` 内 RecvMsg 等待。帧缓冲必须按 gRPC 生命周期 Free，聚合拷贝（CopyTo）是保持窗口推进的必要代价。
 
 测试结束停止采样并解析：
 
