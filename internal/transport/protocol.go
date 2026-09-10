@@ -50,11 +50,16 @@ const (
 	opResp      OpCode = 0x04 // payload: code(4)（Put/Delete/Stat 错误响应）
 	opGetReq    OpCode = 0x05 // payload: keyLen(4) key off(8) size(8)，size=-1 读至结尾
 	opGetData   OpCode = 0x06 // payload: 原始数据
-	opGetEnd    OpCode = 0x07 // payload: 无（服务端 Get 正常结束）
+	opGetEnd    OpCode = 0x07 // payload: 无（旧版服务端 Get 正常结束帧，已弃用不再发送，保留常量兼容解析）
 	opGetErr    OpCode = 0x08 // payload: code(4)（Get 错误，流结束）
 	opDelReq    OpCode = 0x09 // payload: keyLen(4) key
 	opStatReq   OpCode = 0x0A // payload: keyLen(4) key
 	opStatResp  OpCode = 0x0B // payload: size(8)
+
+	// opGetDataFinal 最后一个数据帧（opGetData|0x80）：服务端 Get 流以数据帧
+	// 收尾而非 opGetEnd 空帧，客户端收齐 size 字节（或短读校验）后即结束，
+	// 每请求省一个帧与一次写/读 syscall。帧头/负载格式与 opGetData 完全一致。
+	opGetDataFinal OpCode = opGetData | 0x80
 )
 
 // errCode 错误码（wire 上 4 字节大端），与库错误一一映射。

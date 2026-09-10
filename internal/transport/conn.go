@@ -215,7 +215,7 @@ func (c *Conn) await(ctx context.Context, st *stream) (frameMsg, error) {
 func (c *Conn) writeFrame(sid uint32, op OpCode, payload []byte) error {
 	statTxFrames.Add(1)
 	statTxBytes.Add(int64(len(payload)))
-	if op == opGetData {
+	if op == opGetData || op == opGetDataFinal {
 		statTxDataFrames.Add(1)
 		statTxDataBytes.Add(int64(len(payload)))
 		if len(payload) == chunkSize {
@@ -363,7 +363,8 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 			return nil, nil, err
 		}
 		switch msg.op {
-		case opGetData:
+		case opGetData, opGetDataFinal:
+			final := msg.op == opGetDataFinal
 			rem := int64(msg.r.Len())
 			statRxFrames.Add(1)
 			statRxBytes.Add(rem)
@@ -387,7 +388,11 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 							fullBuf = full
 							out = b
 							pos = size
-							continue // 不 Release：所有权移交
+							if final {
+								// 整响应恰一帧且为 final：直接结束，零拷贝移交完成。
+								return out, dispose, nil
+							}
+							continue // 非 final（协议异常）：不 Release，等下一帧触发超限报错
 						}
 					}
 				}
@@ -416,6 +421,14 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 				pos += int64(copy(out[pos:], p))
 			}
 			msg.r.Release()
+			if final {
+				// final 帧：数据流收尾。缺帧（短读）在此报错，等价旧 opGetEnd 校验。
+				if pos != size {
+					dispose()
+					return nil, nil, fmt.Errorf("taihu: get short read: got %d want %d", pos, size)
+				}
+				return out, dispose, nil
+			}
 		case opGetEnd:
 			msg.r.Release()
 			if pos != size {

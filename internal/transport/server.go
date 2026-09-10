@@ -199,7 +199,8 @@ func (s *Server) handlePut(c *Conn, st *stream) {
 	}
 }
 
-// handleGet 处理 Get 请求：按 chunkSize 分块 ReadAt 下发 opGetData，收尾 opGetEnd；
+// handleGet 处理 Get 请求：按 chunkSize 分块 ReadAt 下发 opGetData，
+// 最后一个数据帧置 final 位（opGetDataFinal）收尾（不再发 opGetEnd 空帧）；
 // 出错发 opGetErr（带错误码）。数据帧零拷贝引用 ReadAt 返回的 bufpool 缓冲，
 // writeFrame 返回（Flush 排空）后归还缓冲。
 func (s *Server) handleGet(c *Conn, st *stream) {
@@ -235,7 +236,13 @@ func (s *Server) handleGet(c *Conn, st *stream) {
 		}
 		data, rerr := s.storage.ReadAt(context.Background(), key, pos, want)
 		if len(data) > 0 {
-			if serr := c.writeFrame(st.id, opGetData, data); serr != nil {
+			op := OpCode(opGetData)
+			if pos+int64(len(data)) >= end || rerr == io.EOF {
+				// 最后一个数据帧带 final 位收尾；EOF 短读同样置 final，
+				// 客户端 final 校验 pos!=size 报 short read（而非挂死等待）。
+				op = opGetDataFinal
+			}
+			if serr := c.writeFrame(st.id, op, data); serr != nil {
 				bufpool.Put(data)
 				return
 			}
@@ -243,6 +250,10 @@ func (s *Server) handleGet(c *Conn, st *stream) {
 			pos += int64(len(data))
 		}
 		if rerr == io.EOF {
+			if len(data) == 0 {
+				// 空短读兜底：发空 final 帧让客户端报 short read，避免客户端挂死。
+				_ = c.writeFrame(st.id, opGetDataFinal, nil)
+			}
 			return
 		}
 		if rerr != nil {
@@ -250,7 +261,6 @@ func (s *Server) handleGet(c *Conn, st *stream) {
 			return
 		}
 	}
-	_ = c.writeFrame(st.id, opGetEnd, nil)
 }
 
 // handleDelete 处理 Delete 请求（一元）。
