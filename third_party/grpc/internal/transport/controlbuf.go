@@ -1004,7 +1004,10 @@ func (l *loopyWriter) processData() (bool, error) {
 		dataItem.h = nil
 		_ = dataItem.reader.Close()
 		str.itl.dequeue()
-		str.state = empty
+		if str.itl.isEmpty() {
+			str.state = empty
+			return false, nil
+		}
 		if trailer, ok := str.itl.peek().(*headerFrame); ok {
 			if err := l.writeHeader(trailer.streamID, trailer.endStream, trailer.hf, trailer.onWrite); err != nil {
 				return false, err
@@ -1012,8 +1015,6 @@ func (l *loopyWriter) processData() (bool, error) {
 			if err := l.cleanupStreamHandler(trailer.cleanup); err != nil {
 				return false, err
 			}
-		} else if str.itl.isEmpty() {
-			return false, nil
 		} else if int(l.oiws)-str.bytesOutStanding <= 0 {
 			str.state = waitingOnStreamQuota
 		} else {
