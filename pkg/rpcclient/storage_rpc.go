@@ -121,6 +121,14 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) ([]byte,
 			f.Free()
 			continue
 		}
+		// 单帧即完整对象（size ≤ 单帧时）：零拷贝移交底层 bufpool 缓冲，
+		// 免收流聚合拷贝（原始帧缓冲已 4K 对齐，直接作为返回缓冲）。
+		if pos == 0 && int64(f.Len()) >= size {
+			if raw := f.Take(); raw != nil {
+				bufpool.Put(buf) // 预取的聚合缓冲未用到，归还
+				return raw[:size], nil
+			}
+		}
 		if pos >= size {
 			f.Free()
 			bufpool.Put(buf)

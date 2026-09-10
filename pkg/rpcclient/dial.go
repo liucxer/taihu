@@ -9,6 +9,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/experimental"
 	"google.golang.org/grpc/keepalive"
 
 	"github.com/liucxer/taihu/rpc"
@@ -50,6 +51,9 @@ func DialPoolWithOptions(ctx context.Context, addr string, n int, extra ...grpc.
 		// 避免依赖 BDP 逐 RTT 收敛导致的初始小帧。
 		grpc.WithInitialWindowSize(16 << 20),
 		grpc.WithInitialConnWindowSize(256 << 20),
+		// 收帧缓冲池接入 taihu bufpool：handleData 帧缓存落进 4K 对齐桶，
+		// 使 Get 单帧完整场景可经 RawFrame.Take 零拷贝移交（免收流聚合拷贝）。
+		experimental.WithBufferPool(rpc.BufferPool),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                30 * time.Second,
 			Timeout:             10 * time.Second,
