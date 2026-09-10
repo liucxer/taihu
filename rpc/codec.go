@@ -3,7 +3,6 @@ package rpc
 import (
 	"fmt"
 	"sync/atomic"
-	"unsafe"
 
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/mem"
@@ -54,29 +53,6 @@ func (f *RawFrame) CopyTo(dst []byte) int {
 	n := copy(dst, f.buf.ReadOnlyData()[f.off:])
 	f.off += n
 	return n
-}
-
-// Take 零拷贝移交底层缓冲：若底层为 bufpool 对齐产物（首地址 4K 对齐且容量为
-// 2 的幂桶容量），返回其完整数据切片并清除本帧引用（调用方负责 bufpool.Put 归还）。
-// 非对齐缓冲（gRPC 默认收帧池产物）或偏移已推进的帧返回 nil，调用方走常规聚合路径。
-func (f *RawFrame) Take() []byte {
-	if f.buf == nil || f.off != 0 {
-		return nil
-	}
-	raw := f.buf.ReadOnlyData()
-	if len(raw) < f.len {
-		return nil
-	}
-	raw = raw[:f.len]
-	if len(raw) == 0 ||
-		uintptr(unsafe.Pointer(&raw[0]))&4095 != 0 ||
-		cap(raw)&(cap(raw)-1) != 0 {
-		return nil // 非 bufpool 桶产物，不可移交
-	}
-	// 移交所有权：清引用，底层缓冲由调用方 bufpool.Put 归还（等价于回池一次）。
-	f.buf = nil
-	f.len, f.off = 0, 0
-	return raw
 }
 
 // Free 释放引用（归还 gRPC wire 缓冲池 / bufpool）。调用后不得再使用。
