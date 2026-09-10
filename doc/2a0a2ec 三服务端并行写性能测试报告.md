@@ -1,0 +1,102 @@
+# 2a0a2ec 三服务端并行写性能测试报告
+
+> 对应提交：`2a0a2ec`（perf: device Append 地址对齐零拷贝快路径、读写帧限制 4M、客户端 Get 整对象同步聚合）
+> 测试范围：**3 服务端 × 3 客户端并行 RPC 写**（各 16T/10C/4M，loopback，客户端与服务端同机）
+
+## 1. 测试目标
+
+验证多实例部署的聚合写能力：3 个 taihu-server（各绑一块 NVMe）× 3 个 taihu-rpc-bench 客户端（各 16 线程 / 10 连接 / 4M 对象）并行写时，物理机 CPU、聚合应用层带宽、延迟、loopback 网络、三盘磁盘的真实表现，并采集 3 客户端 + 3 服务端 pprof 定位热点。
+
+## 2. 测试环境
+
+| 项目 | 值 |
+| --- | --- |
+| 服务器 | 100.71.128.12（客户端 + 服务端同机，loopback） |
+| CPU | 96 核 ARM aarch64（BCLinux 4.19，mpstat -P ALL 逐秒采样） |
+| 内存 | 约 756 GiB |
+| 数据设备 | /dev/nvme1n1、nvme2n1、nvme3n1（各 1.92 TB NVMe SSD，O_DIRECT 直写；nvme0n1 被其他占用未用） |
+| 元数据 | 各服务端独立 pebble 目录：/tmp/tdb（srv1）、/tmp/tdb2（srv2）、/tmp/tdb3（srv3），tmpfs |
+| 服务端 | /tmp/taihu-server.new ×3：srv1 :50051/:6061，srv2 :50052/:6062，srv3 :50053/:6063 |
+| 客户端 | /tmp/taihu-rpc-bench.new ×3，各自直连对应服务端 |
+| 对象 | 4 MiB（4194304 B），每客户端 20000 个（80GB/盘），keys-prefix 3w-a/b/c 隔离 |
+| 通信参数 | chunkSize=4MiB，http2MaxFrameLen=4MiB+16，recv/send 上限 8MiB |
+
+## 3. 测试方法
+
+taihu-rpc-bench 参数：`-mode write -size 4194304 -threads 16 -conns 10 -count 20000 -keys-prefix 3w-{a,b,c} -latency -report-interval 3s -cpuprofile <clientN.cpu>`。
+
+- 三组服务端（三盘各自独立）同时启动，三客户端**并行**写各自服务端，同步进入稳态。
+- 采集：`mpstat -P ALL 1`（整机 CPU）、`iostat -d nvme1n1 nvme2n1 nvme3n1 1`（三盘磁盘）、`/proc/net/dev` loopback 每秒差分（网络）。
+- pprof：三客户端 `-cpuprofile`（全程）；三服务端经各自 `:6061/6062/6063` 抓 `/debug/pprof/profile?seconds=20`（入稳态后并行抓取）。
+- CPU 口径：物理机实占 = `usr+sys`（iowait 时内核未占用算力，计为可用）。
+
+## 4. 测试结果
+
+### 4.1 应用层带宽（三客户端并行）
+
+| 客户端 | 带宽 MiB/s | ops/s | 对象 |
+| --- | --- | --- | --- |
+| C1（srv1/nvme1n1） | 2194.00 | 548.50 | 20000 |
+| C2（srv2/nvme2n1） | 2098.00 | 524.50 | 20000 |
+| C3（srv3/nvme3n1） | 2080.31 | 520.08 | 20000 |
+| **聚合** | **~6372 MiB/s（6.2 GB/s）** | ~1593 | 60000（240GB） |
+
+每客户端均顶到各自盘的稳态写极限（单客户端单盘极限 ~2.5GB/s，三实例并行时 ~2.1GB/s，差异来自整机 CPU 竞争，见 §5）。
+
+### 4.2 延迟（-latency，各客户端）
+
+| 客户端 | p50 | p90 | p99 |
+| --- | --- | --- | --- |
+| C1 | 26.16ms | 41.56ms | 57.55ms |
+| C2 | 27.82ms | 41.45ms | 57.00ms |
+| C3 | 27.98ms | 42.71ms | 58.11ms |
+
+三实例延迟分布一致（p50≈27ms），较单实例 16T10C（24.66ms）略升，为整机 CPU 竞争所致。
+
+## 5. 资源占用
+
+### 5.1 CPU（mpstat -P ALL，整机）
+
+- idle **42.3%**，**实占 usr+sys = 47.5%**（usr 29.1% + sys 18.4%），iowait 8.6%（计入可用）。
+- 三实例叠加后整机约 **45.6 核 / 96 核**被占用；sys 18.4% 表明 syscall 密集是主要内核开销。
+
+### 5.2 磁盘（iostat 实测，三盘独立稳态）
+
+| 盘 | 写均值 | 峰值 | tps |
+| --- | --- | --- | --- |
+| nvme1n1 | 2105.3 MiB/s | 2509.0 | 16848 |
+| nvme2n1 | 2000.0 MiB/s | 2387.5 | 16002 |
+| nvme3n1 | 2000.0 MiB/s | 2543.8 | 16006 |
+
+聚合写 ≈ **6.1 GB/s**，与应用层 6372 MiB/s 吻合；三盘均抵各自写极限（峰值 2.4-2.5GB/s），**磁盘为吞吐上限，非瓶颈**。
+
+### 5.3 网络（loopback /proc/net/dev 差分实测）
+
+- **RX_AVG=6160.9 MiB/s / TX_AVG=6160.9 MiB/s**（PEAK 7128），双向对称，与应用层带宽一致，环回无瓶颈。
+
+## 6. pprof 热点（3 客户端 + 3 服务端）
+
+### 客户端（同构 ×3，各 ~985% CPU ≈ 9.9 核）
+
+| 热点 | flat | 说明 |
+| --- | --- | --- |
+| runtime.memmove | 65.26% | 分帧 `copy(buf, in[off:end])` 全量搬移 |
+| syscall.Syscall6 | 19.73% | socket 写（loopyWriter.processData cum 67.9%） |
+| memclrNoHeapPointers | 11.35% | 帧缓冲清零 |
+
+### 服务端（同构 ×3，各 ~487-749% CPU ≈ 4.9-7.5 核）
+
+| 热点 | flat | 说明 |
+| --- | --- | --- |
+| runtime.memmove | 38.36% | 收帧汇集 `f.CopyTo(buf[pos:])` 一次对齐拷贝 |
+| syscall.Syscall6 | 35.52% | O_DIRECT 落盘写 |
+| memclrNoHeapPointers | 16.04% | 对齐缓冲清零 |
+
+热点结构与单实例测试完全一致；三实例叠加后 memmove+memclr+syscall 合计成为整机 CPU 实占 47.5% 的来源。
+
+## 7. 结论与建议
+
+1. **聚合达标**：3 服务端 × 3 客户端并行写 **~6.2 GB/s**，三盘各自顶到写极限，应用层/磁盘/网络三方数据吻合。
+2. **资源代价**：整机 CPU 实占 **47.5%**（约 45.6/96 核），是三实例工作量的直接叠加；iowait 仅 8.6%，磁盘与网络均非瓶颈——**多实例扩展时 CPU（尤其 syscall）成为资源上限**。
+3. **单实例 vs 多实例**：单客户端带宽由 2.57 GB/s 降至 ~2.1 GB/s，属三实例 CPU 竞争下的正常回落；延迟 p50 +27ms（24.7→27）。
+4. **优化方向（复用单实例结论，多实例下放大）**：客户端分帧拷贝（memmove 65%）与服务端汇集拷贝+对齐清零（memmove 38% + memclr 16%）是主要用户态消耗；若需在固定核数下支撑更多实例/更高聚合带宽，应优先消除这两处拷贝与对齐清零。
