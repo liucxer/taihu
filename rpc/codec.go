@@ -78,11 +78,6 @@ func (bufpoolAdapter) Put(b *[]byte) {
 	}
 }
 
-// BufferPool 将 taihu bufpool 暴露为 mem.BufferPool，供 Dial 注入为 gRPC 收帧池：
-// 使 handleData 的帧缓冲全部落进 4K 对齐 bufpool 桶，为 RawFrame.Take 的
-// 零拷贝移交（Get 单帧快速路径）提供对齐前提。
-var BufferPool mem.BufferPool = bufpoolAdapter{}
-
 // materializeFrame 把 wire 缓冲切片合并为单缓冲：
 // 单缓冲零拷贝 Ref（计数 +1，recv() 的 Free 释放原始引用后本帧仍持有）；
 // 多缓冲（gRPC 按 16KB 帧粒度累积）用 bufpool 复用缓冲合并，1 次拷贝且无 GC 分配。
