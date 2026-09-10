@@ -1,82 +1,42 @@
-// Package rpcclient 提供 taihu 远程访问层客户端（设计文档_v3 §5）。
+// Package rpcclient 提供 taihu 远程访问层客户端（设计文档_v3 §5，netpoll 传输层改造）。
 // 与本地库 pkg/taihu 同签名，调用方可无感切换本地/远程存储。
 package rpcclient
 
 import (
 	"context"
 	"sync/atomic"
-	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/keepalive"
-
-	"github.com/liucxer/taihu/rpc"
+	"github.com/liucxer/taihu/internal/transport"
 )
 
-// chunkSize 与 server 端一致的数据块上限（读写均按此粒度传输，最大 4MiB）。
-const chunkSize = 1 << 22 // 4MiB
-
 // Dial 建立到 taihu-server 的单连接客户端。返回 *Storage，用完须 Close。
-// 内网默认 insecure；断线重连由 gRPC 底层处理，多 goroutine 共享同一连接（HTTP/2 多路复用）。
-// 使用 RawCodec：数据帧（[]byte/RawData）零拷贝透传，与 server 须同步升级。
 func Dial(ctx context.Context, addr string) (*Storage, error) {
 	return DialPool(ctx, addr, 1)
 }
 
-// DialPool 建立 n 条到 taihu-server 的连接，流式 RPC 按 round-robin 分发到各连接。
-// 单进程持有多个 HTTP/2 连接（每连接独立的流控窗口、loopyWriter 写循环与 socket），
-// 可让单客户端并发度突破单连接限制，达到多客户端聚合带宽。n < 1 视为 1。
+// DialPool 建立 n 条到 taihu-server 的 netpoll 连接，RPC 按 round-robin 分发到各连接。
+// 每连接一条 TCP 链路 + 独立读循环，连接内以 streamID 多路复用多个并发 RPC；
+// 多连接可让单客户端并发度突破单连接限制，达到多客户端聚合带宽。n < 1 视为 1。
 func DialPool(ctx context.Context, addr string, n int) (*Storage, error) {
-	return DialPoolWithOptions(ctx, addr, n)
-}
-
-// DialPoolWithOptions 在 DialPool 的标准选项基础上追加额外 DialOption（如测试注入 bufconn dialer）。
-func DialPoolWithOptions(ctx context.Context, addr string, n int, extra ...grpc.DialOption) (*Storage, error) {
 	if n < 1 {
 		n = 1
 	}
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(chunkSize*2),
-			grpc.MaxCallSendMsgSize(chunkSize*2),
-			grpc.ForceCodecV2(rpc.RawCodec{}),
-		),
-		// 发送缓冲放大到帧大小：4MiB 帧直写 socket（单次 syscall），避免默认 32KB
-		// 缓冲导致的多次拷贝 + 多次 syscall。
-		grpc.WithWriteBufferSize(chunkSize),
-		// 接收流/连接窗口与 server 一致（16MB/256MB）：4MiB 帧在途 ≥4 帧/流，
-		// 避免依赖 BDP 逐 RTT 收敛导致的初始小帧。
-		grpc.WithInitialWindowSize(16 << 20),
-		grpc.WithInitialConnWindowSize(256 << 20),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                30 * time.Second,
-			Timeout:             10 * time.Second,
-			PermitWithoutStream: true,
-		}),
-	}
-	opts = append(opts, extra...)
-	s := &Storage{
-		conns: make([]*grpc.ClientConn, 0, n),
-		cs:    make([]rpc.ObjectStoreClient, 0, n),
-	}
+	s := &Storage{conns: make([]*transport.Conn, 0, n)}
 	for i := 0; i < n; i++ {
-		conn, err := grpc.NewClient(addr, opts...)
+		conn, err := transport.DialClient("tcp", addr)
 		if err != nil {
 			_ = s.Close()
 			return nil, err
 		}
 		s.conns = append(s.conns, conn)
-		s.cs = append(s.cs, rpc.NewObjectStoreClient(conn))
 	}
 	return s, nil
 }
 
-// pick 按 round-robin 返回一个连接对应的 client。
-func (s *Storage) pick() rpc.ObjectStoreClient {
-	if len(s.cs) == 1 {
-		return s.cs[0]
+// pick 按 round-robin 返回一条连接。
+func (s *Storage) pick() *transport.Conn {
+	if len(s.conns) == 1 {
+		return s.conns[0]
 	}
-	return s.cs[atomic.AddUint64(&s.rr, 1)%uint64(len(s.cs))]
+	return s.conns[atomic.AddUint64(&s.rr, 1)%uint64(len(s.conns))]
 }

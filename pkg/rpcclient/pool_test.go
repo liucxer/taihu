@@ -8,16 +8,14 @@ import (
 	"path/filepath"
 	"testing"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/test/bufconn"
-
 	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/rpcserver"
 	"github.com/liucxer/taihu/pkg/taihu"
 )
 
-// newBufnetServer 起一个跑在 bufconn 上的本地 taihu-server，返回 listener 和关闭函数。
-func newBufnetServer(t *testing.T) (*bufconn.Listener, func()) {
+// newTestServer 起一个跑在本机 TCP 上的 taihu-server（netpoll EventLoop），
+// 返回监听地址和关闭函数。
+func newTestServer(t *testing.T) (string, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	devPath := filepath.Join(dir, "nvme.img")
@@ -32,25 +30,25 @@ func newBufnetServer(t *testing.T) (*bufconn.Listener, func()) {
 		t.Fatalf("NewStorage: %v", err)
 	}
 	gs := rpcserver.New(storage)
-	lis := bufconn.Listen(2 << 20)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
 	go func() {
-		_ = gs.Serve(lis)
+		_ = gs.Serve(ln)
 	}()
-	return lis, func() {
+	return ln.Addr().String(), func() {
 		gs.Stop()
 		_ = storage.Close()
-		_ = lis.Close()
+		_ = ln.Close()
 	}
 }
 
 func TestDialPoolRoundTrip(t *testing.T) {
-	lis, cleanup := newBufnetServer(t)
+	addr, cleanup := newTestServer(t)
 	defer cleanup()
 
-	s, err := DialPoolWithOptions(context.Background(), "passthrough:///bufnet", 4,
-		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
-			return lis.DialContext(ctx)
-		}))
+	s, err := DialPool(context.Background(), addr, 4)
 	if err != nil {
 		t.Fatalf("DialPool: %v", err)
 	}
@@ -65,10 +63,7 @@ func TestDialPoolRoundTrip(t *testing.T) {
 		}
 	}
 	for i := 0; i < 32; i++ {
-		key := "pool/obj"
-		key += string(rune('0' + i%10))
-		key = key + "/" + string(rune('a'+i%26))
-		key = "pool/" + string(rune('a'+i%26)) + string(rune('0'+i%10))
+		key := "pool/" + string(rune('a'+i%26)) + string(rune('0'+i%10))
 		if err := s.Put(context.Background(), key, int64(len(payload)), payload); err != nil {
 			t.Fatalf("Put %s: %v", key, err)
 		}

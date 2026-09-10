@@ -1,4 +1,4 @@
-// Command taihu-server 是 taihu 远程访问层的 gRPC 服务端（设计文档_v3 §4）。
+// Command taihu-server 是 taihu 远程访问层的 netpoll 服务端（设计文档_v3 §4，替代 gRPC）。
 //
 // 单 Storage 实例（-db pebble 目录 + -dev 裸设备），对外暴露 4 个 RPC：
 // Put（client 流式上传）、Get（server 流式下发，支持 off/size 区间）、Delete、Stat。
