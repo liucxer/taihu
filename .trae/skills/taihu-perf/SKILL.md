@@ -52,6 +52,16 @@ setsid nohup mpstat -P ALL 1 > /tmp/${TAG}.cpu  2>&1 &
 关键坑（均已踩过）：
 1. **不要**在本命令里用 `pkill -f taihu-bench.new`——它会匹配执行该命令的 shell 自身命令行并 SIGTERM 自己，导致整条命令 45ms 即被杀死。清进程改用精确 PID，或跳过 pkill。
 2. TOP 忙核解析：**不要**用 `sort -t= -k2` 排形如 `core=14 busy=73.1%` 的行——`-t= -k2` 的排序键是 `14 busy=...`（核号做数字前缀），会按**核号**而非 **busy** 排序，输出最大核号而非最忙核。应让行首直接是 busy 数值再 `sort -rn`。
+3. **`pkill -x taihu-server.new` 杀不掉进程**：Linux comm 截断为 15 字符（实际是 `taihu-server.ne`），精确匹配失败 → 旧 server 未杀、新 server bind 端口失败但仍 daemonize，脚本继续跑 → **测试连的是旧二进制，整轮数据作废**。正确清理：
+   `ps -eo pid,comm | awk '$2 ~ /^taihu-server/{print $1}' | xargs -r kill; sleep 3`
+   并在跑测试前用 `ss -ltnp` 确认监听 PID 是刚启动的新进程。
+4. **正在运行的二进制无法覆盖上传**：curl PUT 返回 `{"code":1,"error":"[Errno 26] Text file busy"}`。必须先杀进程再上传。
+5. **curl -T 上传失败但命令链继续**：HTTP 错误时 curl 退出码仍为 0（未加 `-f`），配合 `>/dev/null` 吞响应 → 误判上传成功、跑旧二进制。上传后必须检查响应 JSON `code==0`，部署后 `md5sum` 校验版本，测试前 `ss -ltnp` 核对 PID。
+6. **mpstat -P ALL 列布局**（每 1s 一行）：`$1=时间 $2=PM $3=core|all $4=%usr $5=%nice $6=%sys $7=%iowait $8=%irq $9=%soft $10=%steal $11=%guest $12=%gnice $13=%idle`。awk 逐核统计**必须累加**（`u+=$4`）再除以样本数；用赋值（`u=$4`）只保留末帧 → 输出近似 0 的假值。
+7. **128.12 是 aarch64**：交叉编译必须 `GOOS=linux GOARCH=arm64`（amd64 二进制报 `cannot execute binary file`）；本地若 GOROOT 环境变量指向不存在的 toolchain，构建用 `env -u GOROOT GOTOOLCHAIN=auto go build ...`。
+8. **临时诊断代码不要直接 commit**（会被拒/污染历史）：交叉编译上传 `/tmp` 覆盖验证后，必须清理工作区诊断代码再提交。诊断期间如遇 `Text file busy`，先杀占用进程再上传。
+9. **bufpool 冷分配异常排查**：若 server pprof 中 memclr/makeslice 占比高（读路径曾达 ~18-20%），用 `go tool pprof -peek 'runtime.memclrNoHeapPointers'` / `-peek 'runtime.makeslice'` 看 callers。曾因 alignedBuffer 返回 `backing[start:start+n]`（cap = (n+4096)-start > n），Put 按 cap 归一化后落入高一档桶、Get 永远取不到 → 复用率 0、每 op 冷分配（`get=put=alloc`、reuse_rate=0）。修复：三索引切片 `backing[start:start+n:start+n]` 使 cap==n 归桶一致。可在 bufpool 临时加 get/put/alloc 计数验证 reuse_rate。
+10. **跨机压测 128.12 链路仅 ~2-4MB/s**（Mac→128.12 TCP），客户端必须放 128.12 本机走 loopback；跨机客户端会淹没在链路带宽上限，测不出 server 真实能力。
 
 测试结束停止采样并解析：
 
