@@ -1133,6 +1133,7 @@ func (t *http2Server) write(s *ServerStream, hdr []byte, data mem.BufferSlice, _
 		streamID:    s.id,
 		h:           hdr,
 		reader:      reader,
+		buffers:     data, // taihu fork: 供 server 整帧零拷贝快速路径读取原始数据
 		onEachWrite: t.setResetPingStrikes,
 	}
 	if err := s.wq.get(int32(len(hdr) + df.reader.Remaining())); err != nil {

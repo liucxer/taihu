@@ -150,6 +150,10 @@ type dataFrame struct {
 	endStream bool
 	h         []byte
 	reader    mem.Reader
+	// taihu fork: 发送数据的原始 BufferSlice（server 读路径整帧零拷贝用）。
+	// 与 reader 指向同一底层缓冲（引用计数由 Reader() 增加一次，快路径不额外
+	// 增加引用，读取后仍由 reader.Close() 统一归还）。
+	buffers mem.BufferSlice
 	// onEachWrite is called every time
 	// a part of data is written out.
 	onEachWrite func()
@@ -974,6 +978,49 @@ func (l *loopyWriter) processData() (bool, error) {
 	dSize := min(maxSize-hSize, dataItem.reader.Remaining())
 	remainingBytes := len(dataItem.h) + dataItem.reader.Remaining() - hSize - dSize
 	size := hSize + dSize
+
+	// taihu fork: server 读路径整帧零拷贝快速路径。
+	// 条件：server 侧、携带原始 data 缓冲、消息头非空、消息头未被截断
+	// （hSize==len(h)）、数据恰好一次读完（dSize==reader.Remaining()）且整条约消息
+	// 单帧发完（remainingBytes==0）。帧不小于 bufWriter batchSize（大帧才会整帧
+	// 触发 flush，走 writev 免拷贝；小帧保留 bufWriter 聚合，避免 syscall 数上升）。
+	// 此时数据帧是「连续 1MiB 数据」的典型场景，
+	// 直接 writeDataDirect 以 writev 一次性写出 [帧头+消息头+数据]，跳过：
+	//   (a) processData 的物化合并（sliceReader.Read 的 1MiB memmove + 1MiB 分配）；
+	//   (b) bufWriter 的二次 memmove + write syscall。
+	// 服务端读路径每帧从「2 次 1MiB memmove + 1 次 syscall」降为「1 次 writev syscall」。
+	if l.side == serverSide && dataItem.buffers != nil && len(dataItem.h) != 0 &&
+		hSize == len(dataItem.h) && dSize == dataItem.reader.Remaining() && remainingBytes == 0 &&
+		size >= l.framer.writer.batchSize {
+		str.wq.replenish(size)
+		if dataItem.onEachWrite != nil {
+			dataItem.onEachWrite()
+		}
+		if err := l.framer.writeDataDirect(dataItem.streamID, dataItem.endStream, dataItem.h, dataItem.buffers); err != nil {
+			return false, err
+		}
+		str.bytesOutStanding += size
+		l.sendQuota -= uint32(size)
+		dataItem.h = nil
+		_ = dataItem.reader.Close()
+		str.itl.dequeue()
+		str.state = empty
+		if trailer, ok := str.itl.peek().(*headerFrame); ok {
+			if err := l.writeHeader(trailer.streamID, trailer.endStream, trailer.hf, trailer.onWrite); err != nil {
+				return false, err
+			}
+			if err := l.cleanupStreamHandler(trailer.cleanup); err != nil {
+				return false, err
+			}
+		} else if str.itl.isEmpty() {
+			return false, nil
+		} else if int(l.oiws)-str.bytesOutStanding <= 0 {
+			str.state = waitingOnStreamQuota
+		} else {
+			l.activeStreams.enqueue(str)
+		}
+		return false, nil
+	}
 
 	var buf *[]byte
 

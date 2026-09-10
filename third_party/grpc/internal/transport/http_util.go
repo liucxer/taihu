@@ -21,6 +21,7 @@ package transport
 import (
 	"bufio"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -37,6 +38,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/mem"
 )
 
 const (
@@ -375,6 +377,30 @@ func (w *bufWriter) flushKeepBuffer() error {
 	return w.err
 }
 
+// writev 零拷贝写出多段缓冲（taihu fork，配合 framer.writeDataDirect 的整帧
+// 快速路径）。先把缓冲中待发的字节刷出（保证帧间顺序），随后用 writev 一次性
+// 写出 [HTTP/2 帧头 + gRPC 消息头 + 消息数据]，绕开本缓冲的 memmove 拷贝：
+// 底层的 *net.TCPConn 支持 gather write（syscall.Writev），1 次 syscall 完成
+// 整帧发送，无用户态数据拷贝。非 TCP 连接（如 TLS）回退为逐段 Write。
+func (w *bufWriter) writev(buffers net.Buffers) error {
+	if w.err != nil {
+		return w.err
+	}
+	if w.offset > 0 {
+		if err := w.flushKeepBuffer(); err != nil {
+			return err
+		}
+	}
+	// 保持池缓冲句柄有效，后续小帧仍走 buffered 路径。
+	if w.batchSize != 0 && w.buf == nil && w.pool != nil {
+		b := w.pool.Get().(*[]byte)
+		w.buf = *b
+	}
+	_, w.err = buffers.WriteTo(w.conn)
+	w.err = toIOError(w.err)
+	return w.err
+}
+
 type ioError struct {
 	error
 }
@@ -397,6 +423,37 @@ func toIOError(err error) error {
 type framer struct {
 	writer *bufWriter
 	fr     *http2.Framer
+}
+
+// writeDataDirect 零拷贝写出一条完整的 HTTP/2 DATA 帧（taihu fork）。
+// 仅用于 loopyWriter.processData 的整帧快速路径：整条 gRPC 消息
+// （5B 消息头 + 消息数据）恰好单帧可发时，直接以 writev 写出
+// [9B 帧头 + 消息头 + 消息数据]，跳过 (a) processData 的物化合并拷贝
+// （sliceReader.Read 的 1MiB memmove）和 (b) bufWriter 的二次 memmove，
+// 服务端读路径每帧从「2 次 1MiB memmove + 1 次 syscall」降为「1 次 writev
+// syscall」。帧头布局与 x/net/http2 WriteData 一致（3B 长度 + 1B type +
+// 1B flags + 4B stream id，无 padding）。
+func (f *framer) writeDataDirect(streamID uint32, endStream bool, hdr []byte, data mem.BufferSlice) error {
+	payloadLen := len(hdr) + data.Len()
+	var fh [9]byte
+	fh[0] = byte(payloadLen >> 16)
+	fh[1] = byte(payloadLen >> 8)
+	fh[2] = byte(payloadLen)
+	fh[3] = byte(http2.FrameData)
+	if endStream {
+		fh[4] = byte(http2.FlagDataEndStream)
+	}
+	binary.BigEndian.PutUint32(fh[5:], streamID&0x7fffffff)
+
+	buffers := make(net.Buffers, 0, 2+len(data))
+	buffers = append(buffers, fh[:])
+	if len(hdr) > 0 {
+		buffers = append(buffers, hdr)
+	}
+	for _, b := range data {
+		buffers = append(buffers, b.ReadOnlyData())
+	}
+	return f.writer.writev(buffers)
 }
 
 var writeBufferPoolMap = make(map[int]*sync.Pool)
