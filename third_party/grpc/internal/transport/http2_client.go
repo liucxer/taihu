@@ -45,6 +45,7 @@ import (
 	imetadata "google.golang.org/grpc/internal/metadata"
 	istatus "google.golang.org/grpc/internal/status"
 	isyscall "google.golang.org/grpc/internal/syscall"
+	"google.golang.org/grpc/internal/tbpool"
 	"google.golang.org/grpc/internal/transport/networktype"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/mem"
@@ -1207,14 +1208,10 @@ func (t *http2Client) handleData(f *http2.DataFrame) {
 		// TODO(bradfitz, zhaoq): A copy is required here because there is no
 		// guarantee f.Data() is consumed before the arrival of next frame.
 		// Can this copy be eliminated?
+		// 收帧缓冲落在 tbpool 对齐桶（FrameBuffer），单帧完整场景可被应用层
+		// RawFrame.Take 零拷贝移交（免收流聚合拷贝）；小帧/多缓冲仍走默认池合并。
 		if len(f.Data()) > 0 {
-			pool := t.bufferPool
-			if pool == nil {
-				// Note that this is only supposed to be nil in tests. Otherwise, stream is
-				// always initialized with a BufferPool.
-				pool = mem.DefaultBufferPool()
-			}
-			s.write(recvMsg{buffer: mem.Copy(f.Data(), pool)})
+			s.write(recvMsg{buffer: tbpool.CopyToFrame(f.Data())})
 		}
 	}
 	// The server has closed the stream without sending trailers.  Record that

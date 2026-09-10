@@ -108,11 +108,15 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) ([]byte,
 		return nil, rpcToErr(err)
 	}
 	var pos int64
+	var fast []byte // 单帧零拷贝移交的缓冲（仍须消费流至 EOF 归还流控/收尾）
 	for {
 		var f rpc.RawFrame
 		if err := stream.RecvMsg(&f); err != nil {
 			if err == io.EOF {
 				break
+			}
+			if fast != nil {
+				bufpool.Put(fast)
 			}
 			bufpool.Put(buf)
 			return nil, rpcToErr(err)
@@ -120,6 +124,15 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) ([]byte,
 		if f.Remaining() == 0 {
 			f.Free()
 			continue
+		}
+		// 单帧即完整对象（收帧缓冲为 tbpool FrameBuffer 时）：零拷贝移交，
+		// 免收流聚合拷贝；随后仍消费至 EOF 完成流收尾。
+		if pos == 0 && int64(f.Len()) >= size {
+			if raw := f.Take(); raw != nil {
+				fast = raw[:size]
+				pos = size
+				continue
+			}
 		}
 		if pos >= size {
 			f.Free()
@@ -129,6 +142,10 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) ([]byte,
 		n := f.CopyTo(out[pos:])
 		pos += int64(n)
 		f.Free()
+	}
+	if fast != nil {
+		bufpool.Put(buf) // 预取的聚合缓冲未用到，归还
+		return fast, nil
 	}
 	if pos != size {
 		bufpool.Put(buf)

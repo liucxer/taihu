@@ -55,6 +55,32 @@ func (f *RawFrame) CopyTo(dst []byte) int {
 	return n
 }
 
+// Take 零拷贝移交底层收帧缓冲：当底层缓冲实现 Raw() []byte（即 grpc
+// internal/tbpool 的 FrameBuffer，底层为 4K 对齐池缓冲）时，移交其完整数据
+// 切片并清除本帧引用（调用方负责归还底层池，调用方可直接 bufpool.Put 语义
+// 归还该切片）。非该类型（默认池缓冲/多缓冲合并产物）返回 nil，调用方走聚合路径。
+func (f *RawFrame) Take() []byte {
+	if f.buf == nil || f.off != 0 {
+		return nil
+	}
+	rawGetter, ok := f.buf.(interface{ Raw() []byte })
+	if !ok {
+		return nil
+	}
+	raw := rawGetter.Raw()
+	if len(raw) < f.len {
+		return nil
+	}
+	raw = raw[:f.len]
+	if len(raw) == 0 {
+		return nil
+	}
+	// 移交所有权：清引用，底层池缓冲由调用方归还。
+	f.buf = nil
+	f.len, f.off = 0, 0
+	return raw
+}
+
 // Free 释放引用（归还 gRPC wire 缓冲池 / bufpool）。调用后不得再使用。
 func (f *RawFrame) Free() {
 	if f.buf != nil {
