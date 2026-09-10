@@ -1,0 +1,99 @@
+# 2a0a2ec 读写性能测试报告
+
+> 对应提交：`2a0a2ec`（perf: device Append 地址对齐零拷贝快路径、读写帧限制 4M、客户端 Get 整对象同步聚合）
+
+## 1. 测试目标
+
+验证提交 `2a0a2ec` 本地 Storage 面的读写性能，重点确认 device 层 Append 地址对齐零拷贝快路径与 ReadAt 池化返回改造，对 4M 大对象带宽、延迟及资源占用的影响；同时采样 4K 小对象路径与 pprof 热点。
+
+## 2. 测试环境
+
+| 项目 | 值 |
+| --- | --- |
+| 服务器 | 100.71.128.12（内网直连，nefs-proxy 9527） |
+| CPU | 96 核；整机均值采集（mpstat -P ALL），非瓶颈 |
+| 内存 | 约 756 GiB |
+| 数据设备 | /dev/nvme1n1，1.92 TB NVMe SSD（RP2A21T9RK004LX） |
+| 元数据 | /tmp/tdb（pebble，tmpfs） |
+| 对象大小 | 4 MiB（4096B）/ 4 KiB（4096B）两档 |
+| 部署方式 | 本地编译产物 /tmp/taihu-bench.new（commit 2a0a2ec），goods校 直连本地 Storage，未走 RPC/网络 |
+| 编译 | go build ./cmd/taihu-bench（128.12 内置 Go） |
+
+## 3. 测试方法
+
+taihu-bench 参数：`-mode write|read -size -threads -count -keys-prefix -db /tmp/tdb -dev /dev/nvme1n1 -latency -report-interval 5s`。
+
+- **写不留坑**：先 `-mode write` 写入 `count` 个 key，再 `-mode read` 读同一批（key 不重复）。
+- 线程档位：4M 写用 1/4/16 对比扩展性；读写主测 16 线程。
+- 每轮测试期间后台 `iostat -d` 与 `mpstat -P ALL` 逐秒采样，结束按稳态样本解析真实磁盘带宽/CPU。
+- 小对象主测 16 线程（200000 个 4K）。
+
+## 4. 测试结果
+
+### 4.1 带宽与最低线程数
+
+**4M 写：**
+
+| 线程 | 吞吐 (MiB/s) | ops/s | 达标分析 |
+| --- | --- | --- | --- |
+| 1 | 2455.15 | 613.79 | 已远超 0.5GB/s 阈值 |
+| 4 | 2573.84 | 643.46 | 已达设备极限 |
+| 16 | 2577.21 | 644.30 | 持平，扩展性饱和 |
+
+最低线程数 ≈ **1**（单线程即达 ~2.45 GB/s，扩展到 4 线程封顶于设备写极限 ~2.5 GB/s）。相比此前全局 Storage 互斥锁时代的 ~1.48 GB/s，写带宽显著提升至设备写极限。
+
+**4M 读（16 线程）：** `6602.43 MiB/s`，`1650.61 ops/s`；设备实测读带宽峰值 6774 MiB、均值 5714 MiB —— 无 RPC 时收敛于盘读极限（约 6.5 GB/s）。
+
+### 4.2 延迟
+
+**4M 写（-latency）：**
+
+| 线程 | p50 | p90 | p99 |
+| --- | --- | --- | --- |
+| 1 | 1.62ms | 1.64ms | 1.69ms |
+| 4 | 6.18ms | 6.24ms | 7.09ms |
+| 16 | 24.70ms | 25.46ms | 27.32ms |
+
+**4M 读（16 线程）：** p50=9.59ms p90=11.48ms p99=13.60ms。
+
+**4K 小对象（16 线程）：** 写 p50=0.06ms p99=1.96ms（39724 ops/s）；读 p50=0.10ms p99=0.78ms（134071 ops/s）。
+
+## 5. 资源占用
+
+### 5.1 CPU
+
+- **4M 写**：整机 idle 83.6% / busy 16.4%，usr 0.3% sys 0.3%（all 均值）；TOP 忙核均以 iowait 为主（core37 69%、core16 62%）。测试进程 CPU 占用仅 ~17%，**非 CPU 瓶颈，IO 等待主导**。
+- **4M 读**：整机 idle 80.4% / busy 19.6%，usr 1.2% sys 0.9% iowait 17.1%；TOP 忙核 iowait 30–44%。**非 CPU 瓶颈，磁盘读取主导**。
+- **4K 读/写**：idle 96.3% / 81.1%，usr 略升（逐核 ~10–23%），仍是 IO/元数据同步路径为主。
+
+结论：**整机 CPU 空闲充足，读写均非 CPU 瓶颈**；忙核为磁盘 iowait。
+
+### 5.2 磁盘（iostat 实测 /dev/nvme1n1）
+
+| 场景 | 实测带宽均值 | 实测带宽峰值 | 说明 |
+| --- | --- | --- | --- |
+| 4M 写 16T | 2496 MiB/s | 2589 MiB/s | 与 bench 2577 MiB/s 吻合，即设备写极限 |
+| 4M 写 1T | 2181 MiB/s | 2460 MiB/s | 单流写 |
+| 4M 读 16T | 5714 MiB/s | 6774 MiB/s | 收敛于盘读极限 |
+| 4K 写 16T | 129.6 MiB/s | 189.6 MiB/s | 随机小写 + pgl同步元数据 |
+| 4K 读 16T | 189.3 MiB/s | 377.2 MiB/s | 随机小读 tps 受限 |
+
+结论：**4M 大对象读写均直接收敛于盘 IO 极限；4K 小对象受随机小 IO 与同步 pebble 元数据上限约束**。
+
+### 5.3 网络
+
+本测试为本地 Storage 直连（无 RPC），网络不参与，N/A。
+
+## 6. 瓶颈分析与 pprof 热点
+
+- **4M 写 pprof**（进程仅 ~16.8% CPU）：`internal/runtime/syscall.Syscall6` 75.76% 为最大热点，辅以 futex、pebble makeRoomForWrite/flushPending。写入干净地落在 syscall + 磁盘等待，**无用户态拷贝/分配热占** —— 证明 Append 地址对齐快路径（整对象单次 WriteAt 直写）已消除此前每对象整块对齐缓冲分配。
+- **4M 读 pprof**：GC 支配：`gcBgMarkWorker` cum 73.04%、`gcWork.tryGetObjFast` 42.93%、`memclrNoHeapPointers` 11.83%、`gcDrain` 21.86%。虽读受盘极限约束，但进程内仍有显著堆分配/GC 压力（高并发 4MiB 缓冲 + goroutine 栈增长），是后续优化的最大用户态热源。
+
+**前 5 热点（读）**：gcWork.tryGetObjFast / memclrNoHeapPointers / syscall.Syscall6 / markBits.setMarked / gcBits.bitp。
+
+## 7. 结论与建议
+
+1. **写路径达标**：4M 写带宽 2.58 GB/s，已达 NVMe 写极限；单线程即超 0.5GB/s 阈值，算法扩展性好。O_DIRECT 对齐快路径生效，写进程仅 ~17% CPU，无用户态拷贝热占用。
+2. **读路径达标**：4M 读 6.6 GB/s，收敛于盘读极限；整机 idle 80%。
+3. **小对象路径**：4K 读 13.4 万 ops/s、写 3.97 万 ops/s，受随机小 IO 与同步元数据上限约束，CPU 空闲。
+4. **优化方向**：读路径 GC 压力仍为首要热源（~73% 时间在 GC），当前受盘极限掩盖；若未来提升盘读取能力或降低对象尺寸，应优先治理高并发下 4MiB 缓冲与本库读请求的堆分配/GC 压力。
