@@ -269,6 +269,11 @@ const (
 	// allocator injected via SetAlignedAllocator (e.g. bufpool). On release such a
 	// node is returned to that allocator instead of netpoll's internal mcache.
 	flagAligned uint8 = 1 << 2 // 0000 0100
+	// flagInputAligned marks a buffer node allocated by the input node allocator
+	// injected via SetInputAlignedAllocator: exact-size (== wire frame size), 4K-aligned,
+	// so each input node holds at most one frame and, once fully consumed, is never
+	// written again — enabling zero-copy TakeTry handoff to callers.
+	flagInputAligned uint8 = 1 << 3 // 0000 1000
 )
 
 // alignedAllocGet/alignedAllocPut are injected by SetAlignedAllocator. When set,
@@ -289,6 +294,32 @@ var (
 func SetAlignedAllocator(get func(n int) []byte, put func(b []byte)) {
 	alignedAllocGet = get
 	alignedAllocPut = put
+}
+
+// inputAllocGet/inputAllocPut are injected by SetInputAlignedAllocator. When set,
+// connection inputBuffer nodes are allocated EXACTLY at their capacity (the wire frame
+// size) instead of the bucket-rounded alignedAllocGet, so a node can never hold more
+// than one frame. Such a node, once fully consumed, is never written again, which is
+// the invariant that makes zero-copy TakeTry handoff safe.
+var (
+	inputAllocGet func(n int) []byte
+	inputAllocPut func(b []byte)
+	inputNodeSize int
+)
+
+// SetInputAlignedAllocator injects a pluggable exact-size aligned allocator used only
+// for connection inputBuffer nodes (see book). get(n) must return a slice with
+// len/cap == n whose first byte address is aligned; put returns a slice produced by get.
+func SetInputAlignedAllocator(get func(n int) []byte, put func(b []byte)) {
+	inputAllocGet = get
+	inputAllocPut = put
+}
+
+// SetInputNodeSize caps the capacity of connection inputBuffer nodes in bytes.
+// book() clamps the adaptive maxSize at this value so a node never exceeds a single
+// wire frame. 0 disables the cap (fully adaptive, matching upstream behaviour).
+func SetInputNodeSize(n int) {
+	inputNodeSize = n
 }
 
 // malloc limits the cap of the buffer from mcache.

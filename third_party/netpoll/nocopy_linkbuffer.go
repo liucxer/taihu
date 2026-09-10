@@ -425,6 +425,47 @@ func (b *UnsafeLinkBuffer) Slice(n int) (r Reader, err error) {
 	return p, b.Release()
 }
 
+// TakeTry 尝试把剩余可读数据作为整块缓冲移交（零拷贝）：
+//   - 数据须位于单一节点内（b.head==b.read 且 b.read.next==nil；Slice 生成的
+//     子 Reader 会把 flush 置 nil，故以链表末节点判定单节点）；
+//   - 该节点须为收流精确对齐节点（flagInputAligned，容量=帧长，ack 后不再写入）；
+//   - 节点已被本帧完整消费（origin 无剩余未读数据，其余引用仅剩本 Reader）；
+//   - 节点已写满（origin.malloc == cap）：未写满节点 book 仍会复用其缓冲，
+//     移交后被再写入会造成缓冲归属错乱，必须回退拷贝路径。
+//
+// 成功时返回 (buf, full, true)：buf 为负载切片（len==剩余负载），底层为整块精确
+// 对齐缓冲；full 为整块缓冲（len==cap==节点容量，PutExact 按此归桶）。调用方用毕
+// 必须经 SetInputAlignedAllocator 的 put 归还 full（不可归还 buf：其为子切片，
+// cap 已被截断）；且此后不得再调用本 Reader 的 Release（缓冲所有权已移交，避免
+// 双归还）。作为防御，origin 会被标记为不可复用（flagUnmanaged），即使发生越界
+// Release 也只会回收节点对象、不会再次归还缓冲（缓冲归还唯一路径是调用方的 put）。
+// 不满足任一条件返回 (nil, nil, false)，调用方回退 ReadCopy/Next 拷贝路径。
+func (b *UnsafeLinkBuffer) TakeTry() (buf, full []byte, ok bool) {
+	if b.head != b.read || b.read == nil || b.read.next != nil {
+		return nil, nil, false
+	}
+	node := b.read
+	origin := node.origin
+	if origin == nil || !origin.getFlag(flagInputAligned) {
+		return nil, nil, false
+	}
+	if origin.Len() != 0 {
+		return nil, nil, false // origin 仍有未读数据（多帧同节点），移交会丢数据
+	}
+	if origin.malloc != cap(origin.buf) {
+		return nil, nil, false // 节点未写满，book 仍会复用其缓冲
+	}
+	// 所有权移交：缓冲归还唯一路径为调用方的 put，节点对象后续 Release 不再归还缓冲。
+	origin.setFlag(flagUnmanaged)
+	// 负载起点在 origin 缓冲内的偏移：origin 被本帧完整消费，故
+	// base = len(origin.buf) - len(node.buf)，负载 = node.buf[node.off:]。
+	base := len(origin.buf) - len(node.buf)
+	start := base + node.off
+	// 三索引切片 cap 界取 start+Len()：结果 len==cap==负载长（子切片不可独立归池，
+	// 归还统一走 full）。
+	return origin.buf[start : start+node.Len() : start+node.Len()], origin.buf, true
+}
+
 // ------------------------------------------ implement zero-copy writer ------------------------------------------
 
 // Malloc pre-allocates memory, which is not readable, and becomes readable data after submission(e.g. Flush).
@@ -694,6 +735,19 @@ func (b *UnsafeLinkBuffer) GetBytes(p [][]byte) (vs [][]byte) {
 	return p[:i]
 }
 
+// newInputLinkBufferNode 创建收流节点：缓冲精确为 size（4K 对齐，非分桶），
+// 容量==帧长。读满一帧后 l==0，节点永不再被追加（一帧一节点），
+// 且被完整消费的节点可经 TakeTry 零拷贝移交调用方。
+func newInputLinkBufferNode(size int) *linkBufferNode {
+	node := linkedPool.Get().(*linkBufferNode)
+	node.off, node.malloc, node.refer = 0, 0, 1
+	atomic.StoreInt32(&node.mode, int32(defaultLinkBufferMode))
+	node.buf = inputAllocGet(size)
+	node.buf = node.buf[:0]
+	node.setFlag(flagInputAligned)
+	return node
+}
+
 // book will grow and malloc buffer to hold data.
 //
 // bookSize: The size of data that can be read at once.
@@ -701,11 +755,21 @@ func (b *UnsafeLinkBuffer) GetBytes(p [][]byte) (vs [][]byte) {
 //
 //	guarantee all data allocated in one node to reduce copy.
 func (b *UnsafeLinkBuffer) book(bookSize, maxSize int) (p []byte) {
+	// 收流节点容量上限：钳制到单帧长，避免自适应 maxSize 膨胀为多帧节点
+	// （多帧节点既破坏零拷贝 Take 的前置条件，也放大 readv 单次拷贝面）。
+	if inputNodeSize > 0 && maxSize > inputNodeSize {
+		maxSize = inputNodeSize
+	}
 	l := cap(b.write.buf) - b.write.malloc
 	// grow linkBuffer
 	if l == 0 {
 		l = maxSize
-		b.write.next = newLinkBufferNode(maxSize)
+		if inputAllocGet != nil && maxSize > 0 {
+			// 精确尺寸对齐节点：容量==maxSize，读满一帧后 l==0，天然一帧一节点。
+			b.write.next = newInputLinkBufferNode(maxSize)
+		} else {
+			b.write.next = newLinkBufferNode(maxSize)
+		}
 		b.write = b.write.next
 	}
 	if l > bookSize {
@@ -939,9 +1003,12 @@ func (node *linkBufferNode) Release() (err error) {
 	if atomic.AddInt32(&node.refer, -1) == 0 {
 		// readonly nodes cannot recycle node.buf, other node.buf are recycled to mcache.
 		if node.reusable() {
-			if node.getFlag(flagAligned) && alignedAllocPut != nil {
+			switch {
+			case node.getFlag(flagInputAligned) && inputAllocPut != nil:
+				inputAllocPut(node.buf)
+			case node.getFlag(flagAligned) && alignedAllocPut != nil:
 				alignedAllocPut(node.buf)
-			} else {
+			default:
 				free(node.buf)
 			}
 		}

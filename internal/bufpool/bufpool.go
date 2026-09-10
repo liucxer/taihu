@@ -143,3 +143,52 @@ func alignedBuffer(n int) []byte {
 	}
 	return backing[start : start+n : start+n]
 }
+
+// ---------- 精确尺寸对齐池（零拷贝 Take 收流节点/移交缓冲共用） ----------
+
+// exactSizePool 按 len（==cap）分桶的精确尺寸对齐池：容量不按 2 幂取整。
+// 服务对象是 netpoll 收流节点与客户端 Get 零拷贝移交缓冲：两者容量一致（=帧长），
+// 节点缓冲经 TakeTry 移交后由调用方 PutExact 归还，即可被后续 Get/收流节点复用。
+type exactSizePool struct {
+	mu       sync.Mutex
+	freelist map[int][][]byte
+}
+
+var exactPool = &exactSizePool{freelist: make(map[int][][]byte)}
+
+// GetExact 返回 4K 对齐、len==n、cap==n 的精确尺寸缓冲（不按 2 幂取整）。
+// n<=0 返回 nil。供 netpoll 收流节点（book 一帧一节点）与 Get 移交缓冲共用。
+func GetExact(n int) []byte {
+	if n <= 0 {
+		return nil
+	}
+	exactPool.mu.Lock()
+	if fl := exactPool.freelist[n]; len(fl) > 0 {
+		buf := fl[len(fl)-1]
+		exactPool.freelist[n] = fl[:len(fl)-1]
+		exactPool.mu.Unlock()
+		return buf
+	}
+	exactPool.mu.Unlock()
+	return alignedBuffer(n)
+}
+
+// PutExact 归还精确尺寸缓冲：按 cap 归一化到原始容量再入对应桶，
+// 使任意 cap==原始容量的子切片也能归位复用（TakeTry 场景归还整块 full，
+// 其 len==cap==节点容量，直接按节点容量归桶）。
+// 非池产物（nil 等）被忽略。
+func PutExact(buf []byte) {
+	if buf == nil || cap(buf) == 0 {
+		return
+	}
+	if len(buf) < cap(buf) {
+		buf = buf[:cap(buf)]
+	}
+	n := len(buf)
+	exactPool.mu.Lock()
+	fl := exactPool.freelist[n]
+	if len(fl) < maxKeep {
+		exactPool.freelist[n] = append(fl, buf)
+	}
+	exactPool.mu.Unlock()
+}

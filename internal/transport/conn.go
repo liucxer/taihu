@@ -20,8 +20,14 @@ const dialTimeout = 10 * time.Second
 
 // init 使 netpoll 接收缓冲改用 bufpool 对齐分配：收流帧载荷落在单个对齐节点内时，
 // 客户端 Get 可直接移交该缓冲给调用方（零拷贝），并经由 bufpool.Put 安全归还。
+//
+// 收流节点进一步改为精确尺寸对齐分配（容量=单帧线上总长 inputNodeSize）：
+// 每帧独占一个节点，读满一帧后 book 剩余容量为 0、节点不再被复用——这是
+// TakeTry 零拷贝移交（一帧一缓冲、移交后不被 netpoll 再写入）的前置条件。
 func init() {
 	netpoll.SetAlignedAllocator(bufpool.Get, bufpool.Put)
+	netpoll.SetInputAlignedAllocator(bufpool.GetExact, bufpool.PutExact)
+	netpoll.SetInputNodeSize(inputNodeSize)
 }
 
 // streamInCap 每流投递缓冲上限：读循环背压到流处理器消费速度。
@@ -131,6 +137,13 @@ func (c *Conn) readLoop() {
 		}
 		sub, err := c.c.Reader().Slice(4 + int(lenField))
 		if err != nil {
+			return
+		}
+		// 归还主 Reader 已消费节点：Slice 单节点路径不释放主 Reader（多节点路径内部
+		// 已释放），而精确尺寸收流节点一帧一节点、无跨帧复用，若不主动 Release，
+		// 节点链将随帧数无限增长。此释放对已移交（TakeTry）节点仅减引用，不触缓冲归还。
+		if err := c.c.Reader().Release(); err != nil {
+			_ = sub.Release()
 			return
 		}
 		// Slice 覆盖整帧（含 4 字节长度前缀），先跳过长度字段，子 Reader 定位到 sid。
@@ -281,14 +294,16 @@ func (c *Conn) Put(ctx context.Context, key string, size int64, in []byte) error
 
 // Get 读取对象内 [off, off+size) 子区间并返回整块数据（size=-1 读至结尾）。
 //
-// 返回 (data, release, err)：data len==size 为本次调用私有缓冲（4K 对齐 bufpool
-// 缓冲）；调用方用毕必须调用 release()（幂等）归还。收流帧逐帧汇入对齐缓冲，全程
-// 恰一次用户态拷贝（header 消耗 + 帧数据逐段 copy），正确性不依赖 netpoll 节点复用。
+// 返回 (data, release, err)：data len==size 为本次调用私有缓冲；调用方用毕必须调用
+// release()（幂等）归还。
 //
-// 说明：曾尝试“单帧零拷贝移交 netpoll 收节点”给调用方，但客户端诊断 Reader 会把
-// 该节点当作活跃写节点复用（bookAck 对同一 backing array 追加后续帧），Take 归还到
-// bufpool 后会被再次写入，构成内存生命周期错乱（-race 实证）。按计划风险回退条款，
-// 此路径收敛为 1 次对齐汇入拷贝，与本地 ReadAt 语义一致。
+// 两条路径：
+//   - 零拷贝移交（整响应恰一帧，且收流节点为精确尺寸一帧一节点）：TakeTry 直接移交
+//     netpoll 收流节点缓冲给调用方，data 引用该缓冲，全程零用户态拷贝，release 经
+//     bufpool.PutExact 归还。移交成功后不得再 Release 该帧子 Reader（缓冲所有权已转移，
+//     避免双归还）；原节点引用由归还路径收尾（节点对象随之失联交由 GC）。
+//   - 对齐汇入（多帧响应或移交失败回退）：逐帧 ReadCopy/Next 汇入 bufpool 对齐缓冲，
+//     恰一次用户态拷贝，release 经 bufpool.Put 归还。正确性不依赖 netpoll 节点复用。
 func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, func(), error) {
 	if size < 0 {
 		total, err := c.Stat(ctx, key)
@@ -311,16 +326,22 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 
 	var (
 		pos      int64
-		buf      []byte // 汇集缓冲（对齐池，out = buf[:size]）
+		buf      []byte // 汇集缓冲（对齐池，out = buf[:size]）；多帧路径
+		taken    []byte // 零拷贝移交缓冲（TakeTry 单帧路径）：负载切片，data 直接引用
+		fullBuf  []byte // 同上：整块精确对齐缓冲（len==cap==节点容量），用毕 PutExact 归还
 		out      []byte // 返回缓冲
 		disposed bool
 	)
-	// dispose 幂等归还最终占用的缓冲。
+	// dispose 幂等归还最终占用的缓冲：移交缓冲走精确池，汇集缓冲走对齐池。
 	dispose := func() {
 		if disposed {
 			return
 		}
 		disposed = true
+		if fullBuf != nil {
+			bufpool.PutExact(fullBuf)
+			return
+		}
 		if buf != nil {
 			bufpool.Put(buf)
 		}
@@ -340,7 +361,21 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 				dispose()
 				return nil, nil, fmt.Errorf("taihu: get stream exceeds requested size")
 			}
-			if buf == nil {
+			if buf == nil && taken == nil {
+				if rem == size {
+					// 整响应恰一帧：尝试零拷贝移交收流节点缓冲。成功则 data 直接引用
+					// 该缓冲（dispose 经 PutExact 归还 fullBuf），此后不得再 Release 本帧子
+					// Reader（所有权已移交，避免双归还）；不满足单节点条件回退对齐汇入。
+					if tt, ok := msg.r.(interface{ TakeTry() ([]byte, []byte, bool) }); ok {
+						if b, full, ok := tt.TakeTry(); ok {
+							taken = b
+							fullBuf = full
+							out = b
+							pos = size
+							continue // 不 Release：所有权移交
+						}
+					}
+				}
 				buf = bufpool.Get(int(size))
 				out = buf[:size]
 			}

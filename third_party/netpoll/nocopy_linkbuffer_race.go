@@ -101,6 +101,13 @@ func (b *SafeLinkBuffer) Slice(n int) (r Reader, err error) {
 	return b.UnsafeLinkBuffer.Slice(n)
 }
 
+// TakeTry implements Reader.
+func (b *SafeLinkBuffer) TakeTry() (buf, full []byte, ok bool) {
+	b.Lock()
+	defer b.Unlock()
+	return b.UnsafeLinkBuffer.TakeTry()
+}
+
 // ------------------------------------------ implement zero-copy writer ------------------------------------------
 
 // Malloc implements Writer.

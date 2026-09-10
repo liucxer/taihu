@@ -34,6 +34,12 @@ const frameHeaderLen = 5
 // maxFrameTotal 帧负载上限 = frameHeaderLen + chunkSize。
 const maxFrameTotal = frameHeaderLen + chunkSize
 
+// inputNodeSize netpoll 收流节点容量上限：钳到单帧线上总长
+// （4B 长度前缀 + frameHeaderLen + chunkSize）。节点容量==整帧线上大小，
+// 读满一帧后 book 的剩余容量为 0，节点不再被复用（一帧一节点），
+// 客户端 Get 可经 TakeTry 零拷贝移交该节点缓冲给调用方。
+const inputNodeSize = 4 + maxFrameTotal
+
 // OpCode 帧操作码。
 type OpCode byte
 
