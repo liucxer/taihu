@@ -121,9 +121,9 @@ func stopCPUProfile(cpuFile *os.File) {
 
 func (c *config) validate() error {
 	switch c.mode {
-	case "write", "read":
+	case "write", "read", "delete":
 	default:
-		return fmt.Errorf("invalid -mode %q: must be write or read", c.mode)
+		return fmt.Errorf("invalid -mode %q: must be write, read or delete", c.mode)
 	}
 	if c.addr == "" {
 		return fmt.Errorf("-addr is required")
