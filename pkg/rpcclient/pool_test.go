@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/test/bufconn"
 
+	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/rpcserver"
 	"github.com/liucxer/taihu/pkg/taihu"
 )
@@ -78,6 +79,9 @@ func TestDialPoolRoundTrip(t *testing.T) {
 		}
 		if !bytes.Equal(got, payload) {
 			t.Fatalf("Get mismatch key=%s got=%dB want=%dB", key, len(got), len(payload))
+		}
+		if got != nil {
+			bufpool.Put(got) // Get 返回池化缓冲，用毕归还
 		}
 		sz, err := s.Stat(context.Background(), key)
 		if err != nil || sz != int64(len(payload)) {

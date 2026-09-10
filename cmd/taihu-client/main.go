@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/pkg/rpcclient"
 )
 
@@ -82,6 +83,9 @@ func doGet(ctx context.Context, s *rpcclient.Storage, key string, off, size int6
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "get %q: %v\n", key, err)
 		os.Exit(1)
+	}
+	if data != nil {
+		defer bufpool.Put(data) // Get 返回池化缓冲，用毕归还
 	}
 
 	var out io.Writer

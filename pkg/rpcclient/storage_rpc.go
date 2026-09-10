@@ -75,19 +75,37 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in []byte) er
 	return rpcToErr(err)
 }
 
-// Get 读取对象内 [off, off+size) 子区间并返回整块数据（独立副本）。
-// size=-1 表示读到对象结尾（返回长度由服务端截断决定）。收流用 RawFrame 延迟物化，
-// 每帧单次拷贝进返回缓冲（避免逐帧物化的堆分配）。
+// Get 读取对象内 [off, off+size) 子区间并返回整块数据。
+// size=-1 表示读到对象结尾（先经 Stat 取对象总长再按无头定长读取）。
+//
+// 返回值为 bufpool 池化缓冲（4K 对齐，len==size），调用方用毕必须交还
+// bufpool.Put(返回值)，否则造成池泄漏——与本地 Storage.ReadAt 语义一致。
+// 收流用 RawFrame 延迟物化，每帧单次拷贝进返回缓冲（避免逐帧物化的堆分配）。
 func (s *Storage) Get(ctx context.Context, key string, off, size int64) ([]byte, error) {
+	if size < 0 {
+		// 未知长度：先取对象总长，与服务端 Get size=-1 的截断语义一致。
+		total, err := s.Stat(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		size = total - off
+	}
+	if size < 0 {
+		return nil, taihu.ErrInvalidRange
+	}
+	if size == 0 {
+		return nil, nil
+	}
+
+	// 池化返回缓冲：复用 bufpool 对齐缓冲，替代每 op make 4M（清零+GC 压力）。
+	buf := bufpool.Get(int(size))
+	out := buf[:size]
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stream, err := s.pick().Get(cctx, &rpc.GetReq{Key: key, Off: off, Size: size})
 	if err != nil {
+		bufpool.Put(buf)
 		return nil, rpcToErr(err)
-	}
-	var out []byte
-	if size >= 0 {
-		out = make([]byte, size)
 	}
 	var pos int64
 	for {
@@ -96,27 +114,24 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) ([]byte,
 			if err == io.EOF {
 				break
 			}
+			bufpool.Put(buf)
 			return nil, rpcToErr(err)
 		}
 		if f.Remaining() == 0 {
 			f.Free()
 			continue
 		}
-		if size >= 0 {
-			if pos >= size {
-				f.Free()
-				return nil, fmt.Errorf("taihu: get stream exceeds requested size %d", size)
-			}
-			n := f.CopyTo(out[pos:])
-			pos += int64(n)
+		if pos >= size {
 			f.Free()
-		} else {
-			// 未知总长：动态累积（先拷贝后释放引用）。
-			out = append(out, f.Data()...)
-			f.Free()
+			bufpool.Put(buf)
+			return nil, fmt.Errorf("taihu: get stream exceeds requested size %d", size)
 		}
+		n := f.CopyTo(out[pos:])
+		pos += int64(n)
+		f.Free()
 	}
-	if size >= 0 && pos != size {
+	if pos != size {
+		bufpool.Put(buf)
 		return nil, fmt.Errorf("taihu: get short read: got %d want %d", pos, size)
 	}
 	return out, nil
