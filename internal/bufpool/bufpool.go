@@ -119,6 +119,10 @@ func (p *alignedBufPool) poolFor(b int) *bytePool {
 
 // alignedBuffer 返回长度 n 且首地址按 4K 对齐的字节切片，
 // 以满足 O_DIRECT 的缓冲对齐要求。多分配 BlockSize(4K) 用于对齐回退并切回正确长度。
+//
+// 返回值用三索引切片（cap == n）确保归还方按 cap 归一化后落在与 Get 一致的桶：
+// 若 cap 保留为 (n+4096)-start（>n），Put 归一化后 len>n 会落入高一档桶，
+// 导致 Get(n) 永远取不到本桶缓冲而持续冷分配（实测复用率 0 的根因）。
 func alignedBuffer(n int) []byte {
 	const blockSize = 4096
 	backing := make([]byte, n+blockSize)
@@ -126,5 +130,5 @@ func alignedBuffer(n int) []byte {
 	if start != 0 {
 		start = blockSize - start
 	}
-	return backing[start : start+n]
+	return backing[start : start+n : start+n]
 }
