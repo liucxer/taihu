@@ -34,3 +34,7 @@ require (
 	google.golang.org/grpc v1.69.2 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 )
+
+// taihu fork: 大帧优化（http2MaxFrameLen 16KB -> 1MiB），消除客户端读路径多缓冲
+// 合并拷贝、削减服务端逐帧处理与 syscall 次数。客户端/服务端必须同步升级。
+replace google.golang.org/grpc => ./third_party/grpc
