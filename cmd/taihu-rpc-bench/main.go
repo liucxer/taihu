@@ -14,7 +14,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/pkg/rpcclient"
 )
 
@@ -170,12 +169,13 @@ func runWorker(ctx context.Context, s *rpcclient.Storage, c *config, s0, e0 int,
 			err = s.Put(ctx, key, c.size, payload)
 		case "read":
 			var got []byte
-			got, err = s.Get(ctx, key, 0, c.size)
+			var rel func()
+			got, rel, err = s.Get(ctx, key, 0, c.size)
 			if err == nil && int64(len(got)) != c.size {
 				err = fmt.Errorf("key %s: short read %d != %d", key, len(got), c.size)
 			}
 			if got != nil {
-				bufpool.Put(got) // Get 返回池化缓冲，校验后即归还
+				rel() // Get 返回私有缓冲，校验后即归还
 			}
 		}
 		if c.latency {

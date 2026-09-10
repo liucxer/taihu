@@ -41,7 +41,18 @@ type alignedBufPool struct {
 	pools [maxBufBucket - logBlockSize + 1]*bytePool
 }
 
-var pool = &alignedBufPool{}
+var pool = newAlignedPool()
+
+// newAlignedPool 一次性构建全部桶，避免运行期并发懒初始化（poolFor 写有时序竞态，
+// netpoll 对齐分配器会让多个 goroutine 同时首次触达同一新桶而触发 -race）。此后
+// poolFor 退化为纯读，线程安全。
+func newAlignedPool() *alignedBufPool {
+	p := &alignedBufPool{}
+	for i := range p.pools {
+		p.pools[i] = new(bytePool)
+	}
+	return p
+}
 
 // Get 返回 4K 对齐、len>=n 的缓冲。缓冲取自池，池空时新分配。
 func Get(n int) []byte {

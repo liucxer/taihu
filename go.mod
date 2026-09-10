@@ -5,7 +5,12 @@ go 1.25.0
 require (
 	github.com/cloudwego/netpoll v0.7.5
 	github.com/cockroachdb/pebble v1.1.5
+	golang.org/x/sys v0.30.0
 )
+
+// netpoll fork 落地 third_party：可插拔对齐节点分配器 + 单节点所有权移交 TakeBytes，
+// 供 taihu transport 客户端 Get 零拷贝直返调用方。不 import 本项目，避免模块环。
+replace github.com/cloudwego/netpoll => ./third_party/netpoll
 
 require (
 	github.com/DataDog/zstd v1.4.5 // indirect
@@ -33,7 +38,6 @@ require (
 	github.com/prometheus/procfs v0.9.0 // indirect
 	github.com/rogpeppe/go-internal v1.9.0 // indirect
 	golang.org/x/exp v0.0.0-20230626212559-97b1e661b5df // indirect
-	golang.org/x/sys v0.30.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
 	google.golang.org/protobuf v1.36.3 // indirect
 )

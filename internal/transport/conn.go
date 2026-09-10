@@ -18,6 +18,12 @@ import (
 // dialTimeout 客户端拨号超时。
 const dialTimeout = 10 * time.Second
 
+// init 使 netpoll 接收缓冲改用 bufpool 对齐分配：收流帧载荷落在单个对齐节点内时，
+// 客户端 Get 可直接移交该缓冲给调用方（零拷贝），并经由 bufpool.Put 安全归还。
+func init() {
+	netpoll.SetAlignedAllocator(bufpool.Get, bufpool.Put)
+}
+
 // streamInCap 每流投递缓冲上限：读循环背压到流处理器消费速度。
 const streamInCap = 8
 
@@ -274,72 +280,98 @@ func (c *Conn) Put(ctx context.Context, key string, size int64, in []byte) error
 }
 
 // Get 读取对象内 [off, off+size) 子区间并返回整块数据（size=-1 读至结尾）。
-// 返回 bufpool 池化缓冲（len==size），调用方用毕必须 bufpool.Put 归还。
-// 收流用子 Reader.Read 直接拷入返回缓冲（一次拷贝，与旧 gRPC CopyTo 等价）。
-func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, error) {
+//
+// 返回 (data, release, err)：data len==size 为本次调用私有缓冲（4K 对齐 bufpool
+// 缓冲）；调用方用毕必须调用 release()（幂等）归还。收流帧逐帧汇入对齐缓冲，全程
+// 恰一次用户态拷贝（header 消耗 + 帧数据逐段 copy），正确性不依赖 netpoll 节点复用。
+//
+// 说明：曾尝试“单帧零拷贝移交 netpoll 收节点”给调用方，但客户端诊断 Reader 会把
+// 该节点当作活跃写节点复用（bookAck 对同一 backing array 追加后续帧），Take 归还到
+// bufpool 后会被再次写入，构成内存生命周期错乱（-race 实证）。按计划风险回退条款，
+// 此路径收敛为 1 次对齐汇入拷贝，与本地 ReadAt 语义一致。
+func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, func(), error) {
 	if size < 0 {
 		total, err := c.Stat(ctx, key)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		size = total - off
 	}
 	if size < 0 {
-		return nil, taihu.ErrInvalidRange
+		return nil, nil, taihu.ErrInvalidRange
 	}
 	if size == 0 {
-		return nil, nil
+		return nil, func() {}, nil
 	}
 	st := c.newStream()
 	defer c.removeStream(st)
 	if err := c.writeFrame(st.id, opGetReq, encodeGetReq(key, off, size)); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	buf := bufpool.Get(int(size))
-	out := buf[:size]
-	var pos int64
+
+	var (
+		pos      int64
+		buf      []byte // 汇集缓冲（对齐池，out = buf[:size]）
+		out      []byte // 返回缓冲
+		disposed bool
+	)
+	// dispose 幂等归还最终占用的缓冲。
+	dispose := func() {
+		if disposed {
+			return
+		}
+		disposed = true
+		if buf != nil {
+			bufpool.Put(buf)
+		}
+	}
+
 	for {
 		msg, err := c.await(ctx, st)
 		if err != nil {
-			bufpool.Put(buf)
-			return nil, err
+			dispose()
+			return nil, nil, err
 		}
 		switch msg.op {
 		case opGetData:
 			rem := int64(msg.r.Len())
 			if rem > size-pos {
 				msg.r.Release()
-				bufpool.Put(buf)
-				return nil, fmt.Errorf("taihu: get stream exceeds requested size")
+				dispose()
+				return nil, nil, fmt.Errorf("taihu: get stream exceeds requested size")
+			}
+			if buf == nil {
+				buf = bufpool.Get(int(size))
+				out = buf[:size]
 			}
 			p, err := msg.r.Next(int(rem))
 			if err != nil {
 				msg.r.Release()
-				bufpool.Put(buf)
-				return nil, err
+				dispose()
+				return nil, nil, err
 			}
 			pos += int64(copy(out[pos:], p))
 			msg.r.Release()
 		case opGetEnd:
 			msg.r.Release()
 			if pos != size {
-				bufpool.Put(buf)
-				return nil, fmt.Errorf("taihu: get short read: got %d want %d", pos, size)
+				dispose()
+				return nil, nil, fmt.Errorf("taihu: get short read: got %d want %d", pos, size)
 			}
-			return out, nil
+			return out, dispose, nil
 		case opGetErr:
 			code, err := readU32(msg.r)
 			msg.r.Release()
 			if err != nil {
-				bufpool.Put(buf)
-				return nil, err
+				dispose()
+				return nil, nil, err
 			}
-			bufpool.Put(buf)
-			return nil, mapCode(errCode(code))
+			dispose()
+			return nil, nil, mapCode(errCode(code))
 		default:
 			msg.r.Release()
-			bufpool.Put(buf)
-			return nil, fmt.Errorf("taihu: unexpected get frame op %d", msg.op)
+			dispose()
+			return nil, nil, fmt.Errorf("taihu: unexpected get frame op %d", msg.op)
 		}
 	}
 }

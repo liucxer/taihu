@@ -3,12 +3,13 @@ package rpcclient
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/rpcserver"
 	"github.com/liucxer/taihu/pkg/taihu"
 )
@@ -68,7 +69,7 @@ func TestDialPoolRoundTrip(t *testing.T) {
 			t.Fatalf("Put %s: %v", key, err)
 		}
 		// Get 读回，验证 round-trip 数据一致。
-		got, err := s.Get(context.Background(), key, 0, int64(len(payload)))
+		got, rel, err := s.Get(context.Background(), key, 0, int64(len(payload)))
 		if err != nil {
 			t.Fatalf("Get %s: %v", key, err)
 		}
@@ -76,7 +77,7 @@ func TestDialPoolRoundTrip(t *testing.T) {
 			t.Fatalf("Get mismatch key=%s got=%dB want=%dB", key, len(got), len(payload))
 		}
 		if got != nil {
-			bufpool.Put(got) // Get 返回池化缓冲，用毕归还
+			rel() // Get 返回私有缓冲，用毕 release() 归还
 		}
 		sz, err := s.Stat(context.Background(), key)
 		if err != nil || sz != int64(len(payload)) {
@@ -84,6 +85,50 @@ func TestDialPoolRoundTrip(t *testing.T) {
 		}
 		if err := s.Delete(context.Background(), key); err != nil {
 			t.Fatalf("Delete %s: %v", key, err)
+		}
+	}
+}
+
+// TestDialPoolMultiFrame 验证 >4MiB（多帧）对象的 Get 拷贝路径能正确跨帧汇并。
+// chunkSize=4MiB，对象取 4MiB+1 与 ~10MiB 两种尺寸，覆盖跨 2 帧及多帧场景，并做
+// SHA256 校验确保帧间拼接无遗漏/错位。
+func TestDialPoolMultiFrame(t *testing.T) {
+	addr, cleanup := newTestServer(t)
+	defer cleanup()
+
+	s, err := DialPool(context.Background(), addr, 2)
+	if err != nil {
+		t.Fatalf("DialPool: %v", err)
+	}
+	defer s.Close()
+
+	sizes := []int64{1<<22 + 1, (1 << 23) + (1 << 22) + 999} // 4MiB+1, ~10MiB+999
+	for _, size := range sizes {
+		payload := make([]byte, size)
+		for i := range payload {
+			payload[i] = byte(i * 31)
+		}
+		key := fmt.Sprintf("multi/%d", size)
+		if err := s.Put(context.Background(), key, size, payload); err != nil {
+			t.Fatalf("Put %s: %v", key, err)
+		}
+		got, rel, err := s.Get(context.Background(), key, 0, size)
+		if err != nil {
+			t.Fatalf("Get %s: %v", key, err)
+		}
+		gotHash := sha256.Sum256(got)
+		expHash := sha256.Sum256(payload)
+		if gotHash != expHash {
+			t.Fatalf("Get mismatch key=%s size=%d got sha256=%x want=%x",
+				key, len(got), gotHash, expHash)
+		}
+		if int64(len(got)) != size {
+			t.Fatalf("Get short key=%s got=%dB want=%dB", key, len(got), size)
+		}
+		rel()
+		sz, err := s.Stat(context.Background(), key)
+		if err != nil || sz != size {
+			t.Fatalf("Stat %s: sz=%d err=%v", key, sz, err)
 		}
 	}
 }

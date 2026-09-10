@@ -3,9 +3,12 @@ package device
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/liucxer/taihu/internal/bufpool"
 )
@@ -140,4 +143,100 @@ func TestDeviceAppendAlignedFastPath(t *testing.T) {
 			t.Fatal("aligned bulk+tail tail padding not zero")
 		}
 	}
+}
+
+// TestDeviceConcurrent 多 goroutine 异偏移并发 Append/ReadAt，校验完成泵分发正确性（-race）。
+func TestDeviceConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	devPath := filepath.Join(dir, "nvme.img")
+	f, _ := os.Create(devPath)
+	_ = f.Close()
+
+	dev, err := NewDevice(context.Background(), devPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dev.Close()
+
+	const n = 32
+	const chunk = 4096
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			data := bufpool.Get(chunk)
+			defer bufpool.Put(data)
+			for j := range data {
+				data[j] = byte(i)
+			}
+			if err := dev.Append(context.Background(), 0, int64(i)*chunk, chunk, data); err != nil {
+				errs[i] = err
+				return
+			}
+			got, err := dev.ReadAt(context.Background(), 0, int64(i)*chunk, chunk)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer bufpool.Put(got)
+			if !bytes.Equal(got, data) {
+				errs[i] = fmt.Errorf("chunk %d mismatch", i)
+			}
+		}(i)
+	}
+	wg.Wait()
+	for i, e := range errs {
+		if e != nil {
+			t.Fatalf("worker %d: %v", i, e)
+		}
+	}
+}
+
+// TestDeviceCloseInflight 在途请求存在时 Close 须排空完成事件后返回，不挂起。
+func TestDeviceCloseInflight(t *testing.T) {
+	dir := t.TempDir()
+	devPath := filepath.Join(dir, "nvme.img")
+	f, _ := os.Create(devPath)
+	_ = f.Close()
+
+	dev, err := NewDevice(context.Background(), devPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 4MB 写：O_SYNC（非 Linux 打开方式）下耗时足够，可稳定被观测为在途。
+	data := bufpool.Get(4 << 20)
+	defer bufpool.Put(data)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = dev.Append(context.Background(), 0, 0, 4<<20, data)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+poll:
+	for {
+		select {
+		case <-done:
+			break poll // 已完成也直接测 Close
+		default:
+		}
+		dev.mu.Lock()
+		inflight := len(dev.m) > 0
+		dev.mu.Unlock()
+		if inflight {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("submit never registered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := dev.Close(); err != nil {
+		t.Fatalf("close with inflight: %v", err)
+	}
+	<-done
 }
