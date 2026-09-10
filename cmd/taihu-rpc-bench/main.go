@@ -37,7 +37,7 @@ func parseFlags() *config {
 	flag.StringVar(&c.mode, "mode", "", "write | read")
 	flag.Int64Var(&c.size, "size", 4096, "object size in bytes")
 	flag.IntVar(&c.threads, "threads", 1, "number of concurrent goroutines")
-	flag.IntVar(&c.conns, "conns", 1, "number of client gRPC connections (DialPool)")
+	flag.IntVar(&c.conns, "conns", 1, "number of client netpoll connections (DialPool)")
 	flag.IntVar(&c.count, "count", 1000, "total number of distinct objects")
 	flag.StringVar(&c.prefix, "keys-prefix", "rbench", "key prefix, keys are <prefix>/<seq>")
 	flag.DurationVar(&c.reportEvery, "report-interval", 2*time.Second, "progress report interval")

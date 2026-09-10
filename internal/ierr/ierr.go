@@ -16,6 +16,4 @@ var (
 	ErrNoSpace = errors.New("taihu: no free segment")
 	// ErrShortWrite 表示设备实际写入字节数少于期望。
 	ErrShortWrite = errors.New("taihu: short write")
-	// ErrUnaligned 表示 Get 的 off/size 非 4K 对齐（O_DIRECT 读要求对齐）。
-	ErrUnaligned = errors.New("taihu: off and size must be 4K aligned for read")
 )

@@ -15,6 +15,4 @@ var (
 	ErrNoSpace = ierr.ErrNoSpace
 	// ErrShortWrite 表示设备实际写入字节数少于期望。
 	ErrShortWrite = ierr.ErrShortWrite
-	// ErrUnaligned 表示 Get 的 off/size 非 4K 对齐（O_DIRECT 读要求对齐）。
-	ErrUnaligned = ierr.ErrUnaligned
 )
