@@ -64,6 +64,7 @@ setsid nohup mpstat -P ALL 1 > /tmp/${TAG}.cpu  2>&1 &
 10. **跨机压测 128.12 链路仅 ~2-4MB/s**（Mac→128.12 TCP），客户端必须放 128.12 本机走 loopback；跨机客户端会淹没在链路带宽上限，测不出 server 真实能力。
 11. **勿注入自定义 BufferPool 到 gRPC 收帧**：`experimental.WithBufferPool(自定义池)` 使 16T8C 读从 1361 ops/s 暴跌至 ~20 ops/s（~60 倍）。gRPC transport 收帧热路径依赖默认 tiered pool 的分片/缓冲优化；自定义池（即使 4K 对齐）会走低效路径。改为只做 L90 层池化（Get 返回 bufpool 缓冲）。
 12. **gRPC 读路径"零拷贝移交帧缓冲"不可行**（RawFrame.Take 尝试）：跳过 `buffer.Free()` 会使流控窗口不归还（16M 窗口 4 帧耗尽），高并发下 server 停发、RecvMsg 永久阻塞；goroutine dump 定位为 `Get` 内 RecvMsg 等待。帧缓冲必须按 gRPC 生命周期 Free，聚合拷贝（CopyTo）是保持窗口推进的必要代价。
+13. **"拷贝 bufpool 到 grpc 内 + handleData 换帧缓冲"也不可行**（tbpool 尝试）：即使把收帧缓冲换成 grpc module 内的对齐 FrameBuffer，gRPC 收流内部（header 剥离/message billing）会把 FrameBuffer 再拆转为内部 `*mem.buffer`，materialize 出来的类型不是原包装 → Take 类型断言全 miss（实测 hit=0/miss=4000）。结论：gRPC 收流是封闭 buffer 生命周期，任何应用层零拷贝移交都必须贯穿 fork 收侧全链改造；客户端读路径的 CopyTo（~24% memmove）在 gRPC 框架内不可免，属必要成本。
 
 测试结束停止采样并解析：
 
