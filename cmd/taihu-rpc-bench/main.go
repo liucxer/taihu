@@ -34,7 +34,7 @@ type config struct {
 func parseFlags() *config {
 	c := &config{}
 	flag.StringVar(&c.addr, "addr", "", "taihu-server address (required)")
-	flag.StringVar(&c.mode, "mode", "", "write | read")
+	flag.StringVar(&c.mode, "mode", "", "write | read | delete")
 	flag.Int64Var(&c.size, "size", 4096, "object size in bytes")
 	flag.IntVar(&c.threads, "threads", 1, "number of concurrent goroutines")
 	flag.IntVar(&c.conns, "conns", 1, "number of client netpoll connections (DialPool)")
@@ -180,6 +180,8 @@ func runWorker(ctx context.Context, s *rpcclient.Storage, c *config, s0, e0 int,
 			if got != nil {
 				rel() // Get 返回私有缓冲，校验后即归还
 			}
+		case "delete":
+			err = s.Delete(ctx, key)
 		}
 		if c.latency {
 			lat.add(time.Since(t0))

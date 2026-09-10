@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/liucxer/taihu/internal/metastore"
 	"github.com/liucxer/taihu/internal/rpcserver"
 	"github.com/liucxer/taihu/internal/transport"
 	"github.com/liucxer/taihu/pkg/taihu"
@@ -64,6 +65,11 @@ func main() {
 			for range t.C {
 				io4M, ioOther, b4M, bOther := storage.IOStats()
 				log.Printf("[stat] disk-io 4MiB=%d other=%d bytes4MiB=%d bytesOther=%d", io4M, ioOther, b4M, bOther)
+				log.Printf("[stat] segments free=%d active=%d full=%d reclaiming=%d",
+					storage.SegmentStats()[metastore.SegmentStateFree],
+					storage.SegmentStats()[metastore.SegmentStateActive],
+					storage.SegmentStats()[metastore.SegmentStateFull],
+					storage.SegmentStats()[metastore.SegmentStateReclaiming])
 				log.Printf("[stat] %s", transport.StatsString())
 			}
 		}()

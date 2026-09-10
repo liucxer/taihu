@@ -18,10 +18,18 @@ type Store interface {
 	// 段写满自动滚动，返回的偏移恒 4K 对齐、单调不重叠，可并发调用。
 	AllocateSegment(size int64) (segmentID int64, offset int64, err error)
 
-	// GetSegment 读取 segment 状态，gc 使用，暂时未使用。
+	// GetSegment 读取 segment 状态，gc 使用。
 	GetSegment(ctx context.Context, segmentID int64) (SegmentMeta, bool, error)
-	// PutSegment 写 segment 状态，gc 使用，暂时未使用。
+	// PutSegment 写 segment 状态，gc 使用。
 	PutSegment(ctx context.Context, segmentID int64, m SegmentMeta) error
+
+	// RefSegment 记录一次段内读引用（读开始前调用）；UnrefSegment 读结束后调用。
+	// 配合 GC：仅在引用归零时允许 Reclaiming 段回收复用，防止迟到读读错数据。
+	RefSegment(segmentID int64)
+	UnrefSegment(segmentID int64)
+
+	// SegmentStats 返回各状态段数量（管理/验证用）。
+	SegmentStats() map[SegmentState]int
 
 	Close() error
 }

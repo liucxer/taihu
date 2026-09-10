@@ -123,6 +123,10 @@ func (s *Storage) ReadAt(ctx context.Context, key string, off, size int64) ([]by
 	dlen := layout.Align4k(relStart+want) - dstart
 	skip := relStart - dstart
 
+	// 读引用计数：防 GC 在读在途时回收并复用该段（迟到读读错数据）。
+	s.db.RefSegment(meta.SegmentID)
+	defer s.db.UnrefSegment(meta.SegmentID)
+
 	data, err := s.dev.ReadAt(ctx, meta.SegmentID, dstart, dlen)
 	if err != nil {
 		return nil, err
@@ -164,4 +168,9 @@ func (s *Storage) Stat(ctx context.Context, key string) (int64, error) {
 // IOStats 返回底层设备磁盘 IO 尺寸统计（4MiB 整块 vs 其他）。压测/验证用。
 func (s *Storage) IOStats() (io4M, ioOther, bytes4M, bytesOther int64) {
 	return s.dev.Stats()
+}
+
+// SegmentStats 返回各状态 segment 数量（GC/回收/复用验证用）。
+func (s *Storage) SegmentStats() map[metastore.SegmentState]int {
+	return s.db.SegmentStats()
 }

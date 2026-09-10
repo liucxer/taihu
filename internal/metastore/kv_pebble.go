@@ -32,16 +32,26 @@ type pebbleStore struct {
 	db    *pebble.DB
 	alloc *allocator
 	cache *metaCache // 加速层：mapping 的读缓存（read-through），pebble 仍为真实源
+	segs  *segmentManager
 }
 
 // Open 打开 pebble DB。目录不存在时自动创建。
 // 写位置游标由内部的 allocator 在首次 AllocateSegment 时懒加载恢复，无需在启动时读取。
+// segmentManager 在此重建段状态并启动后台 GC goroutine。
 func Open(dir string) (Store, error) {
 	db, err := pebble.Open(dir, &pebble.Options{})
 	if err != nil {
 		return nil, fmt.Errorf("taihu: open pebble %q: %w", dir, err)
 	}
-	return &pebbleStore{db: db, alloc: &allocator{}, cache: &metaCache{}}, nil
+	s := &pebbleStore{db: db, alloc: &allocator{}, cache: &metaCache{}}
+	s.segs = newSegmentManager(db)
+	s.alloc.segs = s.segs
+	if err := s.segs.rebuild(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("taihu: rebuild segments: %w", err)
+	}
+	s.segs.run()
+	return s, nil
 }
 
 // syncWO 用于需要落盘持久化的写入（mapping / cursor）。
@@ -96,22 +106,55 @@ func (s *pebbleStore) GetMapping(ctx context.Context, key string) (ObjectMeta, e
 	return m, nil
 }
 
-// PutMapping 写 mapping，写穿：pebble 成功后回填缓存。
+// PutMapping 写 mapping（WriteBatch 原子含段存活计数更新），写穿：pebble 成功后回填缓存。
+// 同 key 已有对象时先减旧段计数（覆盖写不泄漏旧段空间计数）。
 func (s *pebbleStore) PutMapping(ctx context.Context, key string, m ObjectMeta) error {
-	if err := s.db.Set(keyMapping(key), m.encode(), syncWO); err != nil {
+	var old *ObjectMeta
+	if om, ok := s.cache.get(key); ok {
+		old = &om
+	} else if v, found, err := s.get(keyMapping(key)); err != nil {
+		return err
+	} else if found {
+		om, err := decodeObjectMeta(v)
+		if err != nil {
+			return err
+		}
+		old = &om
+	}
+	if err := s.segs.putObject(ctx, key, m, old); err != nil {
 		return err
 	}
 	s.cache.put(key, m)
 	return nil
 }
 
-// DeleteMapping 删除 mapping，并失效缓存条目。
+// DeleteMapping 删除 mapping（WriteBatch 原子含段存活计数更新），并失效缓存条目。
+// 计数归零的段转为 Reclaiming，由后台 GC 回收。
 func (s *pebbleStore) DeleteMapping(ctx context.Context, key string) error {
-	if err := s.db.Delete(keyMapping(key), syncWO); err != nil {
+	old, err := s.GetMapping(ctx, key)
+	if err != nil {
+		return err
+	}
+	if err := s.segs.delObject(ctx, key, old); err != nil {
 		return err
 	}
 	s.cache.del(key)
 	return nil
+}
+
+// RefSegment 记录一次段内读引用（读开始前调用）。
+func (s *pebbleStore) RefSegment(segmentID int64) {
+	s.segs.Ref(segmentID)
+}
+
+// UnrefSegment 释放一次段内读引用（读结束后调用）。
+func (s *pebbleStore) UnrefSegment(segmentID int64) {
+	s.segs.Unref(segmentID)
+}
+
+// SegmentStats 返回各状态段数量（管理/验证用）。
+func (s *pebbleStore) SegmentStats() map[SegmentState]int {
+	return s.segs.stats()
 }
 
 // LoadCache 预热加速缓存：全量扫描 mapping 命名空间回填，受同一 LRU 预算约束。
@@ -151,6 +194,7 @@ func (s *pebbleStore) IterMapping(ctx context.Context, fn func(key string, m Obj
 type allocator struct {
 	mu     sync.Mutex
 	db     *pebble.DB // 首次分配时从 pebbleStore 注入，persist 使用
+	segs   *segmentManager
 	curSeg int64
 	curOff int64
 
@@ -177,6 +221,12 @@ func (a *allocator) loadCursor(s *pebbleStore) error {
 
 // AllocateSegment 原子申请 layout.Align4k(size) 的连续空间，返回 (segmentID, 段内 4K 对齐偏移)。
 // 首次调用时懒加载持久化游标；段放不下则滚动到下一段并持久化新游标；分配后推进并持久化游标。
+//
+// 段滚动策略（保持磁盘顺序写）：
+//   - 下一段未使用或处于 Free：顺序滚动（正常路径，行为与 v1 一致）；
+//   - 下一段已被占用（Active/Full/Reclaiming）或游标到顶：从空闲池取 Free 段复用（游标回跳）；
+//   - 空闲池为空：ErrNoSpace。
+// 切换段时旧段标记 Full（不再写入），新段激活（Free→Active 或创建记录）。
 func (s *pebbleStore) AllocateSegment(size int64) (int64, int64, error) {
 	ctx := context.Background()
 	a := s.alloc
@@ -195,13 +245,29 @@ func (s *pebbleStore) AllocateSegment(size int64) (int64, int64, error) {
 
 	aligned := layout.Align4k(size)
 	if a.curOff+aligned > layout.SegmentSizeBytes {
-		a.curSeg++
-		if a.curSeg >= layout.SegmentCount {
-			return 0, 0, ierr.ErrNoSpace
+		if a.curOff > 0 {
+			if err := a.segs.markFull(ctx, a.curSeg); err != nil {
+				return 0, 0, err
+			}
 		}
-		a.curOff = 0
-		if err := a.persist(ctx, a.curSeg, a.curOff); err != nil {
-			return 0, 0, err
+		if a.curSeg+1 < layout.SegmentCount && a.segs.canUse(a.curSeg+1) {
+			a.curSeg++
+			a.curOff = 0
+			if err := a.segs.activate(ctx, a.curSeg); err != nil {
+				return 0, 0, err
+			}
+			if err := a.persist(ctx, a.curSeg, a.curOff); err != nil {
+				return 0, 0, err
+			}
+		} else {
+			seg, ok := a.segs.popFree(ctx)
+			if !ok {
+				return 0, 0, ierr.ErrNoSpace
+			}
+			a.curSeg, a.curOff = seg, 0
+			if err := a.persist(ctx, a.curSeg, a.curOff); err != nil {
+				return 0, 0, err
+			}
 		}
 	}
 
@@ -226,10 +292,13 @@ func (s *pebbleStore) PutSegment(ctx context.Context, segmentID int64, m Segment
 	return s.db.Set(keyState(segmentKey(segmentID)), m.encode(), syncWO)
 }
 
-// Close 关闭 pebble DB。
+// Close 停止后台 GC 并关闭 pebble DB。
 func (s *pebbleStore) Close() error {
 	if s.db == nil {
 		return nil
+	}
+	if s.segs != nil {
+		s.segs.stopGC()
 	}
 	err := s.db.Close()
 	s.db = nil
