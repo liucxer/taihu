@@ -30,10 +30,10 @@ type SafeLinkBuffer struct {
 
 // ------------------------------------------ implement copy reader ------------------------------------------
 
-func (b *SafeLinkBuffer) readCopy(p []byte) int {
+func (b *SafeLinkBuffer) ReadCopy(p []byte) (n int, err error) {
 	b.Lock()
 	defer b.Unlock()
-	return b.UnsafeLinkBuffer.readCopy(p)
+	return b.UnsafeLinkBuffer.ReadCopy(p)
 }
 
 // ------------------------------------------ implement zero-copy reader ------------------------------------------

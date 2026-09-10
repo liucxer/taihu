@@ -82,14 +82,15 @@ func (b *UnsafeLinkBuffer) IsEmpty() (ok bool) {
 
 // ------------------------------------------ implement copy reader ------------------------------------------
 
-// readCopy copies up to len(p) bytes from the buffer into p without exposing
-// the underlying buffer to user code (flagReadExposed is not set).
-// After copying, it releases consumed nodes where readExposed is false.
+// ReadCopy copies up to len(p) bytes from the buffer directly into p without
+// exposing the underlying buffer to user code (flagReadExposed is not set),
+// and without any intermediate allocation or copy—the only copy is into p
+// itself. After copying, it releases consumed nodes where readExposed is false.
 // Nodes with readExposed are left for the next Release call.
-func (b *UnsafeLinkBuffer) readCopy(p []byte) (n int) {
+func (b *UnsafeLinkBuffer) ReadCopy(p []byte) (n int, err error) {
 	l := len(p)
 	if l == 0 || b.Len() == 0 {
-		return 0
+		return 0, nil
 	}
 	if has := b.Len(); has < l {
 		l = has
@@ -141,7 +142,7 @@ func (b *UnsafeLinkBuffer) readCopy(p []byte) (n int) {
 		cur = next
 	}
 	b.head = newHead
-	return n
+	return n, nil
 }
 
 // ------------------------------------------ implement zero-copy reader ------------------------------------------

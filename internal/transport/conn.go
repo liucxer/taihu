@@ -344,13 +344,25 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 				buf = bufpool.Get(int(size))
 				out = buf[:size]
 			}
-			p, err := msg.r.Next(int(rem))
-			if err != nil {
-				msg.r.Release()
-				dispose()
-				return nil, nil, err
+			// 直写调用方缓冲：多节点帧由 ReadCopy 一次拷入，消除 Next 的中间搬移；
+			// 断言失败（如 race 变体未实现）回退现有 Next+copy 路径。
+			if rc, ok := msg.r.(interface{ ReadCopy([]byte) (int, error) }); ok {
+				n, err := rc.ReadCopy(out[pos : pos+int64(rem)])
+				if err != nil {
+					msg.r.Release()
+					dispose()
+					return nil, nil, err
+				}
+				pos += int64(n)
+			} else {
+				p, err := msg.r.Next(int(rem))
+				if err != nil {
+					msg.r.Release()
+					dispose()
+					return nil, nil, err
+				}
+				pos += int64(copy(out[pos:], p))
 			}
-			pos += int64(copy(out[pos:], p))
 			msg.r.Release()
 		case opGetEnd:
 			msg.r.Release()

@@ -3,8 +3,9 @@
 package aio
 
 import (
-	"syscall"
+	"os"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -58,14 +59,17 @@ func (r *ring) submit(fd int, buf []byte, off int64, read bool) (uint64, error) 
 	r.mu.Unlock()
 
 	go func() {
+		// 用 os.File 的带偏移读写替代 syscall.Pread/Pwrite（后者仅 Linux 存在）。
+		f := os.NewFile(uintptr(fd), "aio")
 		var res int64
 		if read {
-			n, err := syscall.Pread(fd, buf, off)
+			n, err := f.ReadAt(buf, off)
 			res = result(n, err)
 		} else {
-			n, err := syscall.Pwrite(fd, buf, off)
+			n, err := f.WriteAt(buf, off)
 			res = result(n, err)
 		}
+		_ = f.Close()
 		o.ev = Event{Data: seq, Res: res}
 		close(o.done)
 		select {
@@ -79,6 +83,9 @@ func (r *ring) submit(fd int, buf []byte, off int64, read bool) (uint64, error) 
 // result 归一化结果：>=0 字节数；<0 -errno。
 func result(n int, err error) int64 {
 	if err != nil {
+		if pe, ok := err.(*os.PathError); ok {
+			err = pe.Err
+		}
 		if errno, ok := err.(syscall.Errno); ok {
 			return -int64(errno)
 		}

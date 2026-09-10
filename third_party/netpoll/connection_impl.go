@@ -331,7 +331,7 @@ func (c *connection) Read(p []byte) (n int, err error) {
 	if err = c.waitRead(1); err != nil {
 		return 0, err
 	}
-	return c.inputBuffer.readCopy(p), nil
+	return c.inputBuffer.ReadCopy(p)
 }
 
 // Write will Flush soon.
