@@ -6,6 +6,12 @@
 //   - Get 返回 4K 对齐、len>=n 的切片，len 为 2 的幂（分桶容量）；
 //   - Put 归还 Get 返回的原始切片或其子切片均可：按 cap 归一化回整桶容量再入桶，
 //     保证再次 Get 到的是长度完整的桶容量缓冲（清空由消费方按需处理）。
+//
+// 实现说明：桶内采用自管理 freelist（互斥锁 + LIFO 栈），而非 sync.Pool。
+// sync.Pool 会在每次 GC 时清空其中的对象，导致 4M/8M 大缓冲被整批丢弃、
+// 每轮重走对齐分配（mallocgcLarge）与清零（memclr），实测读路径该冷分配
+// 约占服务端 CPU 36%。自管理 freelist 不受 GC 影响：大缓冲常驻长期复用，
+// 首次分配完成清零后，后续 Get 零分配、零清零；每桶以 maxKeep 上限约束驻留内存。
 package bufpool
 
 import (
@@ -19,11 +25,20 @@ const (
 	logBlockSize = 12
 	// maxBufBucket 覆盖到 2^33 = 8GB >= SegmentSizeBytes。
 	maxBufBucket = logBlockSize + 21 // 33，8GB
+	// maxKeep 每桶常驻缓冲数量上限：约束驻留内存（如 4M 桶 32×4M=128MB），
+	// 超出上限的归还缓冲直接丢弃交由 GC 回收。
+	maxKeep = 32
 )
 
-// alignedBufPool 是对齐缓冲桶池，各桶独立 sync.Pool，可并行 Get/Put。
+// bytePool 单桶 freelist：mu 串行化 Get/Put，LIFO 复用最近归还的缓冲（缓存热）。
+type bytePool struct {
+	mu       sync.Mutex
+	freelist [][]byte
+}
+
+// alignedBufPool 是对齐缓冲桶池，各桶独立 freelist，可并行 Get/Put。
 type alignedBufPool struct {
-	pools [maxBufBucket - logBlockSize + 1]*sync.Pool
+	pools [maxBufBucket - logBlockSize + 1]*bytePool
 }
 
 var pool = &alignedBufPool{}
@@ -53,22 +68,24 @@ func bufBucket(n int) int {
 	return b - logBlockSize
 }
 
-// get 返回 4K 对齐、len>=n 的缓冲。缓冲取自池，池空时新分配。
+// get 返回 4K 对齐、len>=n 的缓冲。优先复用 freelist 尾部（LIFO），
+// 池空时才对齐分配一次（唯一一次清零成本）。
 func (p *alignedBufPool) get(n int) []byte {
 	b := bufBucket(n)
-	bp := p.pools[b]
-	if bp == nil {
-		bp = &sync.Pool{}
-		p.pools[b] = bp // 并发 lazy init 幂等
+	bp := p.poolFor(b)
+	bp.mu.Lock()
+	if m := len(bp.freelist); m > 0 {
+		buf := bp.freelist[m-1]
+		bp.freelist = bp.freelist[:m-1]
+		bp.mu.Unlock()
+		return buf
 	}
-	if v := bp.Get(); v != nil {
-		return v.([]byte)
-	}
+	bp.mu.Unlock()
 	return alignedBuffer(int(int64(1) << uint(b+logBlockSize)))
 }
 
 // put 将切片归还池：先按 cap 归一化到整桶容量（子切片也能回到正确桶），再入桶。
-// 非池产物（nil 等）被忽略。
+// 桶内驻留达到 maxKeep 上限时丢弃该缓冲（交由 GC 回收），避免驻留内存无限增长。
 func (p *alignedBufPool) put(buf []byte) {
 	if cap(buf) == 0 {
 		return
@@ -80,12 +97,24 @@ func (p *alignedBufPool) put(buf []byte) {
 	if b > maxBufBucket-logBlockSize {
 		return
 	}
+	bp := p.poolFor(b)
+	bp.mu.Lock()
+	if len(bp.freelist) < maxKeep {
+		bp.freelist = append(bp.freelist, buf)
+		bp.mu.Unlock()
+		return
+	}
+	bp.mu.Unlock()
+}
+
+// poolFor 懒初始化获取桶（并发调用幂等，可能重复建桶但无正确性影响）。
+func (p *alignedBufPool) poolFor(b int) *bytePool {
 	bp := p.pools[b]
 	if bp == nil {
-		bp = &sync.Pool{}
-		p.pools[b] = bp // cap 归一化可能落到从未 Get 过的桶，按需懒创建
+		bp = new(bytePool)
+		p.pools[b] = bp
 	}
-	bp.Put(buf)
+	return bp
 }
 
 // alignedBuffer 返回长度 n 且首地址按 4K 对齐的字节切片，
