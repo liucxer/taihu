@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 
-	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/device"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
@@ -60,15 +59,18 @@ func (s *Storage) Close() error {
 	return err
 }
 
-// Put 写入对象。size 由调用方提供（逻辑长度），不必预读 in 求得。
-// 先从 db 原子申请写位置（段满自动滚动），再写设备数据，最后写映射。
-// 设备写位于分配锁之外，并发 Put 可写不同偏移。
-func (s *Storage) Put(ctx context.Context, key string, size int64, in io.Reader) error {
+// Put 写入对象。size 为对象逻辑长度，in 提供数据（使用 in[:size] 的前 size 字节，
+// in 不足 size 字节时报错）。先从 db 原子申请写位置（段满自动滚动），
+// 再写设备数据，最后写映射。设备写位于分配锁之外，并发 Put 可写不同偏移。
+func (s *Storage) Put(ctx context.Context, key string, size int64, in []byte) error {
 	if size < 0 {
 		return ErrInvalidRange
 	}
 	if size > layout.SegmentSizeBytes {
 		return ErrTooLarge
+	}
+	if int64(len(in)) < size {
+		return ErrShortWrite
 	}
 
 	seg, off, err := s.db.AllocateSegment(size)
@@ -87,61 +89,32 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in io.Reader)
 	return nil
 }
 
-// Get 读取对象内 [off, off+size) 子区间。元数据由 store 内部缓存加速，命中免查 pebble。
-// 越界（off<0、size<0、off>Size、off+size>Size）返回 ErrInvalidRange。
+// ReadAt 读取对象内 [off, off+size) 区间的数据并返回（返回值为从 bufpool 取出的池化
+// 缓冲或 nil；调用方用毕必须 bufpool.Put(返回值) 归还，否则造成池泄漏）。
 //
 // 对外不要求 off/size 对齐（Storage 层吸收 O_DIRECT 的 4K 对齐细节）：
-// 将物理读向下/向上对齐到 4K，仅返回请求的 [off, off+size) 区间；
-// off、size 恰为 4K 对齐时对齐段与请求段重合，零额外读取开销。
-func (s *Storage) Get(ctx context.Context, key string, off, size int64) (io.ReadCloser, error) {
-	meta, err := s.db.GetMapping(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-
-	if off < 0 || size < 0 || off > meta.Size || off+size > meta.Size {
-		return nil, ErrInvalidRange
-	}
-
-	// 段内请求区间 [relStart, relStart+size)，向下/向上 4K 对齐出物理读区间。
-	relStart := meta.Offset + off
-	dstart := relStart &^ (layout.BlockSize - 1)
-	dlen := layout.Align4k(relStart+size) - dstart
-
-	r, err := s.dev.Read(ctx, meta.SegmentID, dstart, dlen)
-	if err != nil {
-		return nil, err
-	}
-	if skip := relStart - dstart; skip > 0 {
-		if _, err := io.CopyN(io.Discard, r, skip); err != nil {
-			_ = r.Close() // 归还池化缓冲
-			return nil, err
-		}
-	}
-	// 包装 LimitReader 同时透传 Close：Linux 下 Close 归还池化对齐缓冲，调用方必须 Close。
-	return &limitReadCloser{Reader: io.LimitReader(r, size), c: r}, nil
-}
-
-// ReadAt 将对象内 [off, off+len(buf)) 的数据读入 buf，返回实际读取字节数（逻辑字节）。
-// off == Size 时返回 io.EOF。
+// 将物理读向下/向上对齐到 4K，再取回请求窗口。对齐区间（skip==0 且 size 为 4K 倍数）
+// 零拷贝直读，非对齐区间在池化缓冲内原址平移一次。
 //
-// 快路径（off 与 len(buf) 均 4K 对齐、buf 地址 4K 对齐）：O_DIRECT 直读调用方缓冲，
-// 零额外拷贝——server Get 的零拷贝读路径依赖此保证；否则退化为临时对齐缓冲 + 一次拷贝。
-func (s *Storage) ReadAt(ctx context.Context, key string, off int64, buf []byte) (int, error) {
+// 错误与边界：
+//   - off < 0 或 off > Size：ErrInvalidRange；
+//   - 请求超出对象结尾：截断到剩余字节，返回的部分不足 size 时附 io.EOF；
+//   - off == Size（剩余 0）：返回 (nil, io.EOF)。
+func (s *Storage) ReadAt(ctx context.Context, key string, off, size int64) ([]byte, error) {
 	meta, err := s.db.GetMapping(ctx, key)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	if off < 0 || off > meta.Size {
-		return 0, ErrInvalidRange
+		return nil, ErrInvalidRange
 	}
 	remaining := meta.Size - off
-	if remaining == 0 {
-		return 0, io.EOF
-	}
-	want := int64(len(buf))
+	want := size
 	if want > remaining {
 		want = remaining
+	}
+	if want == 0 {
+		return nil, io.EOF
 	}
 
 	// 段内物理读区间 [dstart, dstart+dlen)，向下/向上 4K 对齐。
@@ -150,27 +123,24 @@ func (s *Storage) ReadAt(ctx context.Context, key string, off int64, buf []byte)
 	dlen := layout.Align4k(relStart+want) - dstart
 	skip := relStart - dstart
 
-	if skip == 0 && want == dlen {
-		// 快路径：请求区间本就 4K 对齐，直接读入调用方缓冲（0 拷贝）。
-		return s.dev.ReadAt(ctx, meta.SegmentID, dstart, buf[:dlen])
+	data, err := s.dev.ReadAt(ctx, meta.SegmentID, dstart, dlen)
+	if err != nil {
+		return nil, err
 	}
-	// 慢路径：读入临时对齐缓冲，再拷贝出有效窗口（非对齐请求兜底）。
-	tmp := bufpool.Get(int(dlen))
-	defer bufpool.Put(tmp)
-	if _, err := s.dev.ReadAt(ctx, meta.SegmentID, dstart, tmp[:dlen]); err != nil {
-		return 0, err
+	if n := int64(len(data)); n < want {
+		// 设备不足（对象末尾）：返回已读前缀，调用方按 io.EOF 收尾。
+		want = n
 	}
-	n := copy(buf, tmp[skip:skip+want])
-	return n, nil
+	if skip > 0 || want < int64(len(data)) {
+		// 非对齐窗口：池化缓冲内原址左移，只保留 [skip, skip+want)。
+		n := copy(data, data[skip:skip+want])
+		data = data[:n]
+	}
+	if int64(len(data)) < size {
+		return data, io.EOF
+	}
+	return data, nil
 }
-
-// limitReadCloser 将 LimitReader 包装为 ReadCloser，Close 透传给内部实现（归还池缓冲）。
-type limitReadCloser struct {
-	io.Reader
-	c io.Closer
-}
-
-func (l *limitReadCloser) Close() error { return l.c.Close() }
 
 // Delete 删除对象的持久化映射。缓存失效由 store 内部处理。物理空间回收留待 segment 级 GC。
 // key 不存在时返回 ErrNotFound。

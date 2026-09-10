@@ -43,13 +43,14 @@ import (
 
 const (
 	// http2MaxFrameLen specifies the max length of a HTTP2 frame.
-	// taihu fork: 16384(16KB) -> 1MiB+16。大帧使 1MiB 数据消息在 wire 上单帧传输，
+	// taihu fork: 16384(16KB) -> 4MiB+16。大帧使 ≤4MiB 数据消息在 wire 上单帧传输，
 	// 消除客户端 Unmarshal 的多缓冲合并拷贝（materializeFrame 单缓冲零拷贝 Ref），
-	// 并把服务端 loopyWriter/bufWriter 逐帧处理与 syscall 次数减少 64 倍。
-	// +16 余量容纳 grpc 消息头（5B：1B flag + 4B length），保证 1MiB 数据消息
-	// （1048581B = 5B 头 + 1MiB 数据）单帧，否则消息被拆 2 帧导致客户端 2 段缓冲。
-	// 客户端/服务端必须同步升级（两端使用本 fork）。
-	http2MaxFrameLen = (1 << 20) + 16 // 1MiB + 16
+	// 并把服务端 loopyWriter/bufWriter 逐帧处理与 syscall 次数大幅减少。
+	// +16 余量容纳 grpc 消息头（5B：1B flag + 4B length），保证 4MiB 数据消息
+	// （4194309B = 5B 头 + 4MiB 数据）单帧，否则消息被拆 2 帧导致多段缓冲。
+	// 与 rpcclient/rpcserver 的 chunkSize（4MiB）保持一致；客户端/服务端必须同步升级
+	// （两端使用本 fork）。
+	http2MaxFrameLen = (4 << 20) + 16 // 4MiB + 16
 	// https://httpwg.org/specs/rfc7540.html#SettingValues
 	http2InitHeaderTableSize = 4096
 )

@@ -14,8 +14,8 @@ import (
 	"github.com/liucxer/taihu/rpc"
 )
 
-// chunkSize 与 server 端一致的数据块上限（读写均按此粒度传输）。
-const chunkSize = 1 << 20 // 1MiB
+// chunkSize 与 server 端一致的数据块上限（读写均按此粒度传输，最大 4MiB）。
+const chunkSize = 1 << 22 // 4MiB
 
 // Dial 建立到 taihu-server 的单连接客户端。返回 *Storage，用完须 Close。
 // 内网默认 insecure；断线重连由 gRPC 底层处理，多 goroutine 共享同一连接（HTTP/2 多路复用）。
@@ -39,14 +39,14 @@ func DialPoolWithOptions(ctx context.Context, addr string, n int, extra ...grpc.
 	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(chunkSize*16),
-			grpc.MaxCallSendMsgSize(chunkSize*16),
+			grpc.MaxCallRecvMsgSize(chunkSize*2),
+			grpc.MaxCallSendMsgSize(chunkSize*2),
 			grpc.ForceCodecV2(rpc.RawCodec{}),
 		),
-		// 发送缓冲放大到帧大小：1MiB 帧直写 socket（单次 syscall），避免默认 32KB
-		// 缓冲导致的 32 次拷贝 + 32 次 syscall。
+		// 发送缓冲放大到帧大小：4MiB 帧直写 socket（单次 syscall），避免默认 32KB
+		// 缓冲导致的多次拷贝 + 多次 syscall。
 		grpc.WithWriteBufferSize(chunkSize),
-		// 接收流/连接窗口与 server 一致（16MB/256MB）：1MiB 帧在途 ≥16 帧/流，
+		// 接收流/连接窗口与 server 一致（16MB/256MB）：4MiB 帧在途 ≥4 帧/流，
 		// 避免依赖 BDP 逐 RTT 收敛导致的初始小帧。
 		grpc.WithInitialWindowSize(16 << 20),
 		grpc.WithInitialConnWindowSize(256 << 20),

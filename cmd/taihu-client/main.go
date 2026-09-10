@@ -24,13 +24,10 @@ func main() {
 	addr := fs.String("addr", ":50051", "taihu-server address")
 	key := fs.String("key", "", "object key")
 	var (
-		file  = fs.String("file", "", "input/output file (absent: stdin/stdout)")
-		size  = fs.Int64("size", 0, "put: object size; get: read length (-1=to end)")
-		off   = fs.Int64("off", 0, "get: start offset")
+		file = fs.String("file", "", "input/output file (absent: stdin/stdout)")
+		size = fs.Int64("size", -1, "get: read length (-1=to end); put: optional, defaults to input length")
+		off  = fs.Int64("off", 0, "get: start offset")
 	)
-	_ = size
-	_ = off
-	_ = file
 	if err := fs.Parse(rest); err != nil {
 		os.Exit(2)
 	}
@@ -68,23 +65,24 @@ func doPut(ctx context.Context, s *rpcclient.Storage, key string, size int64, fi
 	} else {
 		in = os.Stdin
 	}
-	if err := s.Put(ctx, key, size, in); err != nil {
+	data, err := io.ReadAll(in)
+	must(err)
+	if size < 0 || size > int64(len(data)) {
+		size = int64(len(data))
+	}
+	if err := s.Put(ctx, key, size, data); err != nil {
 		fmt.Fprintf(os.Stderr, "put %q: %v\n", key, err)
 		os.Exit(1)
 	}
-	fmt.Printf("put %q ok\n", key)
+	fmt.Printf("put %q ok (%d bytes)\n", key, size)
 }
 
 func doGet(ctx context.Context, s *rpcclient.Storage, key string, off, size int64, file string) {
-	if size == 0 {
-		size = -1 // 全量
-	}
-	rc, err := s.Get(ctx, key, off, size)
+	data, err := s.Get(ctx, key, off, size)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "get %q: %v\n", key, err)
 		os.Exit(1)
 	}
-	defer rc.Close()
 
 	var out io.Writer
 	if file != "" {
@@ -95,8 +93,8 @@ func doGet(ctx context.Context, s *rpcclient.Storage, key string, off, size int6
 	} else {
 		out = os.Stdout
 	}
-	n, err := io.Copy(out, rc)
-	must(err)
+	n, werr := out.Write(data)
+	must(werr)
 	fmt.Fprintf(os.Stderr, "get %q: %d bytes\n", key, n)
 }
 

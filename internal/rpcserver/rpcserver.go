@@ -19,22 +19,22 @@ import (
 	"github.com/liucxer/taihu/rpc"
 )
 
-// chunkSize 单条数据帧大小（1MiB，兼顾吞吐与流控），与 rpcclient 侧一致。
-const chunkSize = 1 << 20
+// chunkSize 单条数据帧大小（最大 4MiB，兼顾吞吐与流控），与 rpcclient 侧一致。
+const chunkSize = 1 << 22 // 4MiB
 
 // New 构建并注册 ObjectStore gRPC 服务，返回可 Serve 的 *grpc.Server。
 // 流控与 codec 参数集中在此，保证服务端与集成测试配置一致。
 func New(storage *taihu.Storage) *grpc.Server {
 	gs := grpc.NewServer(
-		// 流控参数（设计文档_v3 §4.3）：消息上限 ≥ chunk，窗口放大提升并发流吞吐
-		grpc.MaxRecvMsgSize(chunkSize*16),
-		grpc.MaxSendMsgSize(chunkSize*16),
-		grpc.InitialWindowSize(16 << 20),      // 16MB 流窗口（≥ 16 帧 1MiB 在途/流，提升单流磁盘并发）
-		grpc.InitialConnWindowSize(256 << 20), // 256MB 连接窗口（多流共享）
+		// 协议参数：消息上限 = 单帧大小（帧最大 4MiB），双端须同步升级
+		grpc.MaxRecvMsgSize(chunkSize*2),
+		grpc.MaxSendMsgSize(chunkSize*2),
+		grpc.InitialWindowSize(16<<20),      // 16MB 流窗口（≥ 4 帧 4MiB 在途/流，提升单流磁盘并发）
+		grpc.InitialConnWindowSize(256<<20), // 256MB 连接窗口（多流共享）
 		// 传输缓冲（实测热点）：syscall write 占 CPU 57%，默认 32KB 写缓冲 → 每次
-		// syscall 仅搬 32KB；放大到 1MiB 后每帧一次 syscall，大幅削减系统调用次数。
-		grpc.WriteBufferSize(1 << 20),
-		grpc.ReadBufferSize(1 << 20),
+		// syscall 仅搬 32KB；放大到帧大小后每帧一次 syscall，大幅削减系统调用次数。
+		grpc.WriteBufferSize(1<<20),
+		grpc.ReadBufferSize(1<<20),
 		grpc.ForceServerCodecV2(rpc.RawCodec{}), // 数据帧裸字节透传（与 client 同步升级）
 	)
 	rpc.RegisterObjectStoreServer(gs, &server{storage: storage})
@@ -47,7 +47,8 @@ type server struct {
 	storage *taihu.Storage
 }
 
-// Put 流式上传：首帧 PutHeader{key,size} 后为数据块；数据经 streamReader 喂给 Storage.Put。
+// Put 流式上传：首帧 PutHeader{key,size} 后为数据块；数据帧逐块汇入 bufpool 缓冲，
+// 收满声明 size 后整块交给 Storage.Put（内部再拷贝进 O_DIRECT 对齐缓冲完成落盘）。
 func (s *server) Put(stream rpc.ObjectStore_PutServer) error {
 	first, err := stream.Recv()
 	if err != nil {
@@ -66,44 +67,48 @@ func (s *server) Put(stream rpc.ObjectStore_PutServer) error {
 	if h.Size > taihu.SegmentSizeBytes {
 		return status.Error(codes.ResourceExhausted, "taihu: object too large, exceeds segment size")
 	}
-	if err := s.storage.Put(stream.Context(), h.Key, h.Size, &streamReader{stream: stream}); err != nil {
+	if h.Size == 0 {
+		if err := s.storage.Put(stream.Context(), h.Key, 0, nil); err != nil {
+			return mapStorageErr(err)
+		}
+		return stream.SendAndClose(&rpc.PutResp{})
+	}
+
+	// 整对象先汇入 bufpool 缓冲（数据帧解码缓冲不保证对齐，最终由 Storage.Put 拷贝进对齐缓冲
+	// 落盘；bufpool 缓冲首地址 4K 对齐，size 为 4K 倍数时 device Append 走直写快路径）。
+	// 收帧用 RawFrame 延迟物化：单缓冲帧零拷贝 Ref、多缓冲帧 bufpool 合并，
+	// 相比 *[]byte 的 Materialize 消除每帧 1MiB 堆分配，wire→buf 仅一次对齐拷贝。
+	buf := bufpool.Get(int(h.Size))
+	defer bufpool.Put(buf)
+	var pos int64
+	for pos < h.Size {
+		var f rpc.RawFrame
+		if err := stream.RecvMsg(&f); err != nil {
+			if err == io.EOF {
+				return status.Error(codes.InvalidArgument, "taihu: put stream shorter than declared size")
+			}
+			return err
+		}
+		if f.Remaining() == 0 {
+			f.Free()
+			continue
+		}
+		if pos+int64(f.Remaining()) > h.Size {
+			f.Free()
+			return status.Error(codes.InvalidArgument, "taihu: put stream exceeds declared size")
+		}
+		pos += int64(f.CopyTo(buf[pos:]))
+		f.Free()
+	}
+	if err := s.storage.Put(stream.Context(), h.Key, h.Size, buf[:h.Size]); err != nil {
 		return mapStorageErr(err)
 	}
 	return stream.SendAndClose(&rpc.PutResp{})
 }
 
-// streamReader 把 gRPC 入流包装为 io.Reader：Read 阻塞在下一个 RecvMsg（数据帧为裸字节），
-// 免去 io.Pipe/额外 goroutine，天然流式且无泄漏。
-type streamReader struct {
-	stream  rpc.ObjectStore_PutServer
-	pending []byte
-}
-
-func (r *streamReader) Read(p []byte) (int, error) {
-	if len(r.pending) > 0 {
-		n := copy(p, r.pending)
-		r.pending = r.pending[n:]
-		return n, nil
-	}
-	for {
-		var b []byte
-		if err := r.stream.RecvMsg(&b); err != nil {
-			return 0, err // io.EOF → Storage.Put 读满 size 即收尾
-		}
-		if len(b) == 0 {
-			continue
-		}
-		n := copy(p, b)
-		if n < len(b) {
-			r.pending = b[n:]
-		}
-		return n, nil
-	}
-}
-
 // Get 流式下发 [off, off+size) 区间；size=-1 表示读到对象结尾。
-// 零拷贝读路径：Storage.ReadAt 把数据 O_DIRECT 直读入 bufpool 缓冲，SendMsg([]byte)
-// 经 RawCodec 零拷贝透传（写完后缓冲由 gRPC 归还 bufpool），每块取新缓冲、不发复用。
+// 零拷贝读路径：Storage.ReadAt 经 O_DIRECT 直读 bufpool 缓冲并返回该切片，
+// SendMsg(RawData{Data:data, Orig:data}) 零拷贝透传（写完后 gRPC 归还 bufpool）。
 func (s *server) Get(req *rpc.GetReq, stream rpc.ObjectStore_GetServer) error {
 	size := req.Size
 	if size == -1 {
@@ -118,29 +123,26 @@ func (s *server) Get(req *rpc.GetReq, stream rpc.ObjectStore_GetServer) error {
 	}
 	pos, end := req.Off, req.Off+size
 	for pos < end {
-		buf := bufpool.Get(chunkSize)
 		want := end - pos
 		if want > chunkSize {
 			want = chunkSize
 		}
-		n, rerr := s.storage.ReadAt(stream.Context(), req.Key, pos, buf[:want])
-		handed := false
-		if n > 0 {
-			if serr := stream.SendMsg(&rpc.RawData{Data: buf[:n], Orig: buf}); serr != nil {
+		data, rerr := s.storage.ReadAt(stream.Context(), req.Key, pos, want)
+		if len(data) > 0 {
+			if serr := stream.SendMsg(&rpc.RawData{Data: data, Orig: data}); serr != nil {
 				return serr // 出错路径不归还：gRPC 可能在内部已 Free
 			}
-			handed = true
-			pos += int64(n)
+			pos += int64(len(data))
 		}
 		if rerr == io.EOF {
-			if !handed {
-				bufpool.Put(buf)
+			if len(data) == 0 {
+				bufpool.Put(data)
 			}
 			return nil
 		}
 		if rerr != nil {
-			if !handed {
-				bufpool.Put(buf)
+			if len(data) == 0 {
+				bufpool.Put(data)
 			}
 			return rerr
 		}

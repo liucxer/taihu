@@ -4,7 +4,8 @@
 //
 // 约定：
 //   - Get 返回 4K 对齐、len>=n 的切片，len 为 2 的幂（分桶容量）；
-//   - Put 必须原样归还 Get 返回的切片（未 reslice），按 len 回到原桶。
+//   - Put 归还 Get 返回的原始切片或其子切片均可：按 cap 归一化回整桶容量再入桶，
+//     保证再次 Get 到的是长度完整的桶容量缓冲（清空由消费方按需处理）。
 package bufpool
 
 import (
@@ -35,7 +36,7 @@ func Get(n int) []byte {
 	return pool.get(n)
 }
 
-// Put 将 Get 返回的原始切片归还池。非池产物（nil 等）被忽略。
+// Put 将 Get 返回的切片（或其子切片）归还池。非池产物（nil 等）被忽略。
 func Put(buf []byte) {
 	if buf == nil {
 		return
@@ -66,13 +67,25 @@ func (p *alignedBufPool) get(n int) []byte {
 	return alignedBuffer(int(int64(1) << uint(b+logBlockSize)))
 }
 
-// put 将 get 返回的原始切片归还池。非池产物（nil 等）被忽略。
+// put 将切片归还池：先按 cap 归一化到整桶容量（子切片也能回到正确桶），再入桶。
+// 非池产物（nil 等）被忽略。
 func (p *alignedBufPool) put(buf []byte) {
+	if cap(buf) == 0 {
+		return
+	}
+	if len(buf) < cap(buf) {
+		buf = buf[:cap(buf)]
+	}
 	b := bufBucket(len(buf))
 	if b > maxBufBucket-logBlockSize {
 		return
 	}
-	p.pools[b].Put(buf)
+	bp := p.pools[b]
+	if bp == nil {
+		bp = &sync.Pool{}
+		p.pools[b] = bp // cap 归一化可能落到从未 Get 过的桶，按需懒创建
+	}
+	bp.Put(buf)
 }
 
 // alignedBuffer 返回长度 n 且首地址按 4K 对齐的字节切片，

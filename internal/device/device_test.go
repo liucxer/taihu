@@ -3,10 +3,11 @@ package device
 import (
 	"bytes"
 	"context"
-	"io"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/liucxer/taihu/internal/bufpool"
 )
 
 func TestDeviceAppendAlignment(t *testing.T) {
@@ -21,31 +22,122 @@ func TestDeviceAppendAlignment(t *testing.T) {
 	}
 	defer dev.Close()
 
-	if err := dev.Append(context.Background(), 0, 0, 3, bytes.NewReader([]byte("abc"))); err != nil {
+	if err := dev.Append(context.Background(), 0, 0, 3, []byte("abc")); err != nil {
 		t.Fatal(err)
 	}
 	// off 须推进到 4K 对齐
-	if err := dev.Append(context.Background(), 0, 4096, 10, bytes.NewReader(make([]byte, 10))); err != nil {
+	if err := dev.Append(context.Background(), 0, 4096, 10, make([]byte, 10)); err != nil {
 		t.Fatalf("aligned append: %v", err)
 	}
 	// 非 4K 对齐 offset 应报错
-	if err := dev.Append(context.Background(), 0, 100, 10, bytes.NewReader(make([]byte, 10))); err == nil {
+	if err := dev.Append(context.Background(), 0, 100, 10, make([]byte, 10)); err == nil {
 		t.Fatalf("unaligned offset should error")
 	}
+	// 数据不足 size 应报错
+	if err := dev.Append(context.Background(), 0, 8192, 10, make([]byte, 5)); err == nil {
+		t.Fatalf("short data should error")
+	}
 
-	// 对齐整块读回：4096 字节里前 3 字节应为 "abc"，其余为补零
-	r, err := dev.Read(context.Background(), 0, 0, 4096)
+	// 对齐整块读回：4096 字节里前 3 字节应为 "abc"，其余为补零（ReadAt 返回池化对齐缓冲）
+	data, err := dev.ReadAt(context.Background(), 0, 0, 4096)
 	if err != nil {
 		t.Fatalf("device read: %v", err)
 	}
-	defer r.Close() // 归还池化对齐缓冲
-	b, _ := io.ReadAll(r)
-	if string(b[:3]) != "abc" {
-		t.Fatalf("device read prefix got %q", b[:3])
+	defer bufpool.Put(data)
+	if len(data) != 4096 {
+		t.Fatalf("device read got %dB want 4096", len(data))
 	}
-	for _, v := range b[3:] {
+	if string(data[:3]) != "abc" {
+		t.Fatalf("device read prefix got %q", data[:3])
+	}
+	for _, v := range data[3:] {
 		if v != 0 {
 			t.Fatalf("device read non-zero padding at byte 3: %d", v)
+		}
+	}
+	// 读第二段（偏移 4096 处的 10 字节内容）
+	data2, err := dev.ReadAt(context.Background(), 0, 4096, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bufpool.Put(data2)
+	for _, v := range data2[:10] {
+		if v != 0 {
+			t.Fatalf("second append misalign: %d", v)
+		}
+	}
+}
+
+func TestDeviceAppendAlignedFastPath(t *testing.T) {
+	dir := t.TempDir()
+	devPath := filepath.Join(dir, "nvme.img")
+	f, _ := os.Create(devPath)
+	_ = f.Close()
+
+	dev, err := NewDevice(context.Background(), devPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dev.Close()
+
+	// 4K 对齐地址 + 4K 倍数长度 → 命中直写快路径（bufpool.Get 保证首地址 4K 对齐）。
+	data := bufpool.Get(int(4096))
+	defer bufpool.Put(data)
+	for i := range data[:4096] {
+		data[i] = byte(i)
+	}
+	if err := dev.Append(context.Background(), 0, 0, 4096, data[:4096]); err != nil {
+		t.Fatalf("aligned fast-path append: %v", err)
+	}
+
+	// 读回对比：快路径直写内容须与源一致（无补零、无错位）。
+	got, err := dev.ReadAt(context.Background(), 0, 0, 4096)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	defer bufpool.Put(got)
+	if !bytes.Equal(got[:4096], data[:4096]) {
+		t.Fatal("aligned fast-path round trip mismatch")
+	}
+
+	// 非快路径（地址/长度不同时为 4K 对齐）仍走拷贝兜底，数据须一致。
+	unaligned := make([]byte, 4096)
+	for i := range unaligned {
+		unaligned[i] = byte(0xff - i)
+	}
+	if err := dev.Append(context.Background(), 0, 8192, 4096, unaligned); err != nil {
+		t.Fatalf("fallback append: %v", err)
+	}
+	got2, err := dev.ReadAt(context.Background(), 0, 8192, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bufpool.Put(got2)
+	if !bytes.Equal(got2[:4096], unaligned) {
+		t.Fatal("fallback round trip mismatch")
+	}
+
+	// 对齐地址 + 非 4K 倍数长度（"4M+1k" 缩小版）：主体直写 + 仅 4K 尾块缓冲，数据与补零须正确。
+	obj := bufpool.Get(16384)
+	defer bufpool.Put(obj)
+	payload := obj[:12288+100] // 12388 B：12288 对齐主体 + 100 字节尾块
+	for i := range payload {
+		payload[i] = byte(i * 7)
+	}
+	if err := dev.Append(context.Background(), 0, 16384, int64(len(payload)), payload); err != nil {
+		t.Fatalf("aligned bulk+tail append: %v", err)
+	}
+	got3, err := dev.ReadAt(context.Background(), 0, 16384, 16384)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bufpool.Put(got3)
+	if !bytes.Equal(got3[:len(payload)], payload) {
+		t.Fatal("aligned bulk+tail payload mismatch")
+	}
+	for _, v := range got3[len(payload):16384] {
+		if v != 0 {
+			t.Fatal("aligned bulk+tail tail padding not zero")
 		}
 	}
 }

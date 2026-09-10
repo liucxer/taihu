@@ -3,7 +3,6 @@ package rpcclient
 import (
 	"bytes"
 	"context"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -58,49 +57,31 @@ func TestDialPoolRoundTrip(t *testing.T) {
 
 	// 4 连接 × 多对象交错读写，覆盖 round-robin 分发到不同连接。
 	payload := bytes.Repeat([]byte("taihu-pool-smoke"), 4096) // ~64KiB
+	if os.Getenv("BIG4M") != "" {
+		payload = make([]byte, 4194304)
+		for i := range payload {
+			payload[i] = byte(i)
+		}
+	}
 	for i := 0; i < 32; i++ {
 		key := "pool/obj"
 		key += string(rune('0' + i%10))
 		key = key + "/" + string(rune('a'+i%26))
 		key = "pool/" + string(rune('a'+i%26)) + string(rune('0'+i%10))
-		if err := s.Put(context.Background(), key, int64(len(payload)), bytes.NewReader(payload)); err != nil {
+		if err := s.Put(context.Background(), key, int64(len(payload)), payload); err != nil {
 			t.Fatalf("Put %s: %v", key, err)
 		}
-		rc, err := s.Get(context.Background(), key, 0, int64(len(payload)))
+		// Get 读回，验证 round-trip 数据一致。
+		got, err := s.Get(context.Background(), key, 0, int64(len(payload)))
 		if err != nil {
 			t.Fatalf("Get %s: %v", key, err)
 		}
-		got, err := io.ReadAll(rc)
-		_ = rc.Close()
-		if err != nil {
-			t.Fatalf("ReadAll %s: %v", key, err)
-		}
 		if !bytes.Equal(got, payload) {
-			t.Fatalf("round trip mismatch key=%s got=%dB want=%dB", key, len(got), len(payload))
+			t.Fatalf("Get mismatch key=%s got=%dB want=%dB", key, len(got), len(payload))
 		}
 		sz, err := s.Stat(context.Background(), key)
 		if err != nil || sz != int64(len(payload)) {
 			t.Fatalf("Stat %s: sz=%d err=%v", key, sz, err)
-		}
-		// GetRaw 帧式路径复读，验证延迟物化数据一致。
-		rs, err := s.GetRaw(context.Background(), key, 0, int64(len(payload)))
-		if err != nil {
-			t.Fatalf("GetRaw %s: %v", key, err)
-		}
-		var gotRaw []byte
-		for {
-			b, rerr := rs.Next()
-			if rerr == io.EOF {
-				break
-			}
-			if rerr != nil {
-				t.Fatalf("GetRaw Next %s: %v", key, rerr)
-			}
-			gotRaw = append(gotRaw, b...)
-		}
-		_ = rs.Close()
-		if !bytes.Equal(gotRaw, payload) {
-			t.Fatalf("GetRaw mismatch key=%s got=%dB want=%dB", key, len(gotRaw), len(payload))
 		}
 		if err := s.Delete(context.Background(), key); err != nil {
 			t.Fatalf("Delete %s: %v", key, err)

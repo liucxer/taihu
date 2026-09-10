@@ -7,7 +7,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"runtime/pprof"
 	"sort"
@@ -119,7 +118,7 @@ func stopCPUProfile(cpuFile *os.File) {
 
 func (c *config) validate() error {
 	switch c.mode {
-	case "write", "read", "rawread":
+	case "write", "read":
 	default:
 		return fmt.Errorf("invalid -mode %q: must be write or read", c.mode)
 	}
@@ -155,7 +154,7 @@ func (c *config) keyFor(seq int) string {
 	return fmt.Sprintf("%s/%d", c.prefix, seq)
 }
 
-// runWorker write 逐个 Put，read 逐个 Get 整对象并拉满流。
+// runWorker write 逐个 Put，read 逐个 Get 整对象。
 func runWorker(ctx context.Context, s *rpcclient.Storage, c *config, s0, e0 int, ops *atomic.Int64, lat *latencyCollector) error {
 	payload := make([]byte, int(c.size))
 	for j := range payload {
@@ -167,40 +166,12 @@ func runWorker(ctx context.Context, s *rpcclient.Storage, c *config, s0, e0 int,
 		var err error
 		switch c.mode {
 		case "write":
-			err = s.Put(ctx, key, c.size, &sliceReader{b: payload})
+			err = s.Put(ctx, key, c.size, payload)
 		case "read":
-			var n int64
-			rc, gerr := s.Get(ctx, key, 0, c.size)
-			if gerr == nil {
-				n, err = io.Copy(io.Discard, rc)
-				_ = rc.Close()
-			} else {
-				err = gerr
-			}
-			if err == nil && n != c.size {
-				err = fmt.Errorf("key %s: short read %d != %d", key, n, c.size)
-			}
-		case "rawread":
-			var n int64
-			rs, gerr := s.GetRaw(ctx, key, 0, c.size)
-			if gerr == nil {
-				for {
-					b, rerr := rs.Next()
-					if rerr == io.EOF {
-						break
-					}
-					if rerr != nil {
-						err = rerr
-						break
-					}
-					n += int64(len(b))
-				}
-				_ = rs.Close()
-			} else {
-				err = gerr
-			}
-			if err == nil && n != c.size {
-				err = fmt.Errorf("key %s: short read %d != %d", key, n, c.size)
+			var got []byte
+			got, err = s.Get(ctx, key, 0, c.size)
+			if err == nil && int64(len(got)) != c.size {
+				err = fmt.Errorf("key %s: short read %d != %d", key, len(got), c.size)
 			}
 		}
 		if c.latency {
@@ -212,18 +183,6 @@ func runWorker(ctx context.Context, s *rpcclient.Storage, c *config, s0, e0 int,
 		ops.Add(1)
 	}
 	return nil
-}
-
-// sliceReader 复用同一底层缓冲，避免每次循环重新分配 payload。
-type sliceReader struct{ b []byte }
-
-func (r *sliceReader) Read(p []byte) (int, error) {
-	if len(r.b) == 0 {
-		return 0, io.EOF
-	}
-	n := copy(p, r.b)
-	r.b = r.b[n:]
-	return n, nil
 }
 
 // progress 周期性打印已完成 op 数。
