@@ -26,9 +26,15 @@ import (
 // chunkSize 单条数据帧负载上限（4MiB），与旧 gRPC 方案一致。
 const chunkSize = 1 << 22 // 4MiB
 
-// shmSliceSize 共享内存（shmipc）单切片数据容量：须容纳最大帧
-// [4B len][1B op][chunkSize 负载] = chunkSize+5；取 4MiB+8（4 对齐，满足 arm64 约束）。
-const shmSliceSize = chunkSize + 8
+// shmDataPad 共享内存数据帧的 4K 对齐 pad 长度：数据帧布局
+// [5B 帧头][4091B pad][4K 对齐数据区]，数据区起始 4K 对齐供服务端
+// O_DIRECT 直读共享内存（免 bufpool→共享内存 memcpy）。客户端读数据帧时跳过 pad。
+const shmDataPad = 4096
+
+// shmSliceSize 共享内存（shmipc）单切片数据容量：须容纳最大直读数据帧
+// [shmDataPad pad][5B 帧头][≤chunkSize 负载][≤4095B 对齐读余量]
+// ≈ 4MiB+8KiB；取 4K 对齐值（同时满足 arm64 约束）。
+const shmSliceSize = chunkSize + 8*1024
 
 // maxKeyLen 请求中 key 的最大长度，防止畸形长度字段放大内存。
 const maxKeyLen = 1 << 16

@@ -22,6 +22,7 @@ import (
 	"github.com/cloudwego/shmipc-go"
 
 	"github.com/liucxer/taihu/internal/bufpool"
+	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/pkg/taihu"
 )
 
@@ -38,6 +39,9 @@ var errShmBadFrame = errors.New("taihu: bad shm frame")
 // shmReadFrame 从 BufferReader 读一帧 [4B len][1B op][payload]，返回 op 与负载切片。
 // 单切片时负载零拷贝引用共享内存（fast path）；跨切片时 ReadBytes 慢路径汇入一次拷贝。
 // 返回后须由调用方在负载用毕后 ReleasePreviousRead 释放该帧 pin 的共享内存。
+//
+// 数据帧（opGetData/opGetDataFinal）在 op 后带 [shmDataPad-5] 对齐 pad（服务端 O_DIRECT
+// 直读布局），此处跳过 pad 再取负载；控制帧无 pad。
 func shmReadFrame(r shmipc.BufferReader) (op OpCode, payload []byte, err error) {
 	lb, err := r.ReadBytes(shmLenPrefixLen)
 	if err != nil {
@@ -47,34 +51,46 @@ func shmReadFrame(r shmipc.BufferReader) (op OpCode, payload []byte, err error) 
 	if n < shmOpLen || n > shmMaxFrameSize {
 		return 0, nil, errShmBadFrame
 	}
-	b, err := r.ReadBytes(n)
+	b, err := r.ReadBytes(shmOpLen)
 	if err != nil {
 		return 0, nil, err
 	}
-	return OpCode(b[0]), b[1:], nil
+	op = OpCode(b[0])
+	if op == opGetData || op == opGetDataFinal {
+		// 数据帧：跳过对齐 pad，payload 从数据区起始（4K 对齐）读 n-1 字节。
+		if _, e := r.ReadBytes(shmDataPad - shmLenPrefixLen - shmOpLen); e != nil {
+			return 0, nil, e
+		}
+	}
+	payload, err = r.ReadBytes(n - shmOpLen)
+	return op, payload, err
 }
 
-// shmWriteFrame 向流写一帧并 Flush。帧头 + 负载一次 Reserve 进共享内存（数据帧
-// 零拷贝直写），Flush 返回后 peer 已可见该帧，调用方即可安全复用/归还 payload。
+// shmWriteFrame 向流写一帧并 Flush。数据帧（opGetData/opGetDataFinal）统一布局
+// [5B 帧头][4091B pad][数据区]：pad 保证数据区 4K 对齐（服务端 O_DIRECT 直读共享内存），
+// 直读/拷贝两条路径布局一致，客户端 shmReadFrame 跳过 pad。控制帧不带 pad。
+// 帧头 + 负载一次 Reserve 进共享内存（数据帧零拷贝直写），Flush 返回后 peer 已可见。
 // 同步累加 statTx* 统计（与 TCP writeFrame 对齐）。客户端（shmipc_client.go）复用。
 func shmWriteFrame(st *shmipc.Stream, op OpCode, payload []byte) error {
 	statTxFrames.Add(1)
 	statTxBytes.Add(int64(len(payload)))
+	dataOff := 0
 	if op == opGetData || op == opGetDataFinal {
 		statTxDataFrames.Add(1)
 		statTxDataBytes.Add(int64(len(payload)))
 		if len(payload) == chunkSize {
 			statTxData4M.Add(1)
 		}
+		dataOff = shmDataPad
 	}
-	total := shmLenPrefixLen + shmOpLen + len(payload)
+	total := dataOff + shmLenPrefixLen + shmOpLen + len(payload)
 	buf, err := st.BufferWriter().Reserve(total)
 	if err != nil {
 		return err
 	}
 	binary.BigEndian.PutUint32(buf[:shmLenPrefixLen], uint32(shmOpLen+len(payload)))
 	buf[shmLenPrefixLen] = byte(op)
-	copy(buf[shmLenPrefixLen+shmOpLen:], payload)
+	copy(buf[dataOff+shmLenPrefixLen+shmOpLen:], payload)
 	return st.Flush(false)
 }
 
@@ -260,9 +276,13 @@ func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, paylo
 	}
 }
 
-// handleShmGet 处理 Get 请求：按 chunkSize 分块 ReadAt 下发 opGetData，末帧置 final 位
-// （opGetDataFinal）收尾。数据帧零拷贝：ReadAt 返回的 bufpool 缓冲经 Reserve 直写共享内存，
-// shmWriteFrame（Flush）返回后归还缓冲。语义镜像 TCP handleGet。
+// handleShmGet 处理 Get 请求：按 chunkSize 分块读下发 opGetData，末帧置 final 位
+// （opGetDataFinal）收尾。语义镜像 TCP handleGet。
+//
+// 两条数据帧路径（布局一致，客户端 shmReadFrame 统一跳 pad）：
+//   - 直读快路径（off 4K 对齐，skip==0）：O_DIRECT 直读共享内存切片数据区，
+//     免 bufpool→共享内存 memcpy（读路径零拷贝）。
+//   - 回退路径（off 非对齐）：Storage.ReadAt 读入 bufpool 对齐缓冲，shmWriteFrame 拷贝。
 func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 	key, off, size, err := parseGetReq(newSliceReader(payload))
 	if err != nil {
@@ -284,6 +304,19 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 		if want > chunkSize {
 			want = chunkSize
 		}
+		// 直读快路径：pos 4K 对齐 → O_DIRECT 直读共享内存（免 memcpy）。
+		if pos%layout.BlockSize == 0 {
+			n, rerr := shmWriteDataFrameDirect(st, s.storage, key, pos, want, end)
+			if rerr != nil {
+				if rerr == io.EOF {
+					return nil // final 帧（含空短读兜底）已发，读完毕
+				}
+				return shmWriteFrame(st, opGetErr, encCode(mapStorageErr(rerr)))
+			}
+			pos += n
+			continue
+		}
+		// 回退路径：非对齐 off，bufpool 读 + 拷贝写。
 		data, rerr := s.storage.ReadAt(context.Background(), key, pos, want)
 		if len(data) > 0 {
 			op := OpCode(opGetData)
@@ -309,6 +342,45 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 		}
 	}
 	return nil
+}
+
+// shmWriteDataFrameDirect O_DIRECT 直读共享内存的数据帧写（免 memcpy 快路径）：
+// Reserve 对齐切片后，帧头写 [0:5]，数据区 [shmDataPad:shmDataPad+dlen] 作为
+// O_DIRECT 目标缓冲直接 DMA 进共享内存（storage.ReadAtInto 同步等待完成）。
+// 帧头 len 按实际读入 n 更新（短读/EOF 时 n < want）。返回实际 payload 字节数 n。
+//
+// 空短读（n==0 && EOF）时发空 final 帧（对端报 short read）；io.EOF 表示读完毕
+// （final 帧已发出），非 EOF 错误表示直读失败（切片未 Flush，由调用方发 opGetErr）。
+func shmWriteDataFrameDirect(st *shmipc.Stream, storage *taihu.Storage, key string, pos, want, end int64) (int64, error) {
+	dlen := layout.Align4k(want)
+	buf, err := st.BufferWriter().Reserve(shmDataPad + int(dlen))
+	if err != nil {
+		return 0, err
+	}
+	ctx := context.Background()
+	n, rerr := storage.ReadAtInto(ctx, key, pos, want, buf[shmDataPad:shmDataPad+dlen])
+	if rerr != nil && rerr != io.EOF {
+		return 0, rerr
+	}
+	// 帧头 len = op(1) + payload 字节数；final 帧按读完毕判定。
+	op := byte(opGetData)
+	if pos+n >= end || rerr == io.EOF {
+		op = byte(opGetDataFinal)
+	}
+	binary.BigEndian.PutUint32(buf[:shmLenPrefixLen], uint32(shmOpLen+n))
+	buf[shmLenPrefixLen] = op
+	// 同步累加 statTx* 统计（与 shmWriteFrame 对齐）。
+	statTxFrames.Add(1)
+	statTxBytes.Add(n)
+	statTxDataFrames.Add(1)
+	statTxDataBytes.Add(n)
+	if n == chunkSize {
+		statTxData4M.Add(1)
+	}
+	if err := st.Flush(false); err != nil {
+		return 0, err
+	}
+	return n, rerr
 }
 
 // handleShmDelete 处理 Delete 请求（一元），语义镜像 TCP handleDelete。

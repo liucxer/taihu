@@ -2,6 +2,7 @@ package taihu
 
 import (
 	"context"
+	"fmt"
 	"io"
 
 	"github.com/liucxer/taihu/internal/device"
@@ -155,6 +156,58 @@ func (s *Storage) ReadAt(ctx context.Context, key string, off, size int64) ([]by
 		return data, io.EOF
 	}
 	return data, nil
+}
+
+// ReadAtInto 读取对象内 [off, off+size) 区间的数据，直接 DMA 进调用方 dst
+// （服务端 shm 直读共享内存用：免 bufpool→共享内存 memcpy）。
+//
+// 要求：
+//   - off 4K 对齐（O_DIRECT 直读快路径，skip==0；非对齐 off 由调用方回退 ReadAt+拷贝）；
+//   - dst 首地址 4K 对齐（bufAligned）且 cap ≥ align4K(want)（物理读区间含尾部对齐余量）。
+//
+// 返回实际读入的请求窗口字节数（读到对象末尾不足 size 时截断；remaining==0 返回
+// (0, io.EOF)）。dst 中 [0, 返回 n) 为有效数据。
+func (s *Storage) ReadAtInto(ctx context.Context, key string, off, size int64, dst []byte) (int64, error) {
+	meta, err := s.db.GetMapping(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+	if off < 0 || off > meta.Size || off%layout.BlockSize != 0 {
+		return 0, ErrInvalidRange
+	}
+	remaining := meta.Size - off
+	want := size
+	if want > remaining {
+		want = remaining
+	}
+	if want == 0 {
+		return 0, io.EOF
+	}
+
+	// 段内物理读区间：off 4K 对齐 + meta.Offset 4K 对齐（写入保证）→ skip==0，
+	// dstart = relStart 4K 对齐，dlen 向上对齐到 4K。
+	relStart := meta.Offset + off
+	dlen := layout.Align4k(relStart+want) - relStart
+	if int64(len(dst)) < dlen {
+		return 0, fmt.Errorf("taihu: readinto dst %d < dlen %d", len(dst), dlen)
+	}
+
+	// 读引用计数：防 GC 在读在途时回收并复用该段（迟到读读错数据）。
+	s.db.RefSegment(meta.SegmentID)
+	defer s.db.UnrefSegment(meta.SegmentID)
+
+	n, err := s.dev.ReadAtInto(ctx, meta.SegmentID, relStart, dlen, dst[:dlen])
+	if err != nil {
+		return 0, err
+	}
+	if n < want {
+		// 设备不足（对象末尾）：返回已读前缀，调用方按 EOF 收尾。
+		want = n
+	}
+	if want < size {
+		return want, io.EOF
+	}
+	return want, nil
 }
 
 // Delete 删除对象的持久化映射。缓存失效由 store 内部处理。物理空间回收留待 segment 级 GC。

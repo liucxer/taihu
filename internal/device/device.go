@@ -360,6 +360,42 @@ func (d *Device) ReadAt(ctx context.Context, segmentID, off, size int64) ([]byte
 	return buf[:n], nil
 }
 
+// ReadAtInto 读取段内 off 起 size 字节，经异步 IO 直接 DMA 进调用方 dst。
+//
+// 要求 off 与 size 均为 4K 对齐（O_DIRECT 约束），dst 首地址 4K 对齐（bufAligned）
+// 且 cap ≥ size；dst 由调用方持有至本函数返回（submit 同步等待完成）。
+// 返回实际读入字节数（读到设备/对象末尾不足时短读，不附错误）；size == 0 返回 (0, nil)。
+func (d *Device) ReadAtInto(ctx context.Context, segmentID, off, size int64, dst []byte) (int64, error) {
+	if off < 0 || off%layout.BlockSize != 0 {
+		return 0, fmt.Errorf("taihu: read offset %d not 4K aligned", off)
+	}
+	if size < 0 || size%layout.BlockSize != 0 {
+		return 0, fmt.Errorf("taihu: read size %d not 4K aligned", size)
+	}
+	if size == 0 {
+		return 0, nil
+	}
+	if int64(len(dst)) < size {
+		return 0, fmt.Errorf("taihu: read dst %d < size %d", len(dst), size)
+	}
+	if !bufAligned(dst) {
+		return 0, fmt.Errorf("taihu: read dst not 4K aligned")
+	}
+
+	ev, err := d.submitRead(dst[:size], d.segmentBase(segmentID)+off)
+	if err != nil {
+		return 0, err
+	}
+	if ev.Res < 0 {
+		return 0, syscall.Errno(-ev.Res)
+	}
+	n := ev.Res
+	if n == 0 {
+		return 0, io.EOF
+	}
+	return n, nil
+}
+
 // Delete 将整段标记可回收。当前采用 append-only，物理擦除/重写延迟到 segment 级 GC 实现，
 // 此处仅作占位，返回 nil。
 func (d *Device) Delete(ctx context.Context, segmentID int64) error {

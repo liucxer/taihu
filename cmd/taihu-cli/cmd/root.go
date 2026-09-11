@@ -1,4 +1,4 @@
-// Package cmd 实现 taihu CLI 的子命令树（cobra）。
+// Package cmd 实现 taihu-cli 的子命令树（cobra）。
 package cmd
 
 import (
@@ -28,9 +28,9 @@ var global = struct {
 
 // rootCmd 根命令：无子命令时打印帮助。
 var rootCmd = &cobra.Command{
-	Use:   "taihu",
+	Use:   "taihu-cli",
 	Short: "taihu 对象数据库命令行运维工具",
-	Long: `taihu CLI：查询集群/实例/segment 信息、key 读写删与定位、SDK 客户端清单。
+	Long: `taihu-cli：查询集群/实例/segment 信息、key 读写删与定位、SDK 客户端清单。
 集群类命令需要 -pd 指向 TiKV PD（实例/索引/客户端注册区所在）；无 TiKV 环境可用
 -addr/instance 直连单个实例。`,
 	SilenceUsage:  true,
@@ -40,7 +40,7 @@ var rootCmd = &cobra.Command{
 // Execute 执行根命令（命令错误已打印，返回后 main 按码退出）。
 func Execute() error {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, "taihu:", err)
+		fmt.Fprintln(os.Stderr, "taihu-cli:", err)
 		return err
 	}
 	return nil

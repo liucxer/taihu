@@ -13,6 +13,6 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "显示版本号",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Printf("taihu %s\n", version.String())
+		fmt.Printf("taihu-cli %s\n", version.String())
 	},
 }

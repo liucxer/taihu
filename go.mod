@@ -17,6 +17,10 @@ require (
 // 供 taihu transport 客户端 Get 零拷贝直返调用方。不 import 本项目，避免模块环。
 replace github.com/cloudwego/netpoll => ./third_party/netpoll
 
+// shmipc fork 落地 third_party：共享内存 buffer data 区 4K 对齐（O_DIRECT 直读共享内存，
+// 服务端读路径免 memcpy）。不 import 本项目，避免模块环。
+replace github.com/cloudwego/shmipc-go => ./third_party/shmipc-go
+
 require (
 	github.com/DataDog/zstd v1.4.5 // indirect
 	github.com/benbjohnson/clock v1.3.0 // indirect
