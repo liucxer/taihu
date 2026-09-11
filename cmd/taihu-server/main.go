@@ -156,6 +156,11 @@ func main() {
 		ShmAddr:   shmPath,
 		StartTime: time.Now().Unix(),
 	}
+	// 完整 TCP 地址列表（各 IP 同端口）：供客户端按多 IP 均分建立数据面连接。
+	// 旧客户端忽略 addrs 字段，仍以 Addr（首个 IP）直连，向后兼容。
+	for _, ip := range ips {
+		info.Addrs = append(info.Addrs, net.JoinHostPort(ip, strconv.Itoa(rpcPort)))
+	}
 	// 心跳刷新动态字段（容量/可用/已用），StartTime 保持注册时刻。
 	refresh := func() *cluster.InstanceInfo {
 		n := *info

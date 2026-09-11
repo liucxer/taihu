@@ -134,3 +134,80 @@ func TestDialPoolMultiFrame(t *testing.T) {
 		}
 	}
 }
+
+// newTestServerMultiAddr 起一个跑在本机 TCP 上的 taihu-server（同一 storage），
+// 通过 2 个独立 listener（不同端口）模拟"多 IP 监听"——两个地址连的是同一实例，
+// 数据一致，round-robin 到任一地址读写均命中。返回两个监听地址。
+func newTestServerMultiAddr(t *testing.T) (string, string, func()) {
+	t.Helper()
+	dir := t.TempDir()
+	devPath := filepath.Join(dir, "nvme.img")
+	f, err := os.Create(devPath)
+	if err != nil {
+		t.Fatalf("create device: %v", err)
+	}
+	_ = f.Close()
+
+	storage, err := taihu.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
+		layout.Layout{SegmentSizeBytes: layout.DefaultSegmentSizeBytes, SegmentCount: 2048})
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	gs := rpcserver.New(storage)
+	lnA, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen A: %v", err)
+	}
+	lnB, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen B: %v", err)
+	}
+	// 同一 Server 多 listener 并发（对应 server 多 IP 监听语义，见 internal/transport.Serve）。
+	go func() { _ = gs.Serve(lnA) }()
+	go func() { _ = gs.Serve(lnB) }()
+	return lnA.Addr().String(), lnB.Addr().String(), func() {
+		gs.Stop()
+		_ = storage.Close()
+		_ = lnA.Close()
+		_ = lnB.Close()
+	}
+}
+
+// TestDialPoolMultiRoundTrip 验证多地址连接池：对同一 server 的 2 个监听地址各建 3 条连接
+// （共 6 条），round-trip 读写覆盖全部连接（数据一致 → 均分到任一地址都能命中）。
+func TestDialPoolMultiRoundTrip(t *testing.T) {
+	addrA, addrB, cleanup := newTestServerMultiAddr(t)
+	defer cleanup()
+
+	s, err := DialPoolMulti(context.Background(), []string{addrA, addrB}, 3)
+	if err != nil {
+		t.Fatalf("DialPoolMulti: %v", err)
+	}
+	defer s.Close()
+	if len(s.conns) != 6 {
+		t.Fatalf("conns = %d, want 6 (2 addrs x 3 perAddr)", len(s.conns))
+	}
+
+	payload := bytes.Repeat([]byte("taihu-multiaddr"), 512)
+	for i := 0; i < 48; i++ {
+		key := fmt.Sprintf("multiaddr/%d", i)
+		if err := s.Put(context.Background(), key, int64(len(payload)), payload); err != nil {
+			t.Fatalf("Put %s: %v", key, err)
+		}
+		got, rel, err := s.Get(context.Background(), key, 0, int64(len(payload)))
+		if err != nil {
+			t.Fatalf("Get %s: %v", key, err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("Get mismatch key=%s", key)
+		}
+		rel()
+	}
+}
+
+// TestDialPoolMultiEmptyAddrs 验证空地址列表直接报错（不构造空连接池）。
+func TestDialPoolMultiEmptyAddrs(t *testing.T) {
+	if _, err := DialPoolMulti(context.Background(), nil, 2); err == nil {
+		t.Fatal("DialPoolMulti(nil) should error")
+	}
+}

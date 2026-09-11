@@ -131,8 +131,14 @@ func (s *Storage) clientFor(inst cluster.InstanceInfo) (*rpcclient.Storage, erro
 			c, err = rpcclient.DialPool(context.Background(), inst.Addr, s.cfg.Conns)
 		}
 	} else {
-		// 跨节点（Hostname 不一致）：走 TCP。
-		c, err = rpcclient.DialPool(context.Background(), inst.Addr, s.cfg.Conns)
+		// 跨节点（Hostname 不一致）：走 TCP。服务端通告多地址（Addrs）时为每个地址各建
+		// cfg.Conns 条连接，读写按 round-robin 均分到全部地址链路；旧 server 无 Addrs
+		// 时回退单地址（兼容）。
+		if len(inst.Addrs) > 0 {
+			c, err = rpcclient.DialPoolMulti(context.Background(), inst.Addrs, s.cfg.Conns)
+		} else {
+			c, err = rpcclient.DialPool(context.Background(), inst.Addr, s.cfg.Conns)
+		}
 	}
 	if err != nil {
 		return nil, err
