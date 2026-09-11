@@ -6,7 +6,7 @@ package layout
 // 整盘段数不再硬编码（v1 曾固定 2048 段 × 8GB = 16TB）：由启动时查询的真实设备容量
 // 与段大小经 ComputeLayout 计算，运行时注入 device（IO 层）与 metastore（分配层）。
 var (
-	// DefaultSegmentSizeBytes 默认单个 segment 大小 = 8GB（-seg-size 可覆盖）。
+	// DefaultSegmentSizeBytes 默认单个 segment 大小 = 8GB（内置固定，不允许命令行覆盖）。
 	DefaultSegmentSizeBytes int64 = 8 * 1024 * 1024 * 1024
 )
 

@@ -20,8 +20,8 @@ import (
 type Server struct {
 	storage *taihu.Storage
 
-	mu sync.Mutex
-	el netpoll.EventLoop
+	mu  sync.Mutex
+	els []netpoll.EventLoop // 多 listener 场景：每 Serve 一个 EventLoop，停机时全部 Shutdown
 }
 
 // NewServer 构建服务端。
@@ -29,7 +29,8 @@ func NewServer(storage *taihu.Storage) *Server {
 	return &Server{storage: storage}
 }
 
-// Serve 在 listener 上提供服务（阻塞直至 Shutdown/异常）。
+// Serve 在 listener 上提供服务（阻塞直至 Shutdown/异常）。可对多个 listener 并发调用：
+// 每个 listener 独立 EventLoop，GracefulStop 会一并停止。
 func (s *Server) Serve(ln net.Listener) error {
 	el, err := netpoll.NewEventLoop(func(ctx context.Context, c netpoll.Connection) error {
 		return s.serveConn(ctx, c)
@@ -38,22 +39,24 @@ func (s *Server) Serve(ln net.Listener) error {
 		return err
 	}
 	s.mu.Lock()
-	s.el = el
+	s.els = append(s.els, el)
 	s.mu.Unlock()
 	return el.Serve(ln)
 }
 
-// GracefulStop 优雅停机：等待在途连接处理完毕。
+// GracefulStop 优雅停机：停止全部 EventLoop，等待在途连接处理完毕。
 func (s *Server) GracefulStop() {
 	s.mu.Lock()
-	el := s.el
+	els := append([]netpoll.EventLoop(nil), s.els...)
 	s.mu.Unlock()
-	if el == nil {
+	if len(els) == 0 {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = el.Shutdown(ctx)
+	for _, el := range els {
+		_ = el.Shutdown(ctx)
+	}
 }
 
 // Stop 强制停机。
