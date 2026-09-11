@@ -56,10 +56,11 @@ func align4K(n uint32) uint32 {
 	return (n + alignSize - 1) &^ (alignSize - 1)
 }
 
-// alignListOffset 返回 bufferRegion 起始偏移 o，使 o+bufferHeaderSize 4K 对齐：
-// 每个 buffer 占 [header 20B][data cap]，data 起始 = buffer 起始 + 20B ≡ 0 (mod 4096)。
+// alignListOffset 返回 bufferList 起始偏移 o，使该列表第一个 buffer 的 data 区
+// （列表起始 + bufferListHeaderSize + bufferHeaderSize）4K 对齐：
+// 布局 [36B 列表头][buffer0: 20B header + data][buffer1: ...]，data 起始 ≡ 0 (mod 4096)。
 func alignListOffset(o uint32) uint32 {
-	const need = uint32(bufferHeaderSize) // data 区需对齐到 4K：o+20 ≡ 0
+	const need = uint32(bufferListHeaderSize + bufferHeaderSize)
 	up := (o + need + alignSize - 1) &^ (alignSize - 1)
 	return up - need
 }
@@ -296,6 +297,8 @@ func createBufferManager(listSizePercent []*SizePercentPair, path string, mem []
 		if sumPercent > 100 {
 			return nil, errors.New("the sum of all SizePercentPair's percent must be equals 100")
 		}
+		// 每个列表起始均对齐：保证各列表 buffer 的 data 区 4K 对齐（O_DIRECT 直读）。
+		hadUsedOffset = alignListOffset(hadUsedOffset)
 		stride := align4K(pair.Size + bufferHeaderSize)
 		bufferNum := uint32(bufferRegionCap*uint64(pair.Percent)/100 / uint64(stride))
 		needSize := countBufferListMemSize(bufferNum, pair.Size)
@@ -336,6 +339,8 @@ func mappingBufferManager(path string, mem []byte, bufferRegionStartOffset uint3
 	internalLogger.infof("mappingBufferManager, listNum:%d length:%d", listNum, length)
 
 	for i := 0; i < listNum; i++ {
+		// 与 createBufferManager 相同的逐列表起始对齐（两端布局一致）。
+		hadUsedOffset = alignListOffset(hadUsedOffset)
 		l, err := mappingFreeBufferList(mem, bufferRegionStartOffset+hadUsedOffset)
 		if err != nil {
 			return nil, err
@@ -478,6 +483,13 @@ func (b *bufferList) push(buffer *bufferSlice) {
 	for {
 		oldTail := atomic.LoadUint32(b.tail)
 		newTail := buffer.offsetInShm - b.bufferRegionOffsetInShm
+		if newTail > uint32(len(b.bufferRegion)) || newTail+bufferHeaderSize > uint32(len(b.bufferRegion)) {
+			// 防御：offset 异常（下溢/越界）说明切片归属错乱，打日志并丢弃，避免破坏链表。
+			internalLogger.errorf("bufferList.push BUG offsetInShm=%d regionOff=%d newTail=%d regionLen=%d cap=%d shm=%v",
+				buffer.offsetInShm, b.bufferRegionOffsetInShm, newTail, len(b.bufferRegion), buffer.cap, buffer.isFromShm)
+			putBackBufferSlice(buffer)
+			return
+		}
 		if atomic.CompareAndSwapUint32(b.tail, oldTail, newTail) {
 			bufferHeader(b.bufferRegion[oldTail : oldTail+bufferHeaderSize]).linkNext(newTail)
 			atomic.AddInt32(b.size, 1)

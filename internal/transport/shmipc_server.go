@@ -345,24 +345,38 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 }
 
 // shmWriteDataFrameDirect O_DIRECT 直读共享内存的数据帧写（免 memcpy 快路径）：
-// Reserve 对齐切片后，帧头写 [0:5]，数据区 [shmDataPad:shmDataPad+dlen] 作为
-// O_DIRECT 目标缓冲直接 DMA 进共享内存（storage.ReadAtInto 同步等待完成）。
-// 帧头 len 按实际读入 n 更新（短读/EOF 时 n < want）。返回实际 payload 字节数 n。
+// Reserve 对齐切片后先写 opGetErr 占位帧头，数据区 [shmDataPad:shmDataPad+dlen] 作为
+// O_DIRECT 目标缓冲直接 DMA 进共享内存（storage.ReadAtInto 同步等待完成）；成功则
+// 更新帧头为数据帧（len 按实际读入 n 更新，短读/EOF 时 n < want）。返回实际 payload
+// 字节数 n。
 //
-// 空短读（n==0 && EOF）时发空 final 帧（对端报 short read）；io.EOF 表示读完毕
-// （final 帧已发出），非 EOF 错误表示直读失败（切片未 Flush，由调用方发 opGetErr）。
+// 空短读（n==0 && EOF）与直读失败（错误码帧已发）均返回 (0, io.EOF)：前者发空 final
+// 帧（对端报 short read），后者已发 opGetErr 错误帧；调用方按 EOF 收尾即可，不再追加
+// 错误帧（避免未写帧头的直读切片污染流）。
 func shmWriteDataFrameDirect(st *shmipc.Stream, storage *taihu.Storage, key string, pos, want, end int64) (int64, error) {
 	dlen := layout.Align4k(want)
 	buf, err := st.BufferWriter().Reserve(shmDataPad + int(dlen))
 	if err != nil {
 		return 0, err
 	}
+	// 占位错误帧头 [4B len=5][1B op=opGetErr][4B 错误码]：直读失败时客户端直接收错误帧，
+	// 不会读到未写帧头的垃圾切片。
+	binary.BigEndian.PutUint32(buf[:shmLenPrefixLen], uint32(shmOpLen+4))
+	buf[shmLenPrefixLen] = byte(opGetErr)
+	copy(buf[shmLenPrefixLen+shmOpLen:], encCode(codeInternal))
 	ctx := context.Background()
 	n, rerr := storage.ReadAtInto(ctx, key, pos, want, buf[shmDataPad:shmDataPad+dlen])
 	if rerr != nil && rerr != io.EOF {
-		return 0, rerr
+		// 直读失败：更新错误码后 Flush 错误帧，复用 EOF 收尾语义（错误帧已发）。
+		copy(buf[shmLenPrefixLen+shmOpLen:], encCode(mapStorageErr(rerr)))
+		statTxFrames.Add(1)
+		statTxBytes.Add(4)
+		if err := st.Flush(false); err != nil {
+			return 0, err
+		}
+		return 0, io.EOF
 	}
-	// 帧头 len = op(1) + payload 字节数；final 帧按读完毕判定。
+	// 成功：更新帧头为数据帧，len = op(1) + payload 字节数；final 帧按读完毕判定。
 	op := byte(opGetData)
 	if pos+n >= end || rerr == io.EOF {
 		op = byte(opGetDataFinal)
