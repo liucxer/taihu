@@ -1,0 +1,15 @@
+#!/bin/bash
+# Probe taihu cluster deployment state for 146-series node.
+echo "HOST=$(hostname)"
+echo "NOW=$(date '+%F %T')"
+echo "--- taihu procs ---"
+ps -eo pid,comm,args 2>/dev/null | grep -E "taihu-server|taihu-rpc-bench|taihu-cli" | grep -v grep || echo "(no taihu procs)"
+echo "--- taihu bins ---"
+ls -l /tmp/taihu-server /tmp/taihu-server.new /tmp/taihu-rpc-bench /tmp/taihu-rpc-bench.new /tmp/taihu-cli* 2>/dev/null || echo "(no taihu binaries)"
+echo "--- nvme devs ---"
+lsblk -d -o NAME,SIZE,MODEL 2>/dev/null | grep -E "nvme|NAME"
+echo "--- nvme mounts ---"
+lsblk -o NAME,MOUNTPOINT,TYPE 2>/dev/null | grep -E "nvme|NAME"
+echo "--- go present ---"
+ls /usr/local/go/bin/go 2>/dev/null || echo "(no go)"
+echo "DONE"
