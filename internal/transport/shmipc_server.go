@@ -106,6 +106,22 @@ func shmWriteFrame(st *shmipc.Stream, op OpCode, payload []byte) error {
 	return st.Flush(false)
 }
 
+// shmCommitFrame 写数据帧帧头 [4B len][1B op] 并 Flush（数据已由调用方直写进
+// reserve 区，不再 copy）。head 为帧首区域 [0:5] 的共享内存引用（客户端零拷贝写
+// 时由 Reserve 返回的整区前 5B 提供）。同步累加 statTx* 统计（与 shmWriteFrame 对齐）。
+func shmCommitFrame(st *shmipc.Stream, head []byte, op OpCode, size int) error {
+	statTxFrames.Add(1)
+	statTxBytes.Add(int64(size))
+	statTxDataFrames.Add(1)
+	statTxDataBytes.Add(int64(size))
+	if size == chunkSize {
+		statTxData4M.Add(1)
+	}
+	binary.BigEndian.PutUint32(head[:shmLenPrefixLen], uint32(shmOpLen+size))
+	head[shmLenPrefixLen] = byte(op)
+	return st.Flush(false)
+}
+
 // shmServer 共享内存 IPC 服务端。
 type shmServer struct {
 	storage *taihu.Storage

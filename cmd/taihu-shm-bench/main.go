@@ -27,6 +27,9 @@ type dataStore interface {
 	Close() error
 }
 
+// writeChunk 零拷贝写单次 Reserve 上限（与服务端 chunkSize 一致，4MiB）。
+const writeChunk = 1 << 22
+
 type config struct {
 	shm         string
 	mode        string
@@ -39,6 +42,7 @@ type config struct {
 	duration    time.Duration
 	latency     bool
 	verify      bool
+	zeroCopy    bool
 	cpuProfile  string
 }
 
@@ -55,6 +59,7 @@ func parseFlags() *config {
 	flag.DurationVar(&c.duration, "duration", 0, "run for this duration looping keys mod count (e.g. 60s); 0 = run each key once")
 	flag.BoolVar(&c.latency, "latency", false, "record per-op latency")
 	flag.BoolVar(&c.verify, "verify-content", false, "read: verify payload pattern byte(i&0xff) (sampled every 64KiB + head/tail)")
+	flag.BoolVar(&c.zeroCopy, "zero-copy-write", true, "write: use shm zero-copy Reserve (direct shared-memory write, no memcpy)")
 	flag.StringVar(&c.cpuProfile, "cpuprofile", "", "write cpu profile to this file (pprof)")
 	flag.Parse()
 	return c
@@ -175,6 +180,32 @@ func (c *config) keyFor(seq int) string {
 	return fmt.Sprintf("%s/%d", c.prefix, seq)
 }
 
+// putOne 写一个对象：零拷贝（NewPut/Reserve/Commit，payload 直接生成在共享内存，
+// 免 memcpy）或普通 Put。零拷贝路径一旦开始（header 已发）失败直接返回，不回退
+// （避免残留流）；NewPut 本身失败（非 shm 连接等）回退普通 Put。
+func putOne(ctx context.Context, s dataStore, c *config, key string, payload []byte) error {
+	if c.zeroCopy {
+		if pw, ok := s.(*rpcclient.Storage); ok {
+			if w, err := pw.NewPut(ctx, key, c.size); err == nil {
+				for off := int64(0); off < c.size; {
+					n := int64(min(int64(writeChunk), c.size-off))
+					buf, rerr := w.Reserve(int(n))
+					if rerr != nil {
+						return rerr
+					}
+					for j := range buf {
+						buf[j] = byte((off + int64(j)) & 0xff)
+					}
+					off += n
+				}
+				return w.Commit()
+			}
+			// NewPut 失败（非 shm / 连接异常）→ 回退普通 Put。
+		}
+	}
+	return s.Put(ctx, key, c.size, payload)
+}
+
 // runWorker write 逐个 Put，read 逐个 Get 整对象。
 // -duration 模式：循环执行直到超时（key = <prefix>/<seq%count>，每线程从 s0 步进 threads，
 // count 为 threads 倍数时各线程覆盖互不重叠的 key 子集）；非 duration 模式每个 key 恰好执行一次。
@@ -198,7 +229,7 @@ func runWorker(ctx context.Context, s dataStore, c *config, s0, e0 int, ops *ato
 		var err error
 		switch c.mode {
 		case "write":
-			err = s.Put(ctx, key, c.size, payload)
+			err = putOne(ctx, s, c, key, payload)
 		case "read":
 			var got []byte
 			var rel func()

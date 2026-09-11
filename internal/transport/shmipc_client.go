@@ -231,6 +231,118 @@ func (c *ShmConn) Get(ctx context.Context, key string, off, size int64) ([]byte,
 	}
 }
 
+// PutBegin 开始共享内存零拷贝写：GetStream + 发 opPutHeader，返回 ShmPutWriter。
+// 调用方随后 Reserve 拿共享内存可写区直写（免 memcpy），全部写毕后 Commit 收尾。
+// 协议与服务端 handleShmPut 兼容（opPutData 带 pad 数据帧，服务端逐帧直写设备）。
+func (c *ShmConn) PutBegin(ctx context.Context, key string, size int64) (*ShmPutWriter, error) {
+	if size < 0 {
+		return nil, taihu.ErrInvalidRange
+	}
+	st, err := c.sm.GetStream()
+	if err != nil {
+		return nil, err
+	}
+	if d, ok := ctx.Deadline(); ok {
+		_ = st.SetDeadline(d)
+	}
+	if err := shmWriteFrame(st, opPutHeader, encodePutHeader(key, size)); err != nil {
+		c.sm.PutBack(st)
+		return nil, err
+	}
+	return &ShmPutWriter{c: c, st: st, size: size}, nil
+}
+
+// ShmPutWriter 共享内存零拷贝写流（一个对象一个，持有流与逐帧状态）。
+// Reserve 返回共享内存数据区直接引用（4K 对齐），调用方直接写入（零拷贝），
+// 写满 chunkSize 自动切帧；Commit 发 opPutEnd 并收响应。
+type ShmPutWriter struct {
+	c        *ShmConn
+	st       *shmipc.Stream
+	size     int64
+	written  int64
+	curLen   int    // 当前帧已写 payload 字节
+	frameHead []byte // 当前帧首区域 [0:5] 帧头引用（共享内存）
+	err      error
+}
+
+// Reserve 返回 n 字节共享内存可写区（零拷贝直写）。单次 n 不得超过 chunkSize
+// （4MiB）；更大对象请分块多次 Reserve。当前帧写满自动切帧（Flush 旧帧）。
+func (w *ShmPutWriter) Reserve(n int) ([]byte, error) {
+	if w.err != nil {
+		return nil, w.err
+	}
+	if n <= 0 {
+		return nil, nil
+	}
+	if n > chunkSize {
+		w.err = fmt.Errorf("taihu: reserve %d > chunkSize %d", n, chunkSize)
+		return nil, w.err
+	}
+	// 切帧：当前帧 + n 超过单帧上限 → Flush 当前帧并开启新帧。
+	if w.curLen > 0 && w.curLen+n > chunkSize {
+		if err := shmCommitFrame(w.st, w.frameHead, opPutData, w.curLen); err != nil {
+			w.err = err
+			return nil, err
+		}
+		w.curLen, w.frameHead = 0, nil
+	}
+	full, err := w.st.BufferWriter().Reserve(shmDataPad + n)
+	if err != nil {
+		w.err = err
+		return nil, err
+	}
+	if w.frameHead == nil {
+		// 新帧首区域：帧头 [4B len][1B op] 位于区域前 5B（pad 4096 内含帧头）。
+		w.frameHead = full[:shmLenPrefixLen+shmOpLen]
+	}
+	w.curLen += n
+	w.written += int64(n)
+	return full[shmDataPad : shmDataPad+n], nil
+}
+
+// Write 拷贝写（通用语义：内部 Reserve + copy）。
+func (w *ShmPutWriter) Write(p []byte) (int, error) {
+	buf, err := w.Reserve(len(p))
+	if err != nil {
+		return 0, err
+	}
+	return copy(buf, p), nil
+}
+
+// Commit 结束写入：Flush 末帧 + 发 opPutEnd + 读 opResp + PutBack 流。
+// 已写字节 != size 时返回 ErrShortWrite。
+func (w *ShmPutWriter) Commit() error {
+	defer w.c.sm.PutBack(w.st)
+	if w.err != nil {
+		return w.err
+	}
+	if w.written != w.size {
+		w.err = taihu.ErrShortWrite
+		return w.err
+	}
+	if w.curLen > 0 {
+		if err := shmCommitFrame(w.st, w.frameHead, opPutData, w.curLen); err != nil {
+			return err
+		}
+		w.curLen, w.frameHead = 0, nil
+	}
+	if err := shmWriteFrame(w.st, opPutEnd, nil); err != nil {
+		return err
+	}
+	op, payload, err := shmReadFrame(w.st.BufferReader())
+	if err != nil {
+		return err
+	}
+	if op != opResp {
+		return fmt.Errorf("taihu: unexpected put response op %d", op)
+	}
+	code, err := readU32(newSliceReader(payload))
+	if err != nil {
+		return err
+	}
+	return mapCode(errCode(code))
+}
+
 // Delete 删除对象映射（key 不存在返回 ErrNotFound）。
 func (c *ShmConn) Delete(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
