@@ -9,7 +9,7 @@ PB=$3
 TAG=$4
 COUNT=${5:-20000}
 THREADS=${6:-32}
-BENCH=/tmp/taihu-rpc-bench.50ebbe4
+BENCH=/tmp/taihu-rpc-bench.b137e7b
 PD="100.71.128.11:2379,100.71.128.12:2379,100.71.128.13:2379"
 export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
 
