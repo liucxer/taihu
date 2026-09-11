@@ -36,6 +36,7 @@ type config struct {
 	count       int
 	prefix      string
 	reportEvery time.Duration
+	duration    time.Duration
 	latency     bool
 	cpuProfile  string
 }
@@ -47,9 +48,10 @@ func parseFlags() *config {
 	flag.Int64Var(&c.size, "size", 4096, "object size in bytes")
 	flag.IntVar(&c.threads, "threads", 1, "number of concurrent goroutines")
 	flag.IntVar(&c.sessions, "sessions", 1, "number of shmipc sessions (shared-memory buffers)")
-	flag.IntVar(&c.count, "count", 1000, "total number of distinct objects")
+	flag.IntVar(&c.count, "count", 1000, "total number of distinct objects (keys are <prefix>/<seq%%count> in -duration mode)")
 	flag.StringVar(&c.prefix, "keys-prefix", "shmbench", "key prefix, keys are <prefix>/<seq>")
 	flag.DurationVar(&c.reportEvery, "report-interval", 2*time.Second, "progress report interval")
+	flag.DurationVar(&c.duration, "duration", 0, "run for this duration looping keys mod count (e.g. 60s); 0 = run each key once")
 	flag.BoolVar(&c.latency, "latency", false, "record per-op latency")
 	flag.StringVar(&c.cpuProfile, "cpuprofile", "", "write cpu profile to this file (pprof)")
 	flag.Parse()
@@ -90,7 +92,11 @@ func main() {
 
 	var ops atomic.Int64
 	lat := newLatencyCollector()
-	pr := newProgress(&ops, c.count, c.reportEvery)
+	total := c.count
+	if c.duration > 0 {
+		total = -1 // duration 模式无固定总量
+	}
+	pr := newProgress(&ops, total, c.reportEvery)
 	pr.start()
 
 	start := time.Now()
@@ -168,13 +174,24 @@ func (c *config) keyFor(seq int) string {
 }
 
 // runWorker write 逐个 Put，read 逐个 Get 整对象。
+// -duration 模式：循环执行直到超时（key = <prefix>/<seq%count>，每线程从 s0 步进 threads，
+// count 为 threads 倍数时各线程覆盖互不重叠的 key 子集）；非 duration 模式每个 key 恰好执行一次。
 func runWorker(ctx context.Context, s dataStore, c *config, s0, e0 int, ops *atomic.Int64, lat *latencyCollector) error {
 	payload := make([]byte, int(c.size))
 	for j := range payload {
 		payload[j] = byte(j & 0xff)
 	}
-	for k := s0; k < e0; k++ {
-		key := c.keyFor(k)
+	start := time.Now()
+	k := s0
+	for {
+		if c.duration > 0 {
+			if time.Since(start) >= c.duration {
+				return nil
+			}
+		} else if k >= e0 {
+			return nil
+		}
+		key := c.keyFor(k % c.count)
 		t0 := time.Now()
 		var err error
 		switch c.mode {
@@ -200,17 +217,22 @@ func runWorker(ctx context.Context, s dataStore, c *config, s0, e0 int, ops *ato
 			return err
 		}
 		ops.Add(1)
+		if c.duration > 0 {
+			k += c.threads // 循环模式按线程步进，避免并发线程争同一 key
+		} else {
+			k++
+		}
 	}
-	return nil
 }
 
 // progress 周期性打印已完成 op 数。
 type progress struct {
-	ops    *atomic.Int64
-	total  int
-	every  time.Duration
-	stopCh chan struct{}
-	doneCh chan struct{}
+	ops       *atomic.Int64
+	total     int
+	every     time.Duration
+	startTime time.Time
+	stopCh    chan struct{}
+	doneCh    chan struct{}
 }
 
 func newProgress(ops *atomic.Int64, total int, every time.Duration) *progress {
@@ -220,6 +242,7 @@ func newProgress(ops *atomic.Int64, total int, every time.Duration) *progress {
 func (p *progress) start() {
 	p.stopCh = make(chan struct{})
 	p.doneCh = make(chan struct{})
+	p.startTime = time.Now()
 	go func() {
 		defer close(p.doneCh)
 		last := time.Now()
@@ -233,7 +256,12 @@ func (p *progress) start() {
 			case now := <-t.C:
 				n := p.ops.Load()
 				rate := float64(n-lastN) / now.Sub(last).Seconds()
-				fmt.Printf("  %s: %d/%d (%.1f ops/s)\n", now.Format("15:04:05"), n, p.total, rate)
+				if p.total < 0 {
+					// duration 模式：显示已运行时间与实时速率。
+					fmt.Printf("  %s: running %.0fs (%.1f ops/s)\n", now.Format("15:04:05"), now.Sub(p.startTime).Seconds(), rate)
+				} else {
+					fmt.Printf("  %s: %d/%d (%.1f ops/s)\n", now.Format("15:04:05"), n, p.total, rate)
+				}
 				last, lastN = now, n
 			}
 		}
