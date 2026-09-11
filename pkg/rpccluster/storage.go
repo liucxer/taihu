@@ -55,18 +55,42 @@ func NewCluster(cfg ClusterConfig) (*Storage, error) {
 	return s, nil
 }
 
+// conns 缓存键：本地实例用 shm 地址，跨节点用网络地址；同机 shm 走共享内存零拷贝，
+// 跨节点走 netpoll TCP。按传输类型分桶避免地址冲突。
+func connKey(inst cluster.InstanceInfo) string {
+	if inst.ShmAddr != "" {
+		return "shm://" + inst.ShmAddr
+	}
+	return "tcp://" + inst.Addr
+}
+
 // clientFor 懒建并缓存某实例的数据面连接（幂等；连接复用避免重复拨号）。
+// 本地实例（同 node）优先用 DialShm 共享内存；否则（跨节点）用 DialPool TCP。
 func (s *Storage) clientFor(inst cluster.InstanceInfo) (*rpcclient.Storage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if c, ok := s.conns[inst.Addr]; ok {
+	key := connKey(inst)
+	if c, ok := s.conns[key]; ok {
 		return c, nil
 	}
-	c, err := rpcclient.DialPool(context.Background(), inst.Addr, 1)
+	var (
+		c   *rpcclient.Storage
+		err error
+	)
+	if s.cfg.Node != "" && inst.ShmAddr != "" {
+		// 同机共享内存：零拷贝传输（若本机未开放 shm，则回退 TCP 由 shmAddr 为空判空）
+		c, err = rpcclient.DialShm(context.Background(), inst.ShmAddr)
+		if err != nil {
+			// shm 不可用（socket 未建等）回退 TCP，保证功能不中断
+			c, err = rpcclient.DialPool(context.Background(), inst.Addr, 1)
+		}
+	} else {
+		c, err = rpcclient.DialPool(context.Background(), inst.Addr, 1)
+	}
 	if err != nil {
 		return nil, err
 	}
-	s.conns[inst.Addr] = c
+	s.conns[key] = c
 	return c, nil
 }
 

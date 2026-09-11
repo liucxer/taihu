@@ -8,19 +8,33 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"runtime/pprof"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/liucxer/taihu/internal/cluster"
 	"github.com/liucxer/taihu/internal/transport"
 	"github.com/liucxer/taihu/pkg/rpcclient"
+	"github.com/liucxer/taihu/pkg/rpccluster"
 )
+
+// dataStore 压测数据面抽象：单实例 rpcclient.Storage 与集群 rpccluster.Storage
+// 均实现同一套 Put/Get/Delete 签名，压测逻辑不关心到底走 TCP/shm 还是集群路由。
+type dataStore interface {
+	Put(ctx context.Context, key string, size int64, in []byte) error
+	Get(ctx context.Context, key string, off, size int64) ([]byte, func(), error)
+	Delete(ctx context.Context, key string) error
+	Close() error
+}
 
 type config struct {
 	addr        string
 	shm         string
+	node        string
+	tikvPD      string
 	mode        string
 	size        int64
 	threads     int
@@ -36,6 +50,8 @@ func parseFlags() *config {
 	c := &config{}
 	flag.StringVar(&c.addr, "addr", "", "taihu-server address (required unless -shm)")
 	flag.StringVar(&c.shm, "shm", "", "taihu-server unix socket path for shmipc shared-memory IPC (mutually exclusive with -addr)")
+	flag.StringVar(&c.node, "node", "", "cluster mode: this client node id (required for cluster)")
+	flag.StringVar(&c.tikvPD, "tikv-pd", "", "cluster mode: comma-separated TiKV PD addresses")
 	flag.StringVar(&c.mode, "mode", "", "write | read | delete")
 	flag.Int64Var(&c.size, "size", 4096, "object size in bytes")
 	flag.IntVar(&c.threads, "threads", 1, "number of concurrent goroutines")
@@ -72,14 +88,40 @@ func main() {
 		}
 	}
 
-	s, err := rpcclient.DialPool(ctx, c.addr, c.conns)
-	if c.shm != "" {
-		s, err = rpcclient.DialShmPool(ctx, c.shm, c.conns)
-	}
-	if err != nil {
-		stopCPUProfile(cpuFile)
-		fmt.Fprintf(os.Stderr, "dial %s: %v\n", c.addr+c.shm, err)
-		os.Exit(1)
+	var s dataStore
+	var err error
+	if c.node != "" {
+		// 集群模式：走 rpccluster（本地实例优先 shm，跨节点 TCP）。
+		kv, kerr := cluster.NewTiKVKV(ctx, strings.Split(c.tikvPD, ","))
+		if kerr != nil {
+			stopCPUProfile(cpuFile)
+			fmt.Fprintf(os.Stderr, "tikv %s: %v\n", c.tikvPD, kerr)
+			os.Exit(1)
+		}
+		defer kv.Close()
+		s, err = rpccluster.NewCluster(rpccluster.ClusterConfig{
+			KV:   kv,
+			Node: c.node,
+			// 压测场景无真实远端源：miss 即记为未命中（回源兜底语义不参与压测带宽）。
+			Source: func(ctx context.Context, key string) ([]byte, error) {
+				return nil, os.ErrNotExist
+			},
+		})
+		if err != nil {
+			stopCPUProfile(cpuFile)
+			fmt.Fprintf(os.Stderr, "cluster %s: %v\n", c.node, err)
+			os.Exit(1)
+		}
+	} else {
+		s, err = rpcclient.DialPool(ctx, c.addr, c.conns)
+		if c.shm != "" {
+			s, err = rpcclient.DialShmPool(ctx, c.shm, c.conns)
+		}
+		if err != nil {
+			stopCPUProfile(cpuFile)
+			fmt.Fprintf(os.Stderr, "dial %s: %v\n", c.addr+c.shm, err)
+			os.Exit(1)
+		}
 	}
 	defer s.Close()
 
@@ -130,11 +172,21 @@ func (c *config) validate() error {
 	default:
 		return fmt.Errorf("invalid -mode %q: must be write, read or delete", c.mode)
 	}
-	if c.addr == "" && c.shm == "" {
-		return fmt.Errorf("-addr or -shm is required")
-	}
-	if c.addr != "" && c.shm != "" {
-		return fmt.Errorf("-addr and -shm are mutually exclusive")
+	if c.node != "" {
+		// 集群模式：node 必传，tikv-pd 必传；addr/shm 互斥且不需提供。
+		if c.tikvPD == "" {
+			return fmt.Errorf("-node requires -tikv-pd")
+		}
+		if c.addr != "" || c.shm != "" {
+			return fmt.Errorf("-addr/-shm are not used in cluster mode (use -node)")
+		}
+	} else {
+		if c.addr == "" && c.shm == "" {
+			return fmt.Errorf("-addr or -shm is required (single-instance mode)")
+		}
+		if c.addr != "" && c.shm != "" {
+			return fmt.Errorf("-addr and -shm are mutually exclusive")
+		}
 	}
 	switch {
 	case c.size < 0:
@@ -166,7 +218,7 @@ func (c *config) keyFor(seq int) string {
 }
 
 // runWorker write 逐个 Put，read 逐个 Get 整对象。
-func runWorker(ctx context.Context, s *rpcclient.Storage, c *config, s0, e0 int, ops *atomic.Int64, lat *latencyCollector) error {
+func runWorker(ctx context.Context, s dataStore, c *config, s0, e0 int, ops *atomic.Int64, lat *latencyCollector) error {
 	payload := make([]byte, int(c.size))
 	for j := range payload {
 		payload[j] = byte(j & 0xff)

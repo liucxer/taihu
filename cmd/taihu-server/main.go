@@ -78,6 +78,7 @@ func main() {
 			Name:      *name,
 			Node:      *node,
 			Addr:      *regAddr,
+			ShmAddr:   *shm, // 同机共享内存 unix socket（-shm）；空=未开放 shm
 			StartTime: time.Now().Unix(),
 		}
 		// 心跳刷新动态字段（容量/可用/已用），StartTime 保持注册时刻。

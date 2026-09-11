@@ -8,11 +8,12 @@ import "time"
 type InstanceInfo struct {
 	Name          string `json:"name"`
 	Node          string `json:"node"`
-	Addr          string `json:"addr"`
-	Capacity      int64  `json:"capacity"`  // 字节
-	Available     int64  `json:"available"` // 字节
-	Used          int64  `json:"used"`      // 字节
-	StartTime     int64  `json:"start_time"`     // unix 秒
+	Addr          string `json:"addr"`          // TCP/网络地址，跨节点访问用
+	ShmAddr       string `json:"shm_addr"`      // 同机 unix socket 路径，共享内存访问用（空=未开放 shm）
+	Capacity      int64  `json:"capacity"`      // 字节
+	Available     int64  `json:"available"`     // 字节
+	Used          int64  `json:"used"`          // 字节
+	StartTime     int64  `json:"start_time"`    // unix 秒
 	LastHeartbeat int64  `json:"last_heartbeat"` // unix 秒
 }
 

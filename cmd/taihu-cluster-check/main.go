@@ -122,8 +122,8 @@ func main() {
 
 	case "read":
 		// 显式三阶段统计（不依赖 store.Get 的本地优先内部路径）：
-		//   localHit: 直连本地实例读命中（本地直查）
-		//   remoteHit: KV 索引定位 → 目标实例读命中（索引锚定/远端读）
+		//   localHit: 直连本地实例读命中（本地直查，优先 shm）
+		//   remoteHit: KV 索引定位 → 目标实例读命中（索引锚定/远端读，TCP）
 		//   sourceHit: 全 miss → 回源回调（回源兜底）
 		var localHit, remoteHit, sourceHit, miss int
 		start := time.Now()
@@ -135,7 +135,7 @@ func main() {
 					if inst.Node != *node {
 						continue
 					}
-					c, err := rpcclient.DialPool(ctx, inst.Addr, 1)
+					c, err := dialFor(inst, *node)
 					if err != nil {
 						continue
 					}
@@ -159,7 +159,7 @@ func main() {
 				target := string(v)
 				for _, inst := range all {
 					if inst.Name == target {
-						c, err := rpcclient.DialPool(ctx, inst.Addr, 1)
+						c, err := dialFor(inst, *node)
 						if err == nil {
 							_, _, err = c.Get(ctx, k, 0, -1)
 							_ = c.Close()
@@ -227,4 +227,15 @@ func splitCSV(s string) []string {
 		out = append(out, cur)
 	}
 	return out
+}
+
+// dialFor 按实例选择数据面连接：同 node 且开放 shm 时走共享内存（零拷贝），
+// 否则（跨节点/未开放 shm）走 netpoll TCP。返回连接供单次使用，需调用方 Close。
+func dialFor(inst cluster.InstanceInfo, node string) (*rpcclient.Storage, error) {
+	if inst.Node == node && inst.ShmAddr != "" {
+		if c, err := rpcclient.DialShm(context.Background(), inst.ShmAddr); err == nil {
+			return c, nil
+		}
+	}
+	return rpcclient.DialPool(context.Background(), inst.Addr, 1)
 }
