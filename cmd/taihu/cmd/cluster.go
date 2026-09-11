@@ -205,7 +205,8 @@ var clusterIndexCmd = &cobra.Command{
 		defer kv.Close()
 
 		start, end := []byte(cluster.IndexKeyPrefix), []byte(cluster.IndexKeyPrefix+"\xff")
-		keys, values, err := kv.Scan(ctx, start, end, 100000)
+		// TiKV rawkv Scan 受 MaxRawKVScanLimit(10240) 上限约束，取 10000。
+		keys, values, err := kv.Scan(ctx, start, end, 10000)
 		if err != nil {
 			return fmt.Errorf("index scan: %w", err)
 		}

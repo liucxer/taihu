@@ -76,8 +76,10 @@ func RunClientHeartbeat(ctx context.Context, kv KV, build func() *ClientInfo, in
 
 // ListClients 扫描客户端注册区全部记录（含已过期未注销的，离线判定由调用方完成）。
 func ListClients(ctx context.Context, kv KV) ([]ClientInfo, error) {
+	// 注意：TiKV rawkv Scan 受 MaxRawKVScanLimit(10240) 上限约束，
+	// 与 register.go ListInstances 保持一致用固定小 limit（10000 < 10240）。
 	start, end := ClientScanRange()
-	_, values, err := kv.Scan(ctx, start, end, 100000)
+	_, values, err := kv.Scan(ctx, start, end, 10000)
 	if err != nil {
 		return nil, err
 	}
