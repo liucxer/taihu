@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/liucxer/taihu/internal/cluster"
@@ -34,7 +35,8 @@ type Storage struct {
 	cache    *RouteCache
 
 	mu    sync.Mutex
-	conns map[string]*rpcclient.Storage // addr -> 数据面客户端（懒建复用）
+	conns atomic.Value // map[string]*rpcclient.Storage 只读快照（copy-on-write，读无锁）
+	// connsMu 仅保护懒建连接的写路径（快照替换），读热路径不触碰。
 
 	// SDK 客户端保活（配置了 ClientID 时启用）：心跳 goroutine 取消函数与注销所需。
 	clientCancel context.CancelFunc
@@ -55,8 +57,8 @@ func NewCluster(cfg ClusterConfig) (*Storage, error) {
 		registry: reg,
 		index:    NewIndexManager(cfg.KV),
 		cache:    NewRouteCache(4096),
-		conns:    make(map[string]*rpcclient.Storage),
 	}
+	s.conns.Store(make(map[string]*rpcclient.Storage))
 	s.picker = NewInstancePicker(reg, cfg.UsageThreshold)
 	reg.Start()
 	s.index.Start()
@@ -100,12 +102,18 @@ func connKey(inst cluster.InstanceInfo) string {
 }
 
 // clientFor 懒建并缓存某实例的数据面连接（幂等；连接复用避免重复拨号）。
+// 无锁快路径：连接缓存为 atomic.Value 只读快照，已建连接直接查表返回（零锁）；
+// miss 时加锁双检并 copy-on-write 替换快照（仅懒建首连触碰锁）。
 // 本地实例（同 node）优先用 DialShm 共享内存；否则（跨节点）用 DialPool TCP。
 func (s *Storage) clientFor(inst cluster.InstanceInfo) (*rpcclient.Storage, error) {
+	key := connKey(inst)
+	if c, ok := s.conns.Load().(map[string]*rpcclient.Storage)[key]; ok {
+		return c, nil
+	}
+	// 懒建慢路径（首个请求触发）：加锁双检，避免并发重复拨号。
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := connKey(inst)
-	if c, ok := s.conns[key]; ok {
+	if c, ok := s.conns.Load().(map[string]*rpcclient.Storage)[key]; ok {
 		return c, nil
 	}
 	var (
@@ -114,18 +122,25 @@ func (s *Storage) clientFor(inst cluster.InstanceInfo) (*rpcclient.Storage, erro
 	)
 	if s.cfg.Node != "" && inst.ShmAddr != "" {
 		// 同机共享内存：零拷贝传输（若本机未开放 shm，则回退 TCP 由 shmAddr 为空判空）
-		c, err = rpcclient.DialShm(context.Background(), inst.ShmAddr)
+		c, err = rpcclient.DialShmPool(context.Background(), inst.ShmAddr, s.cfg.Conns)
 		if err != nil {
 			// shm 不可用（socket 未建等）回退 TCP，保证功能不中断
-			c, err = rpcclient.DialPool(context.Background(), inst.Addr, 1)
+			c, err = rpcclient.DialPool(context.Background(), inst.Addr, s.cfg.Conns)
 		}
 	} else {
-		c, err = rpcclient.DialPool(context.Background(), inst.Addr, 1)
+		c, err = rpcclient.DialPool(context.Background(), inst.Addr, s.cfg.Conns)
 	}
 	if err != nil {
 		return nil, err
 	}
-	s.conns[key] = c
+	// copy-on-write：复制旧快照 + 新连接后原子替换（读者始终看到完整 map）。
+	old := s.conns.Load().(map[string]*rpcclient.Storage)
+	nw := make(map[string]*rpcclient.Storage, len(old)+1)
+	for k, v := range old {
+		nw[k] = v
+	}
+	nw[key] = c
+	s.conns.Store(nw)
 	return c, nil
 }
 
@@ -160,6 +175,33 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) ([]byte,
 	}
 	// 3) 回源重建
 	return s.getFromSource(ctx, key, off, size)
+}
+
+// PreloadRoute 预热路由缓存：逐个 key 查索引/路由并填充 RouteCache（不读数据）。
+// 压测/预热场景用：热缓存下 Get 首查 RouteCache 命中，不再打 TiKV 索引，
+// 消除"每 key 先查 TiKV"的冷启动开销。串行预热大 key 集时 TiKV 查询延迟
+// 主导（~10ms/key），故用固定并发 worker 并行填充（lookup 幂等且并发安全）。
+func (s *Storage) PreloadRoute(ctx context.Context, keys []string) {
+	const workers = 64
+	if len(keys) == 0 {
+		return
+	}
+	ch := make(chan string)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for key := range ch {
+				_, _ = s.lookup(ctx, key)
+			}
+		}()
+	}
+	for _, key := range keys {
+		ch <- key
+	}
+	close(ch)
+	wg.Wait()
 }
 
 // getFrom 从给定实例列表逐个试读，全部 miss 返回 ErrNotFound。
@@ -275,11 +317,12 @@ func (s *Storage) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var first error
-	for addr, c := range s.conns {
+	// 遍历快照关闭连接；随后以空快照原子替换（不修改旧 map，避免并发读者冲突）。
+	for _, c := range s.conns.Load().(map[string]*rpcclient.Storage) {
 		if err := c.Close(); err != nil && first == nil {
 			first = err
 		}
-		delete(s.conns, addr)
 	}
+	s.conns.Store(make(map[string]*rpcclient.Storage))
 	return first
 }

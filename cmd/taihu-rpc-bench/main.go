@@ -44,6 +44,7 @@ type config struct {
 	reportEvery time.Duration
 	latency     bool
 	cpuProfile  string
+	preload     bool
 }
 
 func parseFlags() *config {
@@ -61,6 +62,7 @@ func parseFlags() *config {
 	flag.DurationVar(&c.reportEvery, "report-interval", 2*time.Second, "progress report interval")
 	flag.BoolVar(&c.latency, "latency", false, "record per-op latency")
 	flag.StringVar(&c.cpuProfile, "cpuprofile", "", "write cpu profile to this file (pprof)")
+	flag.BoolVar(&c.preload, "preload", false, "read: preload RouteCache before timing (cluster mode)")
 	flag.Parse()
 	return c
 }
@@ -102,6 +104,8 @@ func main() {
 		s, err = rpccluster.NewCluster(rpccluster.ClusterConfig{
 			KV:   kv,
 			Node: c.node,
+			// 每实例连接数：本地实例 shm 会话数、跨节点 TCP 连接数（-conns）。
+			Conns: c.conns,
 			// 压测场景无真实远端源：miss 即记为未命中（回源兜底语义不参与压测带宽）。
 			Source: func(ctx context.Context, key string) ([]byte, error) {
 				return nil, os.ErrNotExist
@@ -124,6 +128,19 @@ func main() {
 		}
 	}
 	defer s.Close()
+
+	// 预热路由缓存（集群读模式）：逐 key 查索引填充 RouteCache，消除冷启动的
+	// "每 key 查 TiKV"开销，只验证热缓存下的数据面带宽。
+	if c.preload && c.mode == "read" {
+		if cs, ok := s.(*rpccluster.Storage); ok {
+			keys := make([]string, 0, c.count)
+			for k := 0; k < c.count; k++ {
+				keys = append(keys, c.keyFor(k))
+			}
+			cs.PreloadRoute(ctx, keys)
+			fmt.Printf("preloaded %d keys into RouteCache\n", len(keys))
+		}
+	}
 
 	var ops atomic.Int64
 	lat := newLatencyCollector()

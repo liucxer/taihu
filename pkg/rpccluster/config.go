@@ -30,6 +30,10 @@ type ClusterConfig struct {
 	// UsageThreshold 选实例的水位阈值百分比（<=0 或 >100 默认 80）：used/capacity
 	// 超过则跳过该实例（写路径避免打满盘）。
 	UsageThreshold float64
+	// Conns 每实例数据面连接数：本地实例 shm 会话数（shmipc SessionNum）、跨节点 TCP
+	// 连接数（DialPool n）。<=0 默认 1。多会话可支撑更高并发（48+ 线程不触发
+	// shmipc 单会话过载）。
+	Conns int
 	// Source 回源回调（可选）：集群全 miss 时拉远端源并回写缓存。
 	Source SourceGetter
 
