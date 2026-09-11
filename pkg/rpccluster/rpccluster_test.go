@@ -51,9 +51,9 @@ func TestRegistryDiscovery(t *testing.T) {
 	now := time.Now()
 	// 两个在线（node1/node2 各一）+ 一个心跳超时离线
 	for _, inst := range []*cluster.InstanceInfo{
-		{Name: "a", Node: "node1", Addr: "127.0.0.1:1", LastHeartbeat: now.Unix()},
-		{Name: "b", Node: "node2", Addr: "127.0.0.1:2", LastHeartbeat: now.Unix()},
-		{Name: "c", Node: "node1", Addr: "127.0.0.1:3", LastHeartbeat: now.Add(-10 * time.Second).Unix()},
+		{Name: "a", Node: "node1", Hostname: "node1", Addr: "127.0.0.1:1", LastHeartbeat: now.Unix()},
+		{Name: "b", Node: "node2", Hostname: "node2", Addr: "127.0.0.1:2", LastHeartbeat: now.Unix()},
+		{Name: "c", Node: "node1", Hostname: "node1", Addr: "127.0.0.1:3", LastHeartbeat: now.Add(-10 * time.Second).Unix()},
 	} {
 		if err := cluster.Register(ctx, kv, inst); err != nil {
 			t.Fatal(err)
@@ -83,7 +83,7 @@ func TestPickerLocalFirstAndHealthy(t *testing.T) {
 	reg := NewInstanceRegistry(kv, "node1", time.Hour, 5*time.Second)
 	regs := func(name, node string, used, cap int64) {
 		if err := cluster.Register(ctx, kv, &cluster.InstanceInfo{
-			Name: name, Node: node, Addr: "127.0.0.1:9",
+			Name: name, Node: node, Hostname: node, Addr: "127.0.0.1:9",
 			Used: used, Capacity: cap, LastHeartbeat: now.Unix(),
 		}); err != nil {
 			t.Fatal(err)
@@ -114,8 +114,8 @@ func TestPickerFullLocalFallbackRemote(t *testing.T) {
 	now := time.Now()
 	reg := NewInstanceRegistry(kv, "node1", time.Hour, 5*time.Second)
 	for _, inst := range []*cluster.InstanceInfo{
-		{Name: "a-full", Node: "node1", Addr: "127.0.0.1:9", Used: 95, Capacity: 100, LastHeartbeat: now.Unix()},
-		{Name: "c-ok", Node: "node2", Addr: "127.0.0.1:8", Used: 10, Capacity: 100, LastHeartbeat: now.Unix()},
+		{Name: "a-full", Node: "node1", Hostname: "node1", Addr: "127.0.0.1:9", Used: 95, Capacity: 100, LastHeartbeat: now.Unix()},
+		{Name: "c-ok", Node: "node2", Hostname: "node2", Addr: "127.0.0.1:8", Used: 10, Capacity: 100, LastHeartbeat: now.Unix()},
 	} {
 		if err := cluster.Register(ctx, kv, inst); err != nil {
 			t.Fatal(err)

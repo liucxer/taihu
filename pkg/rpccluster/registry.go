@@ -11,13 +11,13 @@ import (
 // instanceSnapshot 一次发现的实例快照（不可变，原子替换；并发读无锁）。
 type instanceSnapshot struct {
 	all    []cluster.InstanceInfo // 全部在线实例
-	local  []cluster.InstanceInfo // 同 node 实例（本地优先）
+	local  []cluster.InstanceInfo // 同机（Hostname 一致）实例（本地优先）
 	remote []cluster.InstanceInfo // 远端实例
 	byName map[string]cluster.InstanceInfo
 }
 
-// buildSnapshot 按心跳超时过滤离线实例并分组。
-func buildSnapshot(all []cluster.InstanceInfo, node string, now time.Time, timeout time.Duration) *instanceSnapshot {
+// buildSnapshot 按心跳超时过滤离线实例并分组：本地 = Hostname 与本机一致。
+func buildSnapshot(all []cluster.InstanceInfo, localHostname string, now time.Time, timeout time.Duration) *instanceSnapshot {
 	snap := &instanceSnapshot{byName: make(map[string]cluster.InstanceInfo, len(all))}
 	for _, inst := range all {
 		if !inst.Aliveness(now, timeout) {
@@ -25,7 +25,7 @@ func buildSnapshot(all []cluster.InstanceInfo, node string, now time.Time, timeo
 		}
 		snap.all = append(snap.all, inst)
 		snap.byName[inst.Name] = inst
-		if inst.Node == node {
+		if inst.Hostname == localHostname {
 			snap.local = append(snap.local, inst)
 		} else {
 			snap.remote = append(snap.remote, inst)
@@ -37,10 +37,10 @@ func buildSnapshot(all []cluster.InstanceInfo, node string, now time.Time, timeo
 // InstanceRegistry 周期扫描 KV 注册区维护在线实例快照（修复 kvcache 的 start_time
 // 复用问题：离线判定依据 LastHeartbeat 字段）。
 type InstanceRegistry struct {
-	kv       cluster.KV
-	node     string
-	interval time.Duration
-	timeout  time.Duration
+	kv            cluster.KV
+	localHostname string
+	interval      time.Duration
+	timeout       time.Duration
 
 	mu   sync.RWMutex
 	snap *instanceSnapshot
@@ -49,8 +49,9 @@ type InstanceRegistry struct {
 	done chan struct{}
 }
 
-// NewInstanceRegistry 构造实例发现器。
-func NewInstanceRegistry(kv cluster.KV, node string, interval, timeout time.Duration) *InstanceRegistry {
+// NewInstanceRegistry 构造实例发现器。localHostname 为本机 hostname（os.Hostname），
+// 用于本地优先分组（与实例注册的 Hostname 比较）。
+func NewInstanceRegistry(kv cluster.KV, localHostname string, interval, timeout time.Duration) *InstanceRegistry {
 	if interval <= 0 {
 		interval = time.Second
 	}
@@ -58,12 +59,12 @@ func NewInstanceRegistry(kv cluster.KV, node string, interval, timeout time.Dura
 		timeout = 5 * time.Second
 	}
 	return &InstanceRegistry{
-		kv:       kv,
-		node:     node,
-		interval: interval,
-		timeout:  timeout,
-		stop:     make(chan struct{}),
-		done:     make(chan struct{}),
+		kv:            kv,
+		localHostname: localHostname,
+		interval:      interval,
+		timeout:       timeout,
+		stop:          make(chan struct{}),
+		done:          make(chan struct{}),
 	}
 }
 
@@ -93,7 +94,7 @@ func (r *InstanceRegistry) refresh() {
 	if err != nil {
 		return
 	}
-	snap := buildSnapshot(all, r.node, time.Now(), r.timeout)
+	snap := buildSnapshot(all, r.localHostname, time.Now(), r.timeout)
 	r.mu.Lock()
 	r.snap = snap
 	r.mu.Unlock()

@@ -45,14 +45,15 @@ func main() {
 		listen = flag.String("listen", "", "comma-separated listen IPs, e.g. 10.0.0.1,10.0.0.2 (required)")
 		db     = flag.String("db", "", "pebble metadata directory (required)")
 		dev    = flag.String("dev", "", "raw device path (required)")
-		// 实例唯一标识：-name（如 TAIHU-0）作为 taihu 实例的唯一标识符，
-		// 也是 TiKV 中容量记录（/taihu/capacity/{name}）与集群注册（/taihu/instances/{name}）的 key。
+		// 实例唯一标识：-server-name（如 TAIHU-0）作为 taihu 实例的唯一标识符，
+		// 也是 TiKV 中容量记录（/taihu/capacity/{server-name}）与集群注册
+		// （/taihu/instances/{server-name}）的 key。
 		// -tikv-pd 必填：容量记录/比较（启动读 nvme 容量后写入/比对，不一致拒绝启动）依赖 TiKV。
 		// 对外通告地址取 -listen 首个 IP + RPC 端口；共享内存（shmipc）默认开启，
-		// unix socket 路径固定为 /dev/<实例名>；节点标识取本机 hostname；
+		// unix socket 路径固定为 /dev/<server-name>；节点标识与本机 Hostname 取 os.Hostname()；
 		// pprof 监听所有 IP（0.0.0.0），端口同样自动分配。
-		name   = flag.String("name", "", "unique instance name, e.g. TAIHU-0 (required)")
-		tikvPD = flag.String("tikv-pd", "", "comma-separated TiKV PD addresses (required)")
+		serverName = flag.String("server-name", "", "unique server name, e.g. TAIHU-0 (required)")
+		tikvPD     = flag.String("tikv-pd", "", "comma-separated TiKV PD addresses (required)")
 	)
 	flag.Parse()
 	if *showVersion {
@@ -63,8 +64,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "taihu-server: -db and -dev are required")
 		os.Exit(2)
 	}
-	if *name == "" || *tikvPD == "" {
-		fmt.Fprintln(os.Stderr, "taihu-server: -name and -tikv-pd are required")
+	if *serverName == "" || *tikvPD == "" {
+		fmt.Fprintln(os.Stderr, "taihu-server: -server-name and -tikv-pd are required")
 		os.Exit(2)
 	}
 	if *listen == "" {
@@ -109,13 +110,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("DeviceCapacity %s: %v", *dev, err)
 	}
-	if rec, ok, err := cluster.GetCapacity(ctx, kv, *name); err != nil {
+	if rec, ok, err := cluster.GetCapacity(ctx, kv, *serverName); err != nil {
 		log.Fatalf("get capacity record: %v", err)
 	} else if ok && rec.CapacityBytes != capacity {
 		log.Fatalf("instance %s capacity changed: recorded=%d current=%d (disk replaced? deploy as a new instance)",
-			*name, rec.CapacityBytes, capacity)
+			*serverName, rec.CapacityBytes, capacity)
 	}
-	if err := cluster.PutCapacity(ctx, kv, *name, cluster.CapacityRecord{
+	if err := cluster.PutCapacity(ctx, kv, *serverName, cluster.CapacityRecord{
 		CapacityBytes:    capacity,
 		SegmentSizeBytes: segSize,
 		SegmentCount:     capacity / segSize,
@@ -124,7 +125,7 @@ func main() {
 	}); err != nil {
 		log.Fatalf("put capacity record: %v", err)
 	}
-	log.Printf("capacity %s: %d bytes = %d segments x %d", *name, capacity, capacity/segSize, segSize)
+	log.Printf("capacity %s: %d bytes = %d segments x %d", *serverName, capacity, capacity/segSize, segSize)
 
 	l := layout.ComputeLayout(capacity, segSize)
 	storage, err := taihu.NewStorage(ctx, *db, *dev, l)
@@ -140,14 +141,17 @@ func main() {
 	defer compactor.Stop()
 
 	// 集群注册：注册 + 1s 心跳 + 停机注销（本地优先发现/索引均依赖该注册区）。
-	// -name/-tikv-pd 必填即集群模式；节点标识取本机 hostname；对外通告地址 = 首个监听 IP:RPC 端口；
-	// 共享内存（shmipc）默认开启，unix socket 路径固定为 /dev/<实例名>。
-	hostname, _ := os.Hostname()
-	shmPath := "/dev/" + *name
+	// Hostname（主机名）供 SDK 判断"客户端是否与服务端同机"——同机走 shm、否则走 TCP。
+	hostname, hnerr := os.Hostname()
+	if hnerr != nil {
+		hostname = ""
+	}
+	shmPath := "/dev/" + *serverName
 	var clusterCancel context.CancelFunc
 	info := &cluster.InstanceInfo{
-		Name:      *name,
+		Name:      *serverName,
 		Node:      hostname,
+		Hostname:  hostname,
 		Addr:      advAddr,
 		ShmAddr:   shmPath,
 		StartTime: time.Now().Unix(),
@@ -169,11 +173,11 @@ func main() {
 	var hctx context.Context
 	hctx, clusterCancel = context.WithCancel(context.Background())
 	go cluster.RunHeartbeat(hctx, kv, refresh, time.Second)
-	log.Printf("cluster registered name=%s node=%s addr=%s kv=%T", *name, hostname, advAddr, kv)
+	log.Printf("cluster registered name=%s node=%s hostname=%s addr=%s kv=%T", *serverName, hostname, hostname, advAddr, kv)
 
 	gs := rpcserver.New(storage)
 
-	// 同机共享内存 IPC（shmipc）：unix socket 固定 /dev/<实例名>，与 TCP 监听并行（默认开启）。
+	// 同机共享内存 IPC（shmipc）：unix socket 固定 /dev/<server-name>，与 TCP 监听并行（默认开启）。
 	shmCloser, err := transport.ServeShm(storage, shmPath)
 	if err != nil {
 		log.Fatalf("serve shm %s: %v", shmPath, err)
@@ -212,7 +216,7 @@ func main() {
 		// 先注销集群注册（避免残留僵尸实例），再停数据面。
 		if clusterCancel != nil {
 			clusterCancel()
-			_ = cluster.Unregister(context.Background(), kv, *name)
+			_ = cluster.Unregister(context.Background(), kv, *serverName)
 		}
 		gs.GracefulStop()
 	}()

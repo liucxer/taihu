@@ -21,8 +21,10 @@ type SourceGetter func(ctx context.Context, key string) ([]byte, error)
 type ClusterConfig struct {
 	// KV 注册/索引后端（必填；TiKV rawkv 或内存）。
 	KV cluster.KV
-	// Node 本节点标识：优先选择同 node 的实例（本地优先）。
-	Node string
+	// ClientName 客户端标识（如 taihu-rpc-bench 的 -client-name）：仅作标注/客户端注册用，
+	// 不参与路由。同机判定（同机走 shm、否则 TCP）由 SDK 比较本机 hostname 与
+	// 服务端注册的 Hostname（os.Hostname）自动完成。
+	ClientName string
 	// RefreshInterval 实例发现刷新周期（<=0 默认 1s）。
 	RefreshInterval time.Duration
 	// HeartbeatTimeout 实例离线判定超时（<=0 默认 5s）。

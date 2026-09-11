@@ -6,7 +6,7 @@ import (
 	"github.com/liucxer/taihu/internal/cluster"
 )
 
-// InstancePicker 实例选择器：本地优先（同 node）→ 远端兜底；每档内只挑
+// InstancePicker 实例选择器：本地优先（同机 Hostname 一致）→ 远端兜底；每档内只挑
 // 水位未超阈值的实例，全超时整档随机兜底（缓存场景：宁可写满盘也不丢写入）。
 type InstancePicker struct {
 	registry  *InstanceRegistry

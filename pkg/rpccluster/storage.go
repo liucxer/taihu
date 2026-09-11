@@ -33,6 +33,7 @@ type Storage struct {
 	picker   *InstancePicker
 	index    *IndexManager
 	cache    *RouteCache
+	hostname string // 本机 hostname（os.Hostname）：与实例注册 Hostname 比较判同机 → shm / TCP
 
 	mu    sync.Mutex
 	conns atomic.Value // map[string]*rpcclient.Storage 只读快照（copy-on-write，读无锁）
@@ -51,10 +52,12 @@ func NewCluster(cfg ClusterConfig) (*Storage, error) {
 	if cfg.KV == nil {
 		return nil, errors.New("rpccluster: KV is required")
 	}
-	reg := NewInstanceRegistry(cfg.KV, cfg.Node, cfg.RefreshInterval, cfg.HeartbeatTimeout)
+	hostname, _ := os.Hostname()
+	reg := NewInstanceRegistry(cfg.KV, hostname, cfg.RefreshInterval, cfg.HeartbeatTimeout)
 	s := &Storage{
 		cfg:      cfg,
 		registry: reg,
+		hostname: hostname,
 		index:    NewIndexManager(cfg.KV),
 		cache:    NewRouteCache(4096),
 	}
@@ -75,7 +78,7 @@ func (s *Storage) startClientKeepalive(cfg ClusterConfig) {
 	host, _ := os.Hostname()
 	info := &cluster.ClientInfo{
 		ID:         cfg.ClientID,
-		Node:       cfg.Node,
+		Node:       cfg.ClientName,
 		Addr:       cfg.ClientAddr,
 		Host:       host,
 		Pid:        os.Getpid(),
@@ -104,7 +107,7 @@ func connKey(inst cluster.InstanceInfo) string {
 // clientFor 懒建并缓存某实例的数据面连接（幂等；连接复用避免重复拨号）。
 // 无锁快路径：连接缓存为 atomic.Value 只读快照，已建连接直接查表返回（零锁）；
 // miss 时加锁双检并 copy-on-write 替换快照（仅懒建首连触碰锁）。
-// 本地实例（同 node）优先用 DialShm 共享内存；否则（跨节点）用 DialPool TCP。
+// 客户端与服务端同机（Hostname 一致）优先用 DialShm 共享内存；否则（跨节点）用 DialPool TCP。
 func (s *Storage) clientFor(inst cluster.InstanceInfo) (*rpcclient.Storage, error) {
 	key := connKey(inst)
 	if c, ok := s.conns.Load().(map[string]*rpcclient.Storage)[key]; ok {
@@ -120,14 +123,15 @@ func (s *Storage) clientFor(inst cluster.InstanceInfo) (*rpcclient.Storage, erro
 		c   *rpcclient.Storage
 		err error
 	)
-	if s.cfg.Node != "" && inst.ShmAddr != "" {
-		// 同机共享内存：零拷贝传输（若本机未开放 shm，则回退 TCP 由 shmAddr 为空判空）
+	if s.hostname != "" && inst.Hostname == s.hostname && inst.ShmAddr != "" {
+		// 客户端与服务端同机（Hostname 一致）：走共享内存（零拷贝传输）；
+		// shm 不可用（socket 未建等）回退 TCP，保证功能不中断。
 		c, err = rpcclient.DialShmPool(context.Background(), inst.ShmAddr, s.cfg.Conns)
 		if err != nil {
-			// shm 不可用（socket 未建等）回退 TCP，保证功能不中断
 			c, err = rpcclient.DialPool(context.Background(), inst.Addr, s.cfg.Conns)
 		}
 	} else {
+		// 跨节点（Hostname 不一致）：走 TCP。
 		c, err = rpcclient.DialPool(context.Background(), inst.Addr, s.cfg.Conns)
 	}
 	if err != nil {

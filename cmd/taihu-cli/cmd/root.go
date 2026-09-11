@@ -20,10 +20,10 @@ func init() {
 
 // global 全局生效参数（root persistent flags），各子命令经 helpers 读取。
 var global = struct {
-	pd      string        // TiKV PD 地址列表（逗号分隔）
-	node    string        // 本节点标识
-	timeout time.Duration // 单次交互超时
-	json    bool          // 机器可读 JSON 输出
+	pd         string        // TiKV PD 地址列表（逗号分隔）
+	clientName string        // 本客户端标识（标注 LOCAL、客户端清单过滤用）
+	timeout    time.Duration // 单次交互超时
+	json       bool          // 机器可读 JSON 输出
 }{timeout: 5 * time.Second}
 
 // rootCmd 根命令：无子命令时打印帮助。
@@ -49,7 +49,7 @@ func Execute() error {
 func init() {
 	pf := rootCmd.PersistentFlags()
 	pf.StringVar(&global.pd, "pd", "", "TiKV PD 地址列表（逗号分隔），集群类命令必需")
-	pf.StringVar(&global.node, "node", "", "本节点标识（标注 LOCAL、客户端清单过滤用）")
+	pf.StringVar(&global.clientName, "client-name", "", "本客户端标识（标注 LOCAL、客户端清单过滤用；传本机 hostname 可高亮本机实例）")
 	pf.DurationVar(&global.timeout, "timeout", 5*time.Second, "单次交互超时")
 	pf.BoolVar(&global.json, "json", false, "机器可读 JSON 输出")
 

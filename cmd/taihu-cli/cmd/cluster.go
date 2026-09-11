@@ -141,7 +141,7 @@ var clusterStatusCmd = &cobra.Command{
 			}
 			if inst.ShmAddr != "" {
 				row.ShmOK = "yes"
-				if global.node != "" && inst.Node == global.node {
+				if global.clientName != "" && inst.Node == global.clientName {
 					// 同机 shm 可达性仅做字段标注（CLI 数据面统一走 TCP）。
 					row.ShmOK = "open"
 				}

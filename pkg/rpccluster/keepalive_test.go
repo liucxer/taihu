@@ -34,9 +34,9 @@ func TestClientKeepalive(t *testing.T) {
 	defer kv.Close()
 
 	s, err := NewCluster(ClusterConfig{
-		KV:        kv,
-		Node:      "test-node",
-		ClientID:  "cache-svc-01",
+		KV:          kv,
+		ClientName:  "test-node",
+		ClientID:    "cache-svc-01",
 		ClientLabels: map[string]string{"app": "cache", "env": "test"},
 	})
 	if err != nil {
@@ -92,7 +92,7 @@ func TestClientKeepaliveDisabled(t *testing.T) {
 	kv := cluster.NewMemoryKV()
 	defer kv.Close()
 
-	s, err := NewCluster(ClusterConfig{KV: kv, Node: "n"})
+	s, err := NewCluster(ClusterConfig{KV: kv, ClientName: "n"})
 	if err != nil {
 		t.Fatalf("NewCluster: %v", err)
 	}

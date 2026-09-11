@@ -49,7 +49,7 @@ func resolveKeyTarget(ctx context.Context, addr, instName string, kv cluster.KV,
 		return c, &keyTarget{inst: &inst}, nil
 	}
 	// 集群路由模式（rpccluster）：put 选实例、get/delete/stat 按索引定位。
-	store, err := rpccluster.NewCluster(rpccluster.ClusterConfig{KV: kv, Node: global.node})
+	store, err := rpccluster.NewCluster(rpccluster.ClusterConfig{KV: kv, ClientName: global.clientName})
 	if err != nil {
 		return nil, nil, err
 	}

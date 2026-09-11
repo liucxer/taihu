@@ -124,7 +124,7 @@ var clientInfoCmd = &cobra.Command{
 			Version:   version.String(),
 			GoVersion: runtime.Version(),
 			Config: map[string]string{
-				"pd": global.pd, "node": global.node, "timeout": global.timeout.String(),
+				"pd": global.pd, "node": global.clientName, "timeout": global.timeout.String(),
 			},
 		}
 
@@ -159,7 +159,7 @@ var clientInfoCmd = &cobra.Command{
 					} else {
 						cr.Shm = "-"
 					}
-					if global.node != "" && inst.Node == global.node {
+					if global.clientName != "" && inst.Node == global.clientName {
 						cr.Local = true
 					}
 					if pi, err := pingInstance(ctx, inst); err != nil {
@@ -177,7 +177,7 @@ var clientInfoCmd = &cobra.Command{
 			return nil
 		}
 		fmt.Printf("taihu %s (%s)\n", info.Version, info.GoVersion)
-		fmt.Printf("config: pd=%s node=%s timeout=%s\n", global.pd, global.node, global.timeout)
+		fmt.Printf("config: pd=%s node=%s timeout=%s\n", global.pd, global.clientName, global.timeout)
 		fmt.Printf("kv backend: %s", info.KVStatus)
 		if len(info.KVCounts) > 0 {
 			fmt.Printf(" (instances: %d, clients: %d, index entries: %d)",
