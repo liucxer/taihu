@@ -3,21 +3,32 @@ package rpcclient
 import (
 	"context"
 
-	"github.com/liucxer/taihu/internal/transport"
 	"github.com/liucxer/taihu/pkg/taihu"
 )
+
+// rpcConn 一条底层传输连接的统一接口：TCP（transport.Conn，netpoll 帧协议）或
+// 共享内存（shmConn，shmipc 流帧协议）均可满足，Storage 按 round-robin 分发到
+// 各连接，两方案对上层调用方透明。
+type rpcConn interface {
+	Put(ctx context.Context, key string, size int64, in []byte) error
+	Get(ctx context.Context, key string, off, size int64) ([]byte, func(), error)
+	Delete(ctx context.Context, key string) error
+	Stat(ctx context.Context, key string) (int64, error)
+	Close() error
+}
 
 // Storage 远程对象存储实现（设计文档_v3 §5.1，整对象 []byte 语义）。
 // Put/Delete/Stat 与本地 taihu.Storage 同签名；读路径本地为 ReadAt（返回池化缓冲，
 // 须 bufpool.Put 归还），远端 Get 返回 (data, release, err)——data 为整块数据，
 // 调用方用毕调用 release()（幂等）归还（内部经 bufpool）。内部可持有 1..n 条
-// netpoll 连接（DialPool），RPC 按 round-robin 分发以提升单进程并发吞吐。
+// 连接（DialPool：netpoll TCP；DialShmPool：shmipc 共享内存），RPC 按 round-robin
+// 分发以提升单进程并发吞吐。
 //
-// 传输层为 internal/transport（netpoll + LinkBuffer 帧协议）：Put 分块零拷贝发送，
-// Get 单帧零拷贝移交接收缓冲、跨节点回退为一次对齐汇入；Get 语义与本地 ReadAt 一致
-// （size=-1 读至结尾）。
+// 传输层为 internal/transport（netpoll + LinkBuffer 帧协议 / shmipc 共享内存）：
+// Put 分块零拷贝发送，Get 单帧零拷贝移交接收缓冲、跨帧回退为一次汇入；Get 语义与
+// 本地 ReadAt 一致（size=-1 读至结尾）。
 type Storage struct {
-	conns []*transport.Conn
+	conns []rpcConn
 	rr    uint64 // round-robin 分发计数器（原子）
 }
 

@@ -21,7 +21,7 @@ func DialPool(ctx context.Context, addr string, n int) (*Storage, error) {
 	if n < 1 {
 		n = 1
 	}
-	s := &Storage{conns: make([]*transport.Conn, 0, n)}
+	s := &Storage{conns: make([]rpcConn, 0, n)}
 	for i := 0; i < n; i++ {
 		conn, err := transport.DialClient("tcp", addr)
 		if err != nil {
@@ -34,7 +34,7 @@ func DialPool(ctx context.Context, addr string, n int) (*Storage, error) {
 }
 
 // pick 按 round-robin 返回一条连接。
-func (s *Storage) pick() *transport.Conn {
+func (s *Storage) pick() rpcConn {
 	if len(s.conns) == 1 {
 		return s.conns[0]
 	}

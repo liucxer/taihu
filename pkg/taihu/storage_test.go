@@ -3,12 +3,16 @@ package taihu
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/liucxer/taihu/internal/bufpool"
+	"github.com/liucxer/taihu/internal/metastore"
 )
 
 // alignedPayload 返回 n 个字节的测试负载，n 须为 BlockSize 整数倍。
@@ -246,5 +250,111 @@ func TestStorageLoadCache(t *testing.T) {
 			t.Fatalf("ReadAt %s mismatch after LoadCache", k)
 		}
 		bufpool.Put(got)
+	}
+}
+
+// TestStorageDeleteReuseLifecycle：Storage 层完整生命周期 写→删→GC→复用。
+// 对象删光后段被后台 GC 回收为 Free，随后新对象复用该段，数据往返正确。
+func TestStorageDeleteReuseLifecycle(t *testing.T) {
+	s, _, _ := newTestStorage(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	payload := alignedPayload(int(BlockSize))
+	if err := s.Put(ctx, "a", int64(len(payload)), payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(ctx, "b", int64(len(payload)), payload); err != nil {
+		t.Fatal(err)
+	}
+	if st := s.SegmentStats(); st[metastore.SegmentStateActive] != 1 {
+		t.Fatalf("after write stats=%v, want Active=1", st)
+	}
+
+	// 删一个：段仍存活（计数 1），同段另一对象仍可读。
+	if err := s.Delete(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.ReadAt(ctx, "b", 0, int64(len(payload))); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("read b after delete a: err=%v", err)
+	} else {
+		bufpool.Put(got)
+	}
+
+	// 删光 → Reclaiming，后台 GC（1s 周期）回收为 Free。
+	if err := s.Delete(ctx, "b"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		st := s.SegmentStats()
+		if st[metastore.SegmentStateFree] == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("segment not freed after 3s: stats=%v", st)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// 复用：写游标继续落该段，新对象数据往返正确。
+	payload2 := alignedPayload(2 * int(BlockSize))
+	copy(payload2, "reused segment payload")
+	if err := s.Put(ctx, "c", int64(len(payload2)), payload2); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.ReadAt(ctx, "c", 0, int64(len(payload2))); err != nil || !bytes.Equal(got, payload2) {
+		t.Fatalf("read c after reuse: err=%v", err)
+	} else {
+		bufpool.Put(got)
+	}
+}
+
+// TestStorageConcurrentPutDeleteRead：并发 Put/Delete/ReadAt 无数据错乱、无残留映射
+// （后台 GC 同时运行，验证 Ref/Unref 与回收的并发安全）。
+func TestStorageConcurrentPutDeleteRead(t *testing.T) {
+	s, _, _ := newTestStorage(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	const n = 16
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			key := fmt.Sprintf("obj/%d", i)
+			payload := alignedPayload(int(BlockSize) * (1 + i%4))
+			if err := s.Put(ctx, key, int64(len(payload)), payload); err != nil {
+				t.Errorf("put %s: %v", key, err)
+				return
+			}
+			got, err := s.ReadAt(ctx, key, 0, int64(len(payload)))
+			if err != nil {
+				t.Errorf("read %s: %v", key, err)
+				return
+			}
+			if !bytes.Equal(got, payload) {
+				t.Errorf("read %s data mismatch", key)
+			}
+			bufpool.Put(got)
+			if err := s.Delete(ctx, key); err != nil {
+				t.Errorf("delete %s: %v", key, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// 全部删光后，段不应卡在 Reclaiming（最终应被回收为 Free）。
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		st := s.SegmentStats()
+		if st[metastore.SegmentStateReclaiming] == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("segments stuck in Reclaiming: stats=%v", st)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

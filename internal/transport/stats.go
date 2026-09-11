@@ -25,6 +25,21 @@ var (
 	statRxCopy   atomic.Int64 // ReadCopy/Next 回退拷贝帧数
 )
 
+// recordRxDataFrame 记录客户端收到的一个数据帧（shmipc 客户端复用；TCP 路径由
+// conn.Get 内联统计）。zeroCopy 为 true 表示零拷贝移交（shm 单帧引用），false 为汇入拷贝。
+func recordRxDataFrame(rem int, zeroCopy bool) {
+	statRxFrames.Add(1)
+	statRxBytes.Add(int64(rem))
+	if rem == chunkSize {
+		statRxData4M.Add(1)
+	}
+	if zeroCopy {
+		statRxTake.Add(1)
+	} else {
+		statRxCopy.Add(1)
+	}
+}
+
 // DumpStats 打印链路帧尺寸统计到 w。
 func DumpStats(w io.Writer) {
 	fmt.Fprintf(w, "transport-tx frames=%d bytes=%d dataFrames=%d dataBytes=%d data4MiB=%d\n",

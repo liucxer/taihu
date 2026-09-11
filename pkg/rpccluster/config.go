@@ -1,0 +1,35 @@
+// Package rpccluster 提供 taihu 集群客户端（缓存场景：首写本地 + 索引锚定 + 回源兜底）。
+//
+// 定位层（Registry/Picker/Index/RouteCache）不进入数据面热路径：数据面复用
+// pkg/rpcclient（netpoll 零拷贝），集群层只负责"key 写到哪个实例、从哪个实例读"。
+// 注册/索引后端经 internal/cluster.KV 注入（内存 KV / TiKV rawkv），可降级：
+// TiKV 不可用时系统退化为"本地实例 + 回源"，功能不中断。
+package rpccluster
+
+import (
+	"context"
+	"time"
+
+	"github.com/liucxer/taihu/internal/cluster"
+)
+
+// SourceGetter 回源接口：集群内全部 miss 时，从远端源拉取整对象数据。
+// 返回 data 为整对象；实现方负责源侧错误语义。
+type SourceGetter func(ctx context.Context, key string) ([]byte, error)
+
+// ClusterConfig 集群客户端配置。
+type ClusterConfig struct {
+	// KV 注册/索引后端（必填；TiKV rawkv 或内存）。
+	KV cluster.KV
+	// Node 本节点标识：优先选择同 node 的实例（本地优先）。
+	Node string
+	// RefreshInterval 实例发现刷新周期（<=0 默认 1s）。
+	RefreshInterval time.Duration
+	// HeartbeatTimeout 实例离线判定超时（<=0 默认 5s）。
+	HeartbeatTimeout time.Duration
+	// UsageThreshold 选实例的水位阈值百分比（<=0 或 >100 默认 80）：used/capacity
+	// 超过则跳过该实例（写路径避免打满盘）。
+	UsageThreshold float64
+	// Source 回源回调（可选）：集群全 miss 时拉远端源并回写缓存。
+	Source SourceGetter
+}

@@ -17,6 +17,7 @@ import (
 type Storage struct {
 	db  metastore.Store
 	dev *device.Device
+	dir string // pebble 元数据目录（容量上报 statfs 用）
 }
 
 // NewStorage 构建 Storage：打开 pebble、打开裸设备。写游标由 db 首次分配时懒加载恢复。
@@ -35,6 +36,7 @@ func NewStorage(ctx context.Context, rocksdbDir, nvmePath string) (*Storage, err
 	s := &Storage{
 		db:  db,
 		dev: dev,
+		dir: rocksdbDir,
 	}
 	return s, nil
 }
@@ -168,6 +170,12 @@ func (s *Storage) Stat(ctx context.Context, key string) (int64, error) {
 // IOStats 返回底层设备磁盘 IO 尺寸统计（4MiB 整块 vs 其他）。压测/验证用。
 func (s *Storage) IOStats() (io4M, ioOther, bytes4M, bytesOther int64) {
 	return s.dev.Stats()
+}
+
+// GetDiskCapacity 返回 pebble 元数据目录所在文件系统的容量/可用/已用字节
+// （集群注册与心跳上报用，statfs 取 Bavail）。失败时返回 (0,0,0,err)。
+func (s *Storage) GetDiskCapacity() (capacity, available, used int64, err error) {
+	return diskCapacity(s.dir)
 }
 
 // SegmentStats 返回各状态 segment 数量（GC/回收/复用验证用）。

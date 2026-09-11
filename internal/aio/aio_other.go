@@ -3,6 +3,7 @@
 package aio
 
 import (
+	"io"
 	"os"
 	"sync"
 	"syscall"
@@ -60,6 +61,8 @@ func (r *ring) submit(fd int, buf []byte, off int64, read bool) (uint64, error) 
 
 	go func() {
 		// 用 os.File 的带偏移读写替代 syscall.Pread/Pwrite（后者仅 Linux 存在）。
+		// 注意：不能 Close 该包装句柄——它会关闭调用方持有的底层 fd/句柄，
+		// 导致后续提交 EBADF。os.File 对象无 finalizer 关闭句柄，随 GC 释放即可。
 		f := os.NewFile(uintptr(fd), "aio")
 		var res int64
 		if read {
@@ -69,7 +72,6 @@ func (r *ring) submit(fd int, buf []byte, off int64, read bool) (uint64, error) 
 			n, err := f.WriteAt(buf, off)
 			res = result(n, err)
 		}
-		_ = f.Close()
 		o.ev = Event{Data: seq, Res: res}
 		close(o.done)
 		select {
@@ -83,6 +85,10 @@ func (r *ring) submit(fd int, buf []byte, off int64, read bool) (uint64, error) 
 // result 归一化结果：>=0 字节数；<0 -errno。
 func result(n int, err error) int64 {
 	if err != nil {
+		// 越界读到 EOF：与 Linux pread 语义一致，返回 0 字节（非错误）。
+		if err == io.EOF {
+			return 0
+		}
 		if pe, ok := err.(*os.PathError); ok {
 			err = pe.Err
 		}

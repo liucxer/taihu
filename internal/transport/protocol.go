@@ -16,6 +16,7 @@ package transport
 import (
 	"encoding/binary"
 	"errors"
+	"io"
 
 	"github.com/cloudwego/netpoll"
 
@@ -24,6 +25,10 @@ import (
 
 // chunkSize 单条数据帧负载上限（4MiB），与旧 gRPC 方案一致。
 const chunkSize = 1 << 22 // 4MiB
+
+// shmSliceSize 共享内存（shmipc）单切片数据容量：须容纳最大帧
+// [4B len][1B op][chunkSize 负载] = chunkSize+5；取 4MiB+8（4 对齐，满足 arm64 约束）。
+const shmSliceSize = chunkSize + 8
 
 // maxKeyLen 请求中 key 的最大长度，防止畸形长度字段放大内存。
 const maxKeyLen = 1 << 16
@@ -60,6 +65,23 @@ const (
 	// 收尾而非 opGetEnd 空帧，客户端收齐 size 字节（或短读校验）后即结束，
 	// 每请求省一个帧与一次写/读 syscall。帧头/负载格式与 opGetData 完全一致。
 	opGetDataFinal OpCode = opGetData | 0x80
+)
+
+// 导出的帧操作码（wire 协议常量，供 rpcclient/shmipc.go 等外部包复用；
+// 内部 TCP 路径继续使用未导出短名，保持零改动）。
+const (
+	OpPutHeader    OpCode = opPutHeader
+	OpPutData      OpCode = opPutData
+	OpPutEnd       OpCode = opPutEnd
+	OpResp         OpCode = opResp
+	OpGetReq       OpCode = opGetReq
+	OpGetData      OpCode = opGetData
+	OpGetEnd       OpCode = opGetEnd
+	OpGetErr       OpCode = opGetErr
+	OpDelReq       OpCode = opDelReq
+	OpStatReq      OpCode = opStatReq
+	OpStatResp     OpCode = opStatResp
+	OpGetDataFinal OpCode = opGetDataFinal
 )
 
 // errCode 错误码（wire 上 4 字节大端），与库错误一一映射。
@@ -145,8 +167,54 @@ func encodeKeyReq(key string) []byte {
 	return p
 }
 
-// readU32 从 Reader 读 4 字节大端 uint32。
-func readU32(r netpoll.Reader) (uint32, error) {
+// byteReader 帧 payload 读取的最小接口。netpoll.Reader 天然满足（TCP 路径）；
+// sliceReader 适配共享内存切片（shmipc 路径），使 parse* 纯函数在两传输下复用。
+type byteReader interface {
+	// Next 返回后续 size 字节（并消费），不足时返回错误。
+	Next(size int) ([]byte, error)
+	// ReadString 读取 size 字节并转为 string（并消费）。
+	ReadString(size int) (string, error)
+}
+
+var _ byteReader = netpoll.Reader(nil)
+var _ byteReader = (*sliceReader)(nil)
+
+// sliceReader 基于 []byte 的 byteReader 适配，用于 shmipc BufferReader.ReadBytes 返回的共享内存切片。
+// 语义与 netpoll.Reader.Next 一致：pos 前进、返回切片引用（零拷贝）。
+type sliceReader struct {
+	b   []byte
+	pos int
+}
+
+// newSliceReader 构造切片读取器。
+func newSliceReader(b []byte) *sliceReader {
+	return &sliceReader{b: b}
+}
+
+// Len 返回未读字节数。
+func (r *sliceReader) Len() int { return len(r.b) - r.pos }
+
+// Next 返回后续 size 字节（零拷贝引用，不复制）。
+func (r *sliceReader) Next(size int) ([]byte, error) {
+	if r.pos+size > len(r.b) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	b := r.b[r.pos : r.pos+size]
+	r.pos += size
+	return b, nil
+}
+
+// ReadString 读取 size 字节并转为 string。
+func (r *sliceReader) ReadString(size int) (string, error) {
+	b, err := r.Next(size)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// readU32 从 byteReader 读 4 字节大端 uint32。
+func readU32(r byteReader) (uint32, error) {
 	b, err := r.Next(4)
 	if err != nil {
 		return 0, err
@@ -154,8 +222,8 @@ func readU32(r netpoll.Reader) (uint32, error) {
 	return binary.BigEndian.Uint32(b), nil
 }
 
-// readU64 从 Reader 读 8 字节大端 uint64。
-func readU64(r netpoll.Reader) (uint64, error) {
+// readU64 从 byteReader 读 8 字节大端 uint64。
+func readU64(r byteReader) (uint64, error) {
 	b, err := r.Next(8)
 	if err != nil {
 		return 0, err
@@ -164,7 +232,7 @@ func readU64(r netpoll.Reader) (uint64, error) {
 }
 
 // parsePutHeader 解析 PutHeader payload。
-func parsePutHeader(r netpoll.Reader) (key string, size int64, err error) {
+func parsePutHeader(r byteReader) (key string, size int64, err error) {
 	kl, err := readU32(r)
 	if err != nil {
 		return "", 0, err
@@ -184,7 +252,7 @@ func parsePutHeader(r netpoll.Reader) (key string, size int64, err error) {
 }
 
 // parseGetReq 解析 GetReq payload。
-func parseGetReq(r netpoll.Reader) (key string, off, size int64, err error) {
+func parseGetReq(r byteReader) (key string, off, size int64, err error) {
 	kl, err := readU32(r)
 	if err != nil {
 		return "", 0, 0, err
@@ -208,7 +276,7 @@ func parseGetReq(r netpoll.Reader) (key string, off, size int64, err error) {
 }
 
 // parseKeyReq 解析 key 请求 payload（Delete/Stat）。
-func parseKeyReq(r netpoll.Reader) (string, error) {
+func parseKeyReq(r byteReader) (string, error) {
 	kl, err := readU32(r)
 	if err != nil {
 		return "", err

@@ -20,6 +20,7 @@ import (
 
 type config struct {
 	addr        string
+	shm         string
 	mode        string
 	size        int64
 	threads     int
@@ -33,11 +34,12 @@ type config struct {
 
 func parseFlags() *config {
 	c := &config{}
-	flag.StringVar(&c.addr, "addr", "", "taihu-server address (required)")
+	flag.StringVar(&c.addr, "addr", "", "taihu-server address (required unless -shm)")
+	flag.StringVar(&c.shm, "shm", "", "taihu-server unix socket path for shmipc shared-memory IPC (mutually exclusive with -addr)")
 	flag.StringVar(&c.mode, "mode", "", "write | read | delete")
 	flag.Int64Var(&c.size, "size", 4096, "object size in bytes")
 	flag.IntVar(&c.threads, "threads", 1, "number of concurrent goroutines")
-	flag.IntVar(&c.conns, "conns", 1, "number of client netpoll connections (DialPool)")
+	flag.IntVar(&c.conns, "conns", 1, "number of client connections (TCP DialPool / shmipc SessionNum)")
 	flag.IntVar(&c.count, "count", 1000, "total number of distinct objects")
 	flag.StringVar(&c.prefix, "keys-prefix", "rbench", "key prefix, keys are <prefix>/<seq>")
 	flag.DurationVar(&c.reportEvery, "report-interval", 2*time.Second, "progress report interval")
@@ -71,9 +73,12 @@ func main() {
 	}
 
 	s, err := rpcclient.DialPool(ctx, c.addr, c.conns)
+	if c.shm != "" {
+		s, err = rpcclient.DialShmPool(ctx, c.shm, c.conns)
+	}
 	if err != nil {
 		stopCPUProfile(cpuFile)
-		fmt.Fprintf(os.Stderr, "dial %s: %v\n", c.addr, err)
+		fmt.Fprintf(os.Stderr, "dial %s: %v\n", c.addr+c.shm, err)
 		os.Exit(1)
 	}
 	defer s.Close()
@@ -125,8 +130,11 @@ func (c *config) validate() error {
 	default:
 		return fmt.Errorf("invalid -mode %q: must be write, read or delete", c.mode)
 	}
-	if c.addr == "" {
-		return fmt.Errorf("-addr is required")
+	if c.addr == "" && c.shm == "" {
+		return fmt.Errorf("-addr or -shm is required")
+	}
+	if c.addr != "" && c.shm != "" {
+		return fmt.Errorf("-addr and -shm are mutually exclusive")
 	}
 	switch {
 	case c.size < 0:
@@ -255,7 +263,11 @@ func report(c *config, done int64, lat *latencyCollector, elapsed time.Duration)
 	bw := float64(totalBytes) / elapsed.Seconds() / (1024 * 1024)
 
 	fmt.Printf("\n==== taihu-rpc-bench %s ====\n", c.mode)
-	fmt.Printf("addr=%s size=%d threads=%d count=%d\n", c.addr, c.size, c.threads, c.count)
+	endpoint := c.addr
+	if c.shm != "" {
+		endpoint = "shm:" + c.shm
+	}
+	fmt.Printf("endpoint=%s size=%d threads=%d count=%d\n", endpoint, c.size, c.threads, c.count)
 	fmt.Printf("objects=%d bytes=%d elapsed=%s\n", done, totalBytes, elapsed.Round(time.Millisecond))
 	fmt.Printf("throughput: %8.2f ops/s  %8.2f MiB/s\n", opsPerSec, bw)
 	if c.latency {
