@@ -40,8 +40,8 @@ var errShmBadFrame = errors.New("taihu: bad shm frame")
 // 单切片时负载零拷贝引用共享内存（fast path）；跨切片时 ReadBytes 慢路径汇入一次拷贝。
 // 返回后须由调用方在负载用毕后 ReleasePreviousRead 释放该帧 pin 的共享内存。
 //
-// 数据帧（opGetData/opGetDataFinal）在 op 后带 [shmDataPad-5] 对齐 pad（服务端 O_DIRECT
-// 直读布局），此处跳过 pad 再取负载；控制帧无 pad。
+// 数据帧（opGetData/opGetDataFinal/opPutData）在 op 后带 [shmDataPad-5] 对齐 pad
+// （服务端 O_DIRECT 直读/直写布局），此处跳过 pad 再取负载；控制帧无 pad。
 func shmReadFrame(r shmipc.BufferReader) (op OpCode, payload []byte, err error) {
 	lb, err := r.ReadBytes(shmLenPrefixLen)
 	if err != nil {
@@ -56,7 +56,7 @@ func shmReadFrame(r shmipc.BufferReader) (op OpCode, payload []byte, err error) 
 		return 0, nil, err
 	}
 	op = OpCode(b[0])
-	if op == opGetData || op == opGetDataFinal {
+	if op == opGetData || op == opGetDataFinal || op == opPutData {
 		// 数据帧：跳过对齐 pad，payload 从数据区起始（4K 对齐）读 n-1 字节。
 		if _, e := r.ReadBytes(shmDataPad - shmLenPrefixLen - shmOpLen); e != nil {
 			return 0, nil, e
@@ -66,16 +66,16 @@ func shmReadFrame(r shmipc.BufferReader) (op OpCode, payload []byte, err error) 
 	return op, payload, err
 }
 
-// shmWriteFrame 向流写一帧并 Flush。数据帧（opGetData/opGetDataFinal）统一布局
-// [5B 帧头][4091B pad][数据区]：pad 保证数据区 4K 对齐（服务端 O_DIRECT 直读共享内存），
-// 直读/拷贝两条路径布局一致，客户端 shmReadFrame 跳过 pad。控制帧不带 pad。
+// shmWriteFrame 向流写一帧并 Flush。数据帧（opGetData/opGetDataFinal/opPutData）统一布局
+// [5B 帧头][4091B pad][数据区]：pad 保证数据区 4K 对齐（服务端 O_DIRECT 直读/直写共享内存），
+// 直读/拷贝两条路径布局一致，对端 shmReadFrame 跳过 pad。控制帧不带 pad。
 // 帧头 + 负载一次 Reserve 进共享内存（数据帧零拷贝直写），Flush 返回后 peer 已可见。
 // 同步累加 statTx* 统计（与 TCP writeFrame 对齐）。客户端（shmipc_client.go）复用。
 func shmWriteFrame(st *shmipc.Stream, op OpCode, payload []byte) error {
 	statTxFrames.Add(1)
 	statTxBytes.Add(int64(len(payload)))
 	dataOff := 0
-	if op == opGetData || op == opGetDataFinal {
+	if op == opGetData || op == opGetDataFinal || op == opPutData {
 		statTxDataFrames.Add(1)
 		statTxDataBytes.Add(int64(len(payload)))
 		if len(payload) == chunkSize {
@@ -83,14 +83,26 @@ func shmWriteFrame(st *shmipc.Stream, op OpCode, payload []byte) error {
 		}
 		dataOff = shmDataPad
 	}
-	total := dataOff + shmLenPrefixLen + shmOpLen + len(payload)
+	// 数据帧 dataOff=shmDataPad 已含 [5B 帧头 + pad]（payload 从 shmDataPad 起）；
+	// 控制帧 dataOff=0 需补 [4B len][1B op] 帧头。Reserve 长度必须与对端实际读取量
+	// 一致（帧头+pad+payload），否则对端 size()>0 导致 ReleasePreviousRead 不归还切片。
+	total := dataOff + len(payload)
+	if dataOff == 0 {
+		total += shmLenPrefixLen + shmOpLen
+	}
 	buf, err := st.BufferWriter().Reserve(total)
 	if err != nil {
 		return err
 	}
 	binary.BigEndian.PutUint32(buf[:shmLenPrefixLen], uint32(shmOpLen+len(payload)))
 	buf[shmLenPrefixLen] = byte(op)
-	copy(buf[dataOff+shmLenPrefixLen+shmOpLen:], payload)
+	// payload 起始：数据帧 = shmDataPad（[0:5] 帧头 + [5:4096] pad 均在前 4096B 内）；
+	// 控制帧 = 帧头后（[5:]）。
+	payloadOff := dataOff
+	if dataOff == 0 {
+		payloadOff = shmLenPrefixLen + shmOpLen
+	}
+	copy(buf[payloadOff:], payload)
 	return st.Flush(false)
 }
 
@@ -240,15 +252,23 @@ func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, paylo
 		if op != opPutEnd {
 			return s.shmRespErr(st, opResp, codeInvalidArgument)
 		}
-		if err := s.storage.Put(context.Background(), key, 0, nil); err != nil {
+		seg, off, err := s.storage.PutBegin(context.Background(), key, 0)
+		if err != nil {
+			return s.shmRespErr(st, opResp, mapStorageErr(err))
+		}
+		if err := s.storage.PutCommit(context.Background(), key, seg, off, 0); err != nil {
 			return s.shmRespErr(st, opResp, mapStorageErr(err))
 		}
 		return shmWriteFrame(st, opResp, encCode(codeOK))
 	}
 
-	buf := bufpool.Get(int(size))
-	defer bufpool.Put(buf)
-	var pos int
+	// 分段直写：PutHeader 分配段游标，每个 PutData 帧（payload 4K 对齐）直接
+	// O_DIRECT 直写共享内存切片（免 bufpool 汇集拷贝），IO 完成后即时归还本帧切片。
+	seg, off, err := s.storage.PutBegin(context.Background(), key, size)
+	if err != nil {
+		return s.shmRespErr(st, opResp, mapStorageErr(err))
+	}
+	var pos int64
 	for {
 		op, p, err := shmReadFrame(r)
 		if err != nil {
@@ -256,17 +276,20 @@ func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, paylo
 		}
 		switch op {
 		case opPutData:
-			if pos+len(p) > int(size) {
+			if pos+int64(len(p)) > size {
 				return s.shmRespErr(st, opResp, codeInvalidArgument)
 			}
-			pos += copy(buf[pos:], p)
-			// 释放上一帧 pin；当前帧为 front 切片，在下次 shmReadFrame 时才移入 pinnedList。
+			if err := s.storage.PutAppend(context.Background(), seg, off+pos, int64(len(p)), p); err != nil {
+				return s.shmRespErr(st, opResp, mapStorageErr(err))
+			}
+			pos += int64(len(p))
+			// 释放本帧 pin；当前帧为 front 切片，在下次 shmReadFrame 时才移入 pinnedList。
 			r.ReleasePreviousRead()
 		case opPutEnd:
-			if pos != int(size) {
+			if pos != size {
 				return s.shmRespErr(st, opResp, codeInvalidArgument)
 			}
-			if err := s.storage.Put(context.Background(), key, size, buf); err != nil {
+			if err := s.storage.PutCommit(context.Background(), key, seg, off, size); err != nil {
 				return s.shmRespErr(st, opResp, mapStorageErr(err))
 			}
 			return shmWriteFrame(st, opResp, encCode(codeOK))
@@ -304,8 +327,10 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 		if want > chunkSize {
 			want = chunkSize
 		}
-		// 直读快路径：pos 4K 对齐 → O_DIRECT 直读共享内存（免 memcpy）。
-		if pos%layout.BlockSize == 0 {
+		// 直读快路径：pos 与 want 均 4K 对齐（帧 Reserve 长度 = pad+dlen = pad+want，
+		// 对端读满后 size()==0 归还切片）。尾帧（want 非 4K 对齐）走回退路径（精确
+		// Reserve + 拷贝，dlen 对齐余量会导致对端读不满泄漏切片）。
+		if pos%layout.BlockSize == 0 && want%layout.BlockSize == 0 {
 			n, rerr := shmWriteDataFrameDirect(st, s.storage, key, pos, want, end)
 			if rerr != nil {
 				if rerr == io.EOF {

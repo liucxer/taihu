@@ -38,6 +38,7 @@ type config struct {
 	reportEvery time.Duration
 	duration    time.Duration
 	latency     bool
+	verify      bool
 	cpuProfile  string
 }
 
@@ -53,6 +54,7 @@ func parseFlags() *config {
 	flag.DurationVar(&c.reportEvery, "report-interval", 2*time.Second, "progress report interval")
 	flag.DurationVar(&c.duration, "duration", 0, "run for this duration looping keys mod count (e.g. 60s); 0 = run each key once")
 	flag.BoolVar(&c.latency, "latency", false, "record per-op latency")
+	flag.BoolVar(&c.verify, "verify-content", false, "read: verify payload pattern byte(i&0xff) (sampled every 64KiB + head/tail)")
 	flag.StringVar(&c.cpuProfile, "cpuprofile", "", "write cpu profile to this file (pprof)")
 	flag.Parse()
 	return c
@@ -203,6 +205,19 @@ func runWorker(ctx context.Context, s dataStore, c *config, s0, e0 int, ops *ato
 			got, rel, err = s.Get(ctx, key, 0, c.size)
 			if err == nil && int64(len(got)) != c.size {
 				err = fmt.Errorf("key %s: short read %d != %d", key, len(got), c.size)
+			}
+			if err == nil && c.verify && len(got) > 0 {
+				// 抽样校验写 payload 模式 byte(i&0xff)：每 64KiB 一个样本 + 首/尾字节。
+				last := len(got) - 1
+				for j := 0; j < len(got); j += 64 * 1024 {
+					if got[j] != byte(j&0xff) {
+						err = fmt.Errorf("key %s: content mismatch at %d", key, j)
+						break
+					}
+				}
+				if err == nil && (got[0] != 0 || got[last] != byte(last&0xff)) {
+					err = fmt.Errorf("key %s: content mismatch at head/tail", key)
+				}
 			}
 			if got != nil {
 				rel() // Get 返回私有缓冲，校验后即归还

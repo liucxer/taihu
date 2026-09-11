@@ -74,31 +74,47 @@ func (s *Storage) Close() error {
 // Put 写入对象。size 为对象逻辑长度，in 提供数据（使用 in[:size] 的前 size 字节，
 // in 不足 size 字节时报错）。先从 db 原子申请写位置（段满自动滚动），
 // 再写设备数据，最后写映射。设备写位于分配锁之外，并发 Put 可写不同偏移。
+// 等价于 PutBegin + PutAppend + PutCommit（供一次性写调用方；分段直写走三个方法）。
 func (s *Storage) Put(ctx context.Context, key string, size int64, in []byte) error {
-	if size < 0 {
-		return ErrInvalidRange
-	}
-	if size > s.layout.SegmentSizeBytes {
-		return ErrTooLarge
-	}
-	if int64(len(in)) < size {
-		return ErrShortWrite
-	}
-
-	seg, off, err := s.db.AllocateSegment(size)
+	seg, off, err := s.PutBegin(ctx, key, size)
 	if err != nil {
 		return err
 	}
-	if err := s.dev.Append(ctx, seg, off, size, in); err != nil {
-		return err
+	if size > 0 {
+		if err := s.PutAppend(ctx, seg, off, size, in); err != nil {
+			return err
+		}
 	}
+	return s.PutCommit(ctx, key, seg, off, size)
+}
 
-	// 顺序保证：先写设备数据，再写元数据，避免出现「有映射无数据」。
-	meta := ObjectMeta{SegmentID: seg, Offset: off, Size: size}
-	if err := s.db.PutMapping(ctx, key, meta); err != nil {
-		return err
+// PutBegin 校验 size 并原子分配段游标（返回 4K 对齐 off），开始分段写。
+// key 仅语义占位（分配不依赖 key，映射在 PutCommit 建立）。
+func (s *Storage) PutBegin(ctx context.Context, key string, size int64) (segmentID, off int64, err error) {
+	if size < 0 {
+		return 0, 0, ErrInvalidRange
 	}
-	return nil
+	if size > s.layout.SegmentSizeBytes {
+		return 0, 0, ErrTooLarge
+	}
+	return s.db.AllocateSegment(size)
+}
+
+// PutAppend 直写一段数据到段内 off 处。data 首地址 4K 对齐时零拷贝直写设备
+// （O_DIRECT 直写调用方缓冲），非对齐/尾段由 device.Append 内部对齐缓冲兜底。
+// 分段调用方须保证 off 递增（off + 已写字节数）且各段相邻。
+func (s *Storage) PutAppend(ctx context.Context, segmentID, off, size int64, data []byte) error {
+	if int64(len(data)) < size {
+		return ErrShortWrite
+	}
+	return s.dev.Append(ctx, segmentID, off, size, data)
+}
+
+// PutCommit 建立 key→(segmentID, off, size) 映射。顺序保证：先写设备数据，再写元数据，
+// 避免出现「有映射无数据」。
+func (s *Storage) PutCommit(ctx context.Context, key string, segmentID, off, size int64) error {
+	meta := ObjectMeta{SegmentID: segmentID, Offset: off, Size: size}
+	return s.db.PutMapping(ctx, key, meta)
 }
 
 // ReadAt 读取对象内 [off, off+size) 区间的数据并返回（返回值为从 bufpool 取出的池化
