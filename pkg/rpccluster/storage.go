@@ -3,9 +3,12 @@ package rpccluster
 import (
 	"context"
 	"errors"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/liucxer/taihu/internal/cluster"
+	"github.com/liucxer/taihu/internal/version"
 	"github.com/liucxer/taihu/pkg/rpcclient"
 	"github.com/liucxer/taihu/pkg/taihu"
 )
@@ -32,6 +35,11 @@ type Storage struct {
 
 	mu    sync.Mutex
 	conns map[string]*rpcclient.Storage // addr -> 数据面客户端（懒建复用）
+
+	// SDK 客户端保活（配置了 ClientID 时启用）：心跳 goroutine 取消函数与注销所需。
+	clientCancel context.CancelFunc
+	clientKV     cluster.KV
+	clientID     string
 }
 
 var _ taihu.ObjectStore = (*Storage)(nil)
@@ -52,7 +60,34 @@ func NewCluster(cfg ClusterConfig) (*Storage, error) {
 	s.picker = NewInstancePicker(reg, cfg.UsageThreshold)
 	reg.Start()
 	s.index.Start()
+	s.startClientKeepalive(cfg)
 	return s, nil
+}
+
+// startClientKeepalive 配置了 ClientID 时自动向 KV 注册 SDK 客户端并周期心跳续约
+// （taihu-cli 设计文档 §5）。注册失败不阻断（心跳每周期重试注册，自愈）。
+func (s *Storage) startClientKeepalive(cfg ClusterConfig) {
+	if cfg.ClientID == "" || cfg.KV == nil {
+		return
+	}
+	host, _ := os.Hostname()
+	info := &cluster.ClientInfo{
+		ID:         cfg.ClientID,
+		Node:       cfg.Node,
+		Addr:       cfg.ClientAddr,
+		Host:       host,
+		Pid:        os.Getpid(),
+		SDKVersion: version.String(),
+		Extra:      cfg.ClientLabels,
+		StartTime:  time.Now().Unix(),
+	}
+	refresh := func() *cluster.ClientInfo { n := *info; return &n }
+	_ = cluster.RegisterClient(context.Background(), cfg.KV, refresh())
+	var hctx context.Context
+	hctx, s.clientCancel = context.WithCancel(context.Background())
+	go cluster.RunClientHeartbeat(hctx, cfg.KV, refresh, time.Second)
+	s.clientKV = cfg.KV
+	s.clientID = cfg.ClientID
 }
 
 // conns 缓存键：本地实例用 shm 地址，跨节点用网络地址；同机 shm 走共享内存零拷贝，
@@ -114,14 +149,10 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in []byte) er
 }
 
 // Get 读取对象 [off, off+size) 子区间（size=-1 读至结尾）。
-// 顺序：本地实例直查 → 索引定位远端 → 回源重建。
+// 顺序：路由缓存 → TiKV 索引定位实例 → 回源重建（不再本地逐个试读）。
 // 返回 (data, release, err)，用毕必须 release()（幂等，归还池化缓冲）。
 func (s *Storage) Get(ctx context.Context, key string, off, size int64) ([]byte, func(), error) {
-	// 1) 本地实例优先（同 node 全部实例，逐个试读）
-	if data, rel, err := s.getFrom(ctx, key, off, size, s.registry.Snapshot().local); err != taihu.ErrNotFound {
-		return data, rel, err
-	}
-	// 2) 索引定位远端
+	// 1) 路由缓存优先（写路径已记录 key→实例名），2) 未命中查 TiKV 索引
 	if inst, ok := s.lookup(ctx, key); ok {
 		if data, rel, err := s.getFrom(ctx, key, off, size, []cluster.InstanceInfo{inst}); err != taihu.ErrNotFound {
 			return data, rel, err
@@ -230,10 +261,17 @@ func (s *Storage) Stat(ctx context.Context, key string) (int64, error) {
 	return 0, taihu.ErrNotFound
 }
 
-// Close 停止后台任务并关闭全部数据面连接。
+// Close 停止后台任务并关闭全部数据面连接；SDK 客户端保活同时注销注册记录。
 func (s *Storage) Close() error {
 	s.index.Stop()
 	s.registry.Stop()
+	// SDK 客户端注销：停止心跳并尽力删除注册 key（避免残留僵尸客户端）。
+	if s.clientCancel != nil {
+		s.clientCancel()
+		if s.clientKV != nil {
+			_ = cluster.UnregisterClient(context.Background(), s.clientKV, s.clientID)
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var first error

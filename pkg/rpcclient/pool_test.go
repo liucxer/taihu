@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/rpcserver"
 	"github.com/liucxer/taihu/pkg/taihu"
 )
@@ -26,7 +27,8 @@ func newTestServer(t *testing.T) (string, func()) {
 	}
 	_ = f.Close()
 
-	storage, err := taihu.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath)
+	storage, err := taihu.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
+		layout.Layout{SegmentSizeBytes: layout.DefaultSegmentSizeBytes, SegmentCount: 2048})
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
 	}

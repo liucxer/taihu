@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/liucxer/taihu/internal/bufpool"
+	"github.com/liucxer/taihu/internal/device"
+	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/pkg/taihu"
 )
 
@@ -77,7 +79,15 @@ func main() {
 		}
 	}
 
-	s, err := taihu.NewStorage(ctx, c.dbDir, c.devPath)
+	// 读取设备真实容量并计算布局（段数不再硬编码 2048）。
+	capacity, err := device.DeviceCapacity(c.devPath)
+	if err != nil {
+		stopCPUProfile(cpuFile)
+		fmt.Fprintf(os.Stderr, "DeviceCapacity: %v\n", err)
+		os.Exit(1)
+	}
+	l := layout.ComputeLayout(capacity, layout.DefaultSegmentSizeBytes)
+	s, err := taihu.NewStorage(ctx, c.dbDir, c.devPath, l)
 	if err != nil {
 		stopCPUProfile(cpuFile)
 		fmt.Fprintf(os.Stderr, "NewStorage: %v\n", err)

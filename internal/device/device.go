@@ -45,8 +45,9 @@ var errDeviceClosed = errors.New("taihu: device closed")
 
 // Device 底层存储：直接操作裸设备文件。
 type Device struct {
-	f    *os.File
-	path string
+	f       *os.File
+	path    string
+	segSize int64 // 单段大小（由启动时布局注入，segmentBase/越界校验依赖）
 
 	ring     aio.Ring
 	mu       sync.Mutex // 保护 m/pending/inSubmit/closed
@@ -63,9 +64,10 @@ type Device struct {
 	bytesOther atomic.Int64 // 其他尺寸 IO 总字节
 }
 
-// NewDevice 打开裸设备文件并创建异步 IO 队列。平台差异（O_DIRECT / 普通打开）在 openDevice 中处理。
+// NewDevice 打开裸设备文件并创建异步 IO 队列。segSize 为单段大小（layout.Layout.SegmentSizeBytes）。
+// 平台差异（O_DIRECT / 普通打开）在 openDevice 中处理。
 // 返回 (*Device, error)，便于暴露打开失败。
-func NewDevice(ctx context.Context, nvmePath string) (*Device, error) {
+func NewDevice(ctx context.Context, nvmePath string, segSize int64) (*Device, error) {
 	f, err := openDevice(nvmePath)
 	if err != nil {
 		return nil, fmt.Errorf("taihu: open device %q: %w", nvmePath, err)
@@ -78,6 +80,7 @@ func NewDevice(ctx context.Context, nvmePath string) (*Device, error) {
 	d := &Device{
 		f:        f,
 		path:     nvmePath,
+		segSize:  segSize,
 		ring:     ring,
 		m:        make(map[uint64]chan aio.Event),
 		pending:  make(map[uint64]aio.Event),
@@ -110,7 +113,7 @@ func (d *Device) Close() error {
 
 // segmentBase 返回段 i 的物理基址。
 func (d *Device) segmentBase(segmentID int64) int64 {
-	return segmentID * layout.SegmentSizeBytes
+	return segmentID * d.segSize
 }
 
 // bufAligned 报告 b 非空且首地址 4K 对齐（O_DIRECT 直写调用方缓冲的硬性前置）。
@@ -254,7 +257,7 @@ func (d *Device) Append(ctx context.Context, segmentID, off, size int64, data []
 		return fmt.Errorf("taihu: append offset %d not 4K aligned", off)
 	}
 	aligned := layout.Align4k(size)
-	if off+aligned > layout.SegmentSizeBytes {
+	if off+aligned > d.segSize {
 		return ierr.ErrTooLarge
 	}
 	if int64(len(data)) < size {

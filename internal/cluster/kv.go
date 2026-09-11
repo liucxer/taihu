@@ -24,4 +24,6 @@ const (
 	InstanceKeyPrefix = "/taihu/instances/"
 	// IndexKeyPrefix key→实例索引区：/taihu/index/{key}
 	IndexKeyPrefix = "/taihu/index/"
+	// ClientKeyPrefix SDK 客户端注册区：/taihu/clients/{id}
+	ClientKeyPrefix = "/taihu/clients/"
 )

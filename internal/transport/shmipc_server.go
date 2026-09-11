@@ -212,7 +212,7 @@ func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, paylo
 	if size < 0 {
 		return s.shmRespErr(st, opResp, codeInvalidArgument)
 	}
-	if size > taihu.SegmentSizeBytes {
+	if size > s.storage.MaxObjectSize() {
 		return s.shmRespErr(st, opResp, codeTooLarge)
 	}
 	if size == 0 {

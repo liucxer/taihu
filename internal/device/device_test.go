@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/liucxer/taihu/internal/bufpool"
+	"github.com/liucxer/taihu/internal/layout"
 )
 
 func TestDeviceAppendAlignment(t *testing.T) {
@@ -19,7 +20,7 @@ func TestDeviceAppendAlignment(t *testing.T) {
 	f, _ := os.Create(devPath)
 	_ = f.Close()
 
-	dev, err := NewDevice(context.Background(), devPath)
+	dev, err := NewDevice(context.Background(), devPath, layout.DefaultSegmentSizeBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +78,7 @@ func TestDeviceAppendAlignedFastPath(t *testing.T) {
 	f, _ := os.Create(devPath)
 	_ = f.Close()
 
-	dev, err := NewDevice(context.Background(), devPath)
+	dev, err := NewDevice(context.Background(), devPath, layout.DefaultSegmentSizeBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +153,7 @@ func TestDeviceConcurrent(t *testing.T) {
 	f, _ := os.Create(devPath)
 	_ = f.Close()
 
-	dev, err := NewDevice(context.Background(), devPath)
+	dev, err := NewDevice(context.Background(), devPath, layout.DefaultSegmentSizeBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +202,7 @@ func TestDeviceCloseInflight(t *testing.T) {
 	f, _ := os.Create(devPath)
 	_ = f.Close()
 
-	dev, err := NewDevice(context.Background(), devPath)
+	dev, err := NewDevice(context.Background(), devPath, layout.DefaultSegmentSizeBytes)
 	if err != nil {
 		t.Fatal(err)
 	}

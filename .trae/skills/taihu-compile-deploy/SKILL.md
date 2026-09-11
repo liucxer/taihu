@@ -57,9 +57,11 @@ curl -s --max-time 120 -X PUT -T "$PKG" -H "X-Token: $TOKEN" \
   "http://$NODE:9527/upload?path=/tmp/$(basename "$PKG")"
 
 curl -s -G -H "X-Token: $TOKEN" "http://$NODE:9527/exec" \
-  --data-urlencode "cmd=rm -rf $DIST && mkdir -p $DIST && tar -xzf /tmp/$(basename "$PKG") -C $DIST && cd $DIST && export PATH=/usr/local/go/bin:\$PATH && go build -o $BIN ./cmd/taihu-bench && echo BUILD_ALL_DONE" \
+  --data-urlencode "cmd=rm -rf $DIST && mkdir -p $DIST && tar -xzf /tmp/$(basename "$PKG") -C $DIST && cd $DIST && export PATH=/usr/local/go/bin:\$PATH && SHA=\$(git rev-parse --short HEAD) && TS=\$(git log -1 --format=%cd --date=format:%Y%m%d%H%M) && go build -ldflags \"-X github.com/liucxer/taihu/internal/version.Commit=\$SHA -X github.com/liucxer/taihu/internal/version.BuildTime=\$TS\" -o $BIN ./cmd/taihu-bench && echo BUILD_ALL_DONE" \
   --data-urlencode "timeout=280"
 ```
+
+- `SHA`/`TS` 取自远端最后一次 commit（短哈希 + `YYYYMMDDHHMM`），经 `-ldflags -X` 注入 `internal/version`，二进制 `-version` 输出形如 `8abdf4d_202609111002`。
 
 - `BUILD_ALL_DONE` 为完成标记；编译测试可用 `go test ./...` 替代/追加。
 - 若需编译整个 module（非仅 bench）：`go build ./...`。

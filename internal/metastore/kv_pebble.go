@@ -35,15 +35,20 @@ type pebbleStore struct {
 	segs  *segmentManager
 }
 
-// Open 打开 pebble DB。目录不存在时自动创建。
+// Open 打开 pebble DB。目录不存在时自动创建。l 为设备物理布局（段大小/段数），
+// 由启动时读取的真实设备容量计算并注入 allocator（游标滚动/段尾判断依赖）。
 // 写位置游标由内部的 allocator 在首次 AllocateSegment 时懒加载恢复，无需在启动时读取。
 // segmentManager 在此重建段状态并启动后台 GC goroutine。
-func Open(dir string) (Store, error) {
+func Open(dir string, l layout.Layout) (Store, error) {
 	db, err := pebble.Open(dir, &pebble.Options{})
 	if err != nil {
 		return nil, fmt.Errorf("taihu: open pebble %q: %w", dir, err)
 	}
-	s := &pebbleStore{db: db, alloc: &allocator{}, cache: &metaCache{}}
+	s := &pebbleStore{
+		db:    db,
+		alloc: &allocator{segSize: l.SegmentSizeBytes, segCount: l.SegmentCount},
+		cache: &metaCache{},
+	}
 	s.segs = newSegmentManager(db)
 	s.alloc.segs = s.segs
 	if err := s.segs.rebuild(context.Background()); err != nil {
@@ -56,6 +61,11 @@ func Open(dir string) (Store, error) {
 
 // syncWO 用于需要落盘持久化的写入（mapping / cursor）。
 var syncWO = &pebble.WriteOptions{Sync: true}
+
+// reserveSegs 预留搬移缓冲段数：最后 reserveSegs 个段不参与用户写路径的顺序滚动，
+// 仅 compaction 搬移（AllocateSegmentReserve）可动用。保证用户写满时搬移仍有落点，避免死锁。
+// 占 2048 中 2 段 ≈ 0.1% 容量（设计文档 §4.5 over-provisioning）。
+const reserveSegs = 2
 
 func keyMapping(key string) []byte {
 	b := make([]byte, 0, len(kvPrefixMapping)+len(key))
@@ -198,6 +208,10 @@ type allocator struct {
 	curSeg int64
 	curOff int64
 
+	// 布局（启动时由设备容量计算注入）：segSize 单段大小、segCount 整盘段数。
+	segSize  int64
+	segCount int64
+
 	cursorLoaded bool // 是否已从持久化游标恢复
 }
 
@@ -219,16 +233,18 @@ func (a *allocator) loadCursor(s *pebbleStore) error {
 	return nil
 }
 
-// AllocateSegment 原子申请 layout.Align4k(size) 的连续空间，返回 (segmentID, 段内 4K 对齐偏移)。
+// allocate 原子申请 layout.Align4k(size) 的连续空间，返回 (segmentID, 段内 4K 对齐偏移)；
+// useReserve=true 时可滚动进入预留缓冲段（compaction 搬移专用）。
 // 首次调用时懒加载持久化游标；段放不下则滚动到下一段并持久化新游标；分配后推进并持久化游标。
 //
 // 段滚动策略（保持磁盘顺序写）：
 //   - 下一段未使用或处于 Free：顺序滚动（正常路径，行为与 v1 一致）；
+//     用户路径滚动上限为 SegmentCount−reserveSegs（预留缓冲段不参与）；
 //   - 下一段已被占用（Active/Full/Reclaiming）或游标到顶：从空闲池取 Free 段复用（游标回跳）；
 //   - 空闲池为空：ErrNoSpace。
+//
 // 切换段时旧段标记 Full（不再写入），新段激活（Free→Active 或创建记录）。
-func (s *pebbleStore) AllocateSegment(size int64) (int64, int64, error) {
-	ctx := context.Background()
+func (s *pebbleStore) allocate(ctx context.Context, size int64, useReserve bool) (int64, int64, error) {
 	a := s.alloc
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -244,13 +260,17 @@ func (s *pebbleStore) AllocateSegment(size int64) (int64, int64, error) {
 	}
 
 	aligned := layout.Align4k(size)
-	if a.curOff+aligned > layout.SegmentSizeBytes {
+	if a.curOff+aligned > a.segSize {
 		if a.curOff > 0 {
 			if err := a.segs.markFull(ctx, a.curSeg); err != nil {
 				return 0, 0, err
 			}
 		}
-		if a.curSeg+1 < layout.SegmentCount && a.segs.canUse(a.curSeg+1) {
+		upper := a.segCount
+		if !useReserve {
+			upper = a.segCount - reserveSegs
+		}
+		if a.curSeg+1 < upper && a.segs.canUse(a.curSeg+1) {
 			a.curSeg++
 			a.curOff = 0
 			if err := a.segs.activate(ctx, a.curSeg); err != nil {
@@ -279,6 +299,16 @@ func (s *pebbleStore) AllocateSegment(size int64) (int64, int64, error) {
 	return seg, off, nil
 }
 
+// AllocateSegment 用户写路径分配（预留缓冲段不可用）。
+func (s *pebbleStore) AllocateSegment(size int64) (int64, int64, error) {
+	return s.allocate(context.Background(), size, false)
+}
+
+// AllocateSegmentReserve 搬移专用分配：可动用预留缓冲段，保证 compaction 有落点。
+func (s *pebbleStore) AllocateSegmentReserve(size int64) (int64, int64, error) {
+	return s.allocate(context.Background(), size, true)
+}
+
 func (s *pebbleStore) GetSegment(ctx context.Context, segmentID int64) (SegmentMeta, bool, error) {
 	v, found, err := s.get(keyState(segmentKey(segmentID)))
 	if err != nil || !found {
@@ -290,6 +320,91 @@ func (s *pebbleStore) GetSegment(ctx context.Context, segmentID int64) (SegmentM
 
 func (s *pebbleStore) PutSegment(ctx context.Context, segmentID int64, m SegmentMeta) error {
 	return s.db.Set(keyState(segmentKey(segmentID)), m.encode(), syncWO)
+}
+
+// MarkCompacting 将 Full 段标记为搬移中（提供 Store 接口透传）。
+func (s *pebbleStore) MarkCompacting(ctx context.Context, segmentID int64) error {
+	return s.segs.markCompacting(ctx, segmentID)
+}
+
+// MoveMapping 条件写（CAS）搬移对象映射：以 pebble 为权威校验当前 mapping == old，
+// 一致则原子切换为 new 并转移段存活计数（new 段 +1、old 段 −1，同一 WriteBatch），成功后回填缓存。
+// 不一致或 key 不存在返回 ierr.ErrConflict，不修改任何数据（并发 Put/Delete 冲突由调用方跳过重试）。
+func (s *pebbleStore) MoveMapping(ctx context.Context, key string, old, new ObjectMeta) error {
+	v, found, err := s.get(keyMapping(key))
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ierr.ErrConflict
+	}
+	cur, err := decodeObjectMeta(v)
+	if err != nil {
+		return err
+	}
+	if cur != old {
+		return ierr.ErrConflict
+	}
+
+	b := s.db.NewBatch()
+	defer b.Close()
+	s.segs.mu.Lock()
+	s.segs.putObjectLocked(b, key, new, &old)
+	s.segs.mu.Unlock()
+	if err := s.db.Apply(b, syncWO); err != nil {
+		return err
+	}
+	s.cache.put(key, new)
+	return nil
+}
+
+// ListSegments 枚举内存引用表中的全部段状态（权限同 SegmentStats，admin 透传出服务端 RPC）。
+func (s *pebbleStore) ListSegments(_ context.Context, fn func(id int64, m SegmentMeta) error) error {
+	s.segs.mu.Lock()
+	defer s.segs.mu.Unlock()
+	for id, e := range s.segs.segs {
+		if err := fn(id, e.meta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Cursor 返回当前顺序写游标。游标懒加载（首次分配时恢复），尚无写入时返回 (0, 0)。
+func (s *pebbleStore) Cursor() (segmentID, offset int64) {
+	a := s.alloc
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.curSeg, a.curOff
+}
+
+// UsedBytes 统计已用物理字节：Full/Reclaiming 段计整段大小，Active 段计已写偏移（curOff）。
+// 锁序 allocator.mu → segmentManager.mu；此处取快照后释放 a.mu 再取 m.mu，无嵌套持有。
+// 段数 ≤2048，心跳 1s 一次，遍历开销可忽略。
+func (s *pebbleStore) UsedBytes() int64 {
+	a := s.alloc
+	a.mu.Lock()
+	segSize := a.segSize
+	curSeg, curOff := a.curSeg, a.curOff
+	a.mu.Unlock()
+
+	m := s.segs
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var used int64
+	for id, e := range m.segs {
+		switch e.meta.State {
+		case SegmentStateFull, SegmentStateReclaiming:
+			used += segSize
+		case SegmentStateActive:
+			if id == curSeg {
+				used += curOff
+			} else {
+				used += segSize
+			}
+		}
+	}
+	return used
 }
 
 // Close 停止后台 GC 并关闭 pebble DB。

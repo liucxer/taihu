@@ -16,4 +16,7 @@ var (
 	ErrNoSpace = errors.New("taihu: no free segment")
 	// ErrShortWrite 表示设备实际写入字节数少于期望。
 	ErrShortWrite = errors.New("taihu: short write")
+	// ErrConflict 表示条件写（CAS）失败：当前映射与期望不符（并发 Put/Delete 竞态），
+	// 调用方应跳过本次操作并重试。compaction 搬移使用。
+	ErrConflict = errors.New("taihu: mapping conflict")
 )

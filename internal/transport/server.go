@@ -81,7 +81,7 @@ func (s *Server) dispatch(c *Conn, sid uint32, op OpCode, sub netpoll.Reader) de
 	st := c.streams[sid]
 	if st == nil {
 		switch op {
-		case opPutHeader, opGetReq, opDelReq, opStatReq:
+		case opPutHeader, opGetReq, opDelReq, opStatReq, opPing, opMetaReq, opSegReq, opKeysReq:
 			st = newStream(sid)
 			c.streams[sid] = st
 			started = true
@@ -113,6 +113,14 @@ func (s *Server) dispatch(c *Conn, sid uint32, op OpCode, sub netpoll.Reader) de
 			go s.handleDelete(c, st)
 		case opStatReq:
 			go s.handleStat(c, st)
+		case opPing:
+			go s.handlePing(c, st)
+		case opMetaReq:
+			go s.handleMeta(c, st)
+		case opSegReq:
+			go s.handleSegments(c, st)
+		case opKeysReq:
+			go s.handleListKeys(c, st)
 		}
 	}
 	return deliverOK
@@ -142,7 +150,7 @@ func (s *Server) handlePut(c *Conn, st *stream) {
 		_ = c.writeFrame(st.id, opResp, encCode(codeInvalidArgument))
 		return
 	}
-	if size > taihu.SegmentSizeBytes {
+	if size > s.storage.MaxObjectSize() {
 		_ = c.writeFrame(st.id, opResp, encCode(codeTooLarge))
 		return
 	}

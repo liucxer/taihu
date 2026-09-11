@@ -65,6 +65,18 @@ const (
 	// 收尾而非 opGetEnd 空帧，客户端收齐 size 字节（或短读校验）后即结束，
 	// 每请求省一个帧与一次写/读 syscall。帧头/负载格式与 opGetData 完全一致。
 	opGetDataFinal OpCode = opGetData | 0x80
+
+	// 管理类 op（admin RPC，首版仅 TCP 路径；shmipc 路径不实现，见 taihu-cli 设计文档 §4）：
+	opPing     OpCode = 0x0C // payload: 空；响应 opPong: code(4) server_time_unix_nano(8)
+	opPong     OpCode = 0x0D
+	opMetaReq  OpCode = 0x0E // payload: keyLen(4) key（编码同 opStatReq）；响应 opMetaResp/opResp
+	opMetaResp OpCode = 0x0F // payload: segID(8) off(8) size(8)（code==0 时）
+	opSegReq   OpCode = 0x10 // payload: 空；流式响应 opSegSum + opSegData* + opSegEnd
+	opSegSum   OpCode = 0x11 // payload: code(4) total(8) free(8) active(8) full(8) reclaiming(8) cursorSeg(8) cursorOff(8) segSize(8) objectCount(8)
+	opSegData  OpCode = 0x12 // payload: count(4) + count × [segID(8) state(1) alive(8) reclaimSeq(8)]
+	opSegEnd   OpCode = 0x13 // payload: 空（正常结束）
+	opKeysReq  OpCode = 0x14 // payload: keyLen(4) prefix（可为空）；响应 opKeysData* + opResp(code)
+	opKeysData OpCode = 0x15 // payload: count(4) + count × [keyLen(4) key]
 )
 
 // 导出的帧操作码（wire 协议常量，供 rpcclient/shmipc.go 等外部包复用；
@@ -82,6 +94,11 @@ const (
 	OpStatReq      OpCode = opStatReq
 	OpStatResp     OpCode = opStatResp
 	OpGetDataFinal OpCode = opGetDataFinal
+
+	OpPing     OpCode = opPing
+	OpSegReq   OpCode = opSegReq
+	OpMetaReq  OpCode = opMetaReq
+	OpKeysReq  OpCode = opKeysReq
 )
 
 // errCode 错误码（wire 上 4 字节大端），与库错误一一映射。
@@ -285,4 +302,208 @@ func parseKeyReq(r byteReader) (string, error) {
 		return "", errors.New("taihu: key too long")
 	}
 	return r.ReadString(int(kl))
+}
+
+// --- admin RPC 编解码（taihu-cli 设计文档 §4）---
+
+// SegmentEntry 单段状态明细（wire 上 state 占 1 字节）。
+type SegmentEntry struct {
+	SegmentID  int64
+	State      uint8
+	AliveCount int64
+	ReclaimSeq int64
+}
+
+// SegmentSummary 实例段汇总与写游标。
+type SegmentSummary struct {
+	Total       int64
+	Free        int64
+	Active      int64
+	Full        int64
+	Reclaiming  int64
+	CursorSeg   int64
+	CursorOff   int64
+	SegSize     int64
+	ObjectCount int64
+}
+
+// encodePong 编码 Ping 响应 payload: code(4) server_time_unix_nano(8)。
+func encodePong(code errCode, t int64) []byte {
+	p := make([]byte, 12)
+	binary.BigEndian.PutUint32(p[:4], uint32(code))
+	binary.BigEndian.PutUint64(p[4:], uint64(t))
+	return p
+}
+
+// parsePong 解析 Ping 响应 payload，返回 (server_time_unix_nano, error)。
+func parsePong(r byteReader) (int64, error) {
+	code, err := readU32(r)
+	if err != nil {
+		return 0, err
+	}
+	if errCode(code) != codeOK {
+		return 0, mapCode(errCode(code))
+	}
+	t, err := readU64(r)
+	if err != nil {
+		return 0, err
+	}
+	return int64(t), nil
+}
+
+// encodeMetaResp 编码 Meta 响应 payload: segID(8) off(8) size(8)。
+func encodeMetaResp(segID, off, size int64) []byte {
+	p := make([]byte, 24)
+	binary.BigEndian.PutUint64(p[0:], uint64(segID))
+	binary.BigEndian.PutUint64(p[8:], uint64(off))
+	binary.BigEndian.PutUint64(p[16:], uint64(size))
+	return p
+}
+
+// parseMetaResp 解析 Meta 响应 payload。
+func parseMetaResp(r byteReader) (segID, off, size int64, err error) {
+	var n uint64
+	if n, err = readU64(r); err != nil {
+		return 0, 0, 0, err
+	}
+	segID = int64(n)
+	if n, err = readU64(r); err != nil {
+		return 0, 0, 0, err
+	}
+	off = int64(n)
+	if n, err = readU64(r); err != nil {
+		return 0, 0, 0, err
+	}
+	size = int64(n)
+	return segID, off, size, nil
+}
+
+// encodeSegSum 编码段汇总帧 payload。
+func encodeSegSum(code errCode, s SegmentSummary) []byte {
+	p := make([]byte, 4+8*9)
+	binary.BigEndian.PutUint32(p[:4], uint32(code))
+	putI64 := func(b int, v int64) {
+		binary.BigEndian.PutUint64(p[b:], uint64(v))
+	}
+	putI64(4, s.Total)
+	putI64(12, s.Free)
+	putI64(20, s.Active)
+	putI64(28, s.Full)
+	putI64(36, s.Reclaiming)
+	putI64(44, s.CursorSeg)
+	putI64(52, s.CursorOff)
+	putI64(60, s.SegSize)
+	putI64(68, s.ObjectCount)
+	return p
+}
+
+// parseSegSum 解析段汇总帧 payload。
+func parseSegSum(r byteReader) (SegmentSummary, error) {
+	code, err := readU32(r)
+	if err != nil {
+		return SegmentSummary{}, err
+	}
+	if errCode(code) != codeOK {
+		return SegmentSummary{}, mapCode(errCode(code))
+	}
+	var s SegmentSummary
+	for _, v := range []*int64{&s.Total, &s.Free, &s.Active, &s.Full, &s.Reclaiming, &s.CursorSeg, &s.CursorOff, &s.SegSize, &s.ObjectCount} {
+		n, err := readU64(r)
+		if err != nil {
+			return SegmentSummary{}, err
+		}
+		*v = int64(n)
+	}
+	return s, nil
+}
+
+// segItemLen 单条段明细在线字节数。
+const segItemLen = 8 + 1 + 8 + 8
+
+// encodeSegData 编码段明细帧 payload（单帧可容纳 ~16 万条，远大于 2048 段配额）。
+func encodeSegData(entries []SegmentEntry) []byte {
+	p := make([]byte, 4+len(entries)*segItemLen)
+	binary.BigEndian.PutUint32(p[:4], uint32(len(entries)))
+	for i, e := range entries {
+		b := 4 + i*segItemLen
+		binary.BigEndian.PutUint64(p[b:], uint64(e.SegmentID))
+		p[b+8] = e.State
+		binary.BigEndian.PutUint64(p[b+9:], uint64(e.AliveCount))
+		binary.BigEndian.PutUint64(p[b+17:], uint64(e.ReclaimSeq))
+	}
+	return p
+}
+
+// parseSegData 解析段明细帧 payload，追加到 out。
+func parseSegData(r byteReader, out []SegmentEntry) ([]SegmentEntry, error) {
+	count, err := readU32(r)
+	if err != nil {
+		return out, err
+	}
+	for i := uint32(0); i < count; i++ {
+		var (
+			id, alive, seq int64
+			n              uint64
+			err            error
+		)
+		if n, err = readU64(r); err != nil {
+			return out, err
+		}
+		id = int64(n)
+		st, err := r.Next(1)
+		if err != nil {
+			return out, err
+		}
+		if n, err = readU64(r); err != nil {
+			return out, err
+		}
+		alive = int64(n)
+		if n, err = readU64(r); err != nil {
+			return out, err
+		}
+		seq = int64(n)
+		out = append(out, SegmentEntry{SegmentID: id, State: st[0], AliveCount: alive, ReclaimSeq: seq})
+	}
+	return out, nil
+}
+
+// encodeKeysData 编码 key 列表帧 payload: count(4) + count × [keyLen(4) key]。
+func encodeKeysData(keys []string) []byte {
+	size := 4
+	for _, k := range keys {
+		size += 4 + len(k)
+	}
+	p := make([]byte, size)
+	binary.BigEndian.PutUint32(p[:4], uint32(len(keys)))
+	pos := 4
+	for _, k := range keys {
+		binary.BigEndian.PutUint32(p[pos:], uint32(len(k)))
+		pos += 4
+		copy(p[pos:], k)
+		pos += len(k)
+	}
+	return p
+}
+
+// parseKeysData 解析 key 列表帧 payload，追加到 out。
+func parseKeysData(r byteReader, out []string) ([]string, error) {
+	count, err := readU32(r)
+	if err != nil {
+		return out, err
+	}
+	for i := uint32(0); i < count; i++ {
+		kl, err := readU32(r)
+		if err != nil {
+			return out, err
+		}
+		if kl > maxKeyLen {
+			return out, errors.New("taihu: key too long")
+		}
+		k, err := r.ReadString(int(kl))
+		if err != nil {
+			return out, err
+		}
+		out = append(out, k)
+	}
+	return out, nil
 }

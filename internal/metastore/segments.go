@@ -82,7 +82,25 @@ func (m *segmentManager) rebuild(ctx context.Context) error {
 	}
 
 	// 2. 存活计数：全量扫描 mapping 重建（权威）。
-	return m.rebuildMapping(ctx)
+	if err := m.rebuildMapping(ctx); err != nil {
+		return err
+	}
+
+	// 3. Compacting 自愈：搬移中断/未收尾的段，以重建后的计数为准收口。
+	//    AliveCount>0 → 中断的搬移 → 回退 Full（下轮由搬移任务重新选中，幂等续搬）；
+	//    AliveCount==0 → 搬完未转 → 直接转 Reclaiming（走后台 GC 收尾）。
+	m.mu.Lock()
+	for _, e := range m.segs {
+		if e.meta.State == SegmentStateCompacting {
+			if e.meta.AliveCount <= 0 {
+				e.meta.State = SegmentStateReclaiming
+			} else {
+				e.meta.State = SegmentStateFull
+			}
+		}
+	}
+	m.mu.Unlock()
+	return nil
 }
 
 // rebuildMapping 遍历 mapping 重建各段存活计数。
@@ -153,15 +171,11 @@ func (m *segmentManager) persistLocked(ctx context.Context, id int64, e *segEntr
 	return m.db.Set(keyState(segmentKey(id)), e.meta.encode(), syncWO)
 }
 
-// putObject 写对象映射并原子更新段存活计数。
-// old 为被覆盖的旧映射（同 key 已有对象时非 nil）：旧对象所在段计数 -1。
-// mapping 写与两段 seg meta 写同 batch 原子提交。
-func (m *segmentManager) putObject(ctx context.Context, key string, meta ObjectMeta, old *ObjectMeta) error {
-	b := m.db.NewBatch()
-	defer b.Close()
+// putObjectLocked 将对象映射与相关段的存活计数写入 batch（不 Apply）。
+// 调用方须持有 m.mu；batch 由调用方原子提交。
+func (m *segmentManager) putObjectLocked(b *pebble.Batch, key string, meta ObjectMeta, old *ObjectMeta) {
 	b.Set(keyMapping(key), meta.encode(), nil)
 
-	m.mu.Lock()
 	e := m.ensureLocked(meta.SegmentID)
 	oldSame := old != nil && old.SegmentID == meta.SegmentID
 	if !oldSame {
@@ -185,6 +199,17 @@ func (m *segmentManager) putObject(ctx context.Context, key string, meta ObjectM
 			b.Set(keyState(segmentKey(old.SegmentID)), oe.meta.encode(), nil)
 		}
 	}
+}
+
+// putObject 写对象映射并原子更新段存活计数。
+// old 为被覆盖的旧映射（同 key 已有对象时非 nil）：旧对象所在段计数 -1。
+// mapping 写与两段 seg meta 写同 batch 原子提交。
+func (m *segmentManager) putObject(ctx context.Context, key string, meta ObjectMeta, old *ObjectMeta) error {
+	b := m.db.NewBatch()
+	defer b.Close()
+
+	m.mu.Lock()
+	m.putObjectLocked(b, key, meta, old)
 	m.mu.Unlock()
 
 	return m.db.Apply(b, syncWO)
@@ -261,6 +286,20 @@ func (m *segmentManager) markFull(ctx context.Context, segmentID int64) error {
 		return nil // 段从未写入（无数据），无需标记
 	}
 	e.meta.State = SegmentStateFull
+	return m.persistLocked(ctx, segmentID, e)
+}
+
+// markCompacting 将段置为 Compacting 并持久化（搬移存活对象前由搬移任务调用）。
+// 仅 Full 段可进搬移；搬移完成后旧段计数归零自动转 Reclaiming（putObject/MoveMapping 旧段分支触发），
+// 再由后台 GC 回收。段不存在或非 Full 时为空操作。
+func (m *segmentManager) markCompacting(ctx context.Context, segmentID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e := m.segs[segmentID]
+	if e == nil || e.meta.State != SegmentStateFull {
+		return nil
+	}
+	e.meta.State = SegmentStateCompacting
 	return m.persistLocked(ctx, segmentID, e)
 }
 

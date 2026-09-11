@@ -9,10 +9,15 @@ import (
 	"io"
 	"os"
 
+	"github.com/liucxer/taihu/internal/version"
 	"github.com/liucxer/taihu/pkg/rpcclient"
 )
 
 func main() {
+	if len(os.Args) >= 2 && (os.Args[1] == "-version" || os.Args[1] == "--version") {
+		fmt.Printf("taihu-client %s\n", version.String())
+		return
+	}
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -126,7 +131,8 @@ func must(err error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `usage: taihu-client <put|get|delete|stat> -addr :50051 [flags]
+	fmt.Fprintln(os.Stderr, `usage: taihu-client -version | <put|get|delete|stat> -addr :50051 [flags]
+  -version              显示版本号（commit_日期，如 8abdf4d_202609111002）
   put    -key K -size N [-file F]    上传对象（缺省 stdin）
   get    -key K [-off O] [-size N] [-file F]  下载（size=-1 全量，缺省 stdout）
   delete -key K

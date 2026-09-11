@@ -12,12 +12,16 @@ import (
 	"time"
 
 	"github.com/liucxer/taihu/internal/bufpool"
+	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
 )
 
-// alignedPayload 返回 n 个字节的测试负载，n 须为 BlockSize 整数倍。
+// testLayout 测试用默认布局（段大小 8GB、段数 2048）。
+var testLayout = layout.Layout{SegmentSizeBytes: layout.DefaultSegmentSizeBytes, SegmentCount: 2048}
+
+// alignedPayload 返回 n 个字节的测试负载，n 须为 layout.BlockSize 整数倍。
 func alignedPayload(n int) []byte {
-	if n%int(BlockSize) != 0 {
+	if n%int(layout.BlockSize) != 0 {
 		panic("alignedPayload requires 4K multiple")
 	}
 	b := make([]byte, n)
@@ -36,7 +40,7 @@ func newTestStorage(t *testing.T) (*Storage, string, string) {
 	}
 	_ = f.Close()
 
-	s, err := NewStorage(context.Background(), rocksdbDir, devPath)
+	s, err := NewStorage(context.Background(), rocksdbDir, devPath, testLayout)
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
 	}
@@ -79,7 +83,7 @@ func TestStorageReadRange(t *testing.T) {
 	s, _, _ := newTestStorage(t)
 	defer s.Close()
 
-	payload := alignedPayload(2 * int(BlockSize)) // 8192 B
+	payload := alignedPayload(2 * int(layout.BlockSize)) // 8192 B
 	for i := range payload {
 		payload[i] = byte(i)
 	}
@@ -88,18 +92,18 @@ func TestStorageReadRange(t *testing.T) {
 	}
 
 	// 对齐子区间读
-	got, err := s.ReadAt(context.Background(), "obj", 0, int64(BlockSize))
+	got, err := s.ReadAt(context.Background(), "obj", 0, int64(layout.BlockSize))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got, payload[:BlockSize]) {
+	if !bytes.Equal(got, payload[:layout.BlockSize]) {
 		t.Fatal("aligned sub-range mismatch")
 	}
 	bufpool.Put(got)
 
 	// 越过对象结尾：截断到剩余字节并附 io.EOF
-	got2, err := s.ReadAt(context.Background(), "obj", int64(BlockSize), int64(4*BlockSize))
-	if !bytes.Equal(got2, payload[BlockSize:]) {
+	got2, err := s.ReadAt(context.Background(), "obj", int64(layout.BlockSize), int64(4*layout.BlockSize))
+	if !bytes.Equal(got2, payload[layout.BlockSize:]) {
 		t.Fatalf("clamped tail mismatch: got %dB", len(got2))
 	}
 	if err != io.EOF {
@@ -108,11 +112,11 @@ func TestStorageReadRange(t *testing.T) {
 	bufpool.Put(got2)
 
 	// 恰好的末尾子区间读
-	got3, err := s.ReadAt(context.Background(), "obj", int64(BlockSize), int64(BlockSize))
+	got3, err := s.ReadAt(context.Background(), "obj", int64(layout.BlockSize), int64(layout.BlockSize))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got3, payload[BlockSize:]) {
+	if !bytes.Equal(got3, payload[layout.BlockSize:]) {
 		t.Fatal("tail sub-range mismatch")
 	}
 	bufpool.Put(got3)
@@ -141,14 +145,14 @@ func TestStorageDelete(t *testing.T) {
 	s, _, _ := newTestStorage(t)
 	defer s.Close()
 
-	payload := alignedPayload(int(BlockSize))
+	payload := alignedPayload(int(layout.BlockSize))
 	if err := s.Put(context.Background(), "d", int64(len(payload)), payload); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Delete(context.Background(), "d"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ReadAt(context.Background(), "d", 0, int64(BlockSize)); err != ErrNotFound {
+	if _, err := s.ReadAt(context.Background(), "d", 0, int64(layout.BlockSize)); err != ErrNotFound {
 		t.Fatalf("after delete ReadAt err=%v want ErrNotFound", err)
 	}
 	if err := s.Delete(context.Background(), "d"); err != ErrNotFound {
@@ -159,7 +163,7 @@ func TestStorageDelete(t *testing.T) {
 func TestStorageNotFound(t *testing.T) {
 	s, _, _ := newTestStorage(t)
 	defer s.Close()
-	if _, err := s.ReadAt(context.Background(), "nope", 0, int64(BlockSize)); err != ErrNotFound {
+	if _, err := s.ReadAt(context.Background(), "nope", 0, int64(layout.BlockSize)); err != ErrNotFound {
 		t.Fatalf("ReadAt missing err=%v want ErrNotFound", err)
 	}
 }
@@ -171,11 +175,11 @@ func TestStorageRestartPreservesCursor(t *testing.T) {
 	f, _ := os.Create(devPath)
 	_ = f.Close()
 
-	s1, err := NewStorage(context.Background(), rocksdbDir, devPath)
+	s1, err := NewStorage(context.Background(), rocksdbDir, devPath, testLayout)
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := alignedPayload(int(BlockSize))
+	payload := alignedPayload(int(layout.BlockSize))
 	if err := s1.Put(context.Background(), "k", int64(len(payload)), payload); err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +187,7 @@ func TestStorageRestartPreservesCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := NewStorage(context.Background(), rocksdbDir, devPath)
+	s2, err := NewStorage(context.Background(), rocksdbDir, devPath, testLayout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +204,7 @@ func TestStorageRestartPreservesCursor(t *testing.T) {
 	bufpool.Put(b1)
 
 	// 重启后续写（新对象起始于老对象 4K 对齐之后的下一位置）
-	payload2 := alignedPayload(int(BlockSize))
+	payload2 := alignedPayload(int(layout.BlockSize))
 	copy(payload2, "after restart")
 	if err := s2.Put(context.Background(), "k2", int64(len(payload2)), payload2); err != nil {
 		t.Fatalf("restart put: %v", err)
@@ -219,7 +223,7 @@ func TestStorageLoadCache(t *testing.T) {
 	s, rocksdbDir, devPath := newTestStorage(t)
 
 	// 写入若干对象后关闭，用全新 Storage 验证 LoadCache 能从 pebble 重建缓存
-	payload := alignedPayload(int(BlockSize))
+	payload := alignedPayload(int(layout.BlockSize))
 	keys := []string{"k1", "k2", "k3"}
 	for _, k := range keys {
 		if err := s.Put(context.Background(), k, int64(len(payload)), payload); err != nil {
@@ -230,7 +234,7 @@ func TestStorageLoadCache(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := NewStorage(context.Background(), rocksdbDir, devPath)
+	s2, err := NewStorage(context.Background(), rocksdbDir, devPath, testLayout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +264,7 @@ func TestStorageDeleteReuseLifecycle(t *testing.T) {
 	defer s.Close()
 	ctx := context.Background()
 
-	payload := alignedPayload(int(BlockSize))
+	payload := alignedPayload(int(layout.BlockSize))
 	if err := s.Put(ctx, "a", int64(len(payload)), payload); err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +302,7 @@ func TestStorageDeleteReuseLifecycle(t *testing.T) {
 	}
 
 	// 复用：写游标继续落该段，新对象数据往返正确。
-	payload2 := alignedPayload(2 * int(BlockSize))
+	payload2 := alignedPayload(2 * int(layout.BlockSize))
 	copy(payload2, "reused segment payload")
 	if err := s.Put(ctx, "c", int64(len(payload2)), payload2); err != nil {
 		t.Fatal(err)
@@ -324,7 +328,7 @@ func TestStorageConcurrentPutDeleteRead(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			key := fmt.Sprintf("obj/%d", i)
-			payload := alignedPayload(int(BlockSize) * (1 + i%4))
+			payload := alignedPayload(int(layout.BlockSize) * (1 + i%4))
 			if err := s.Put(ctx, key, int64(len(payload)), payload); err != nil {
 				t.Errorf("put %s: %v", key, err)
 				return

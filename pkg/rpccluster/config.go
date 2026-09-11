@@ -32,4 +32,12 @@ type ClusterConfig struct {
 	UsageThreshold float64
 	// Source 回源回调（可选）：集群全 miss 时拉远端源并回写缓存。
 	Source SourceGetter
+
+	// ClientID 可选：SDK 客户端注册 ID。非空时该 SDK 自动向 KV 注册 + 周期心跳
+	// 续约（taihu-cli 设计文档 §5），Close 时注销。需配合 KV 已配置。
+	ClientID string
+	// ClientAddr 可选：SDK 数据面地址（随心跳上报）。
+	ClientAddr string
+	// ClientLabels 可选：调用方自定义标签（随心跳上报）。
+	ClientLabels map[string]string
 }

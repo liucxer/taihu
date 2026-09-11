@@ -59,6 +59,36 @@ func TestMemoryKVScanBatch(t *testing.T) {
 	}
 }
 
+// TestCapacityRecord：容量记录写读往返与未初始化（无记录）语义。
+func TestCapacityRecord(t *testing.T) {
+	kv := NewMemoryKV()
+	ctx := context.Background()
+
+	// 未初始化：GetCapacity 返回 ok=false。
+	if _, ok, err := GetCapacity(ctx, kv, "TAIHU-0"); err != nil || ok {
+		t.Fatalf("uninitialized GetCapacity = (ok=%v, err=%v), want (false, nil)", ok, err)
+	}
+
+	// 写入后读回一致。
+	rec := CapacityRecord{
+		CapacityBytes:    16 * 1024 * 1024 * 1024 * 1024,
+		SegmentSizeBytes: 8 * 1024 * 1024 * 1024,
+		SegmentCount:     2048,
+		ListenAddr:       "127.0.0.1:50051",
+		UpdateTime:       time.Now().Unix(),
+	}
+	if err := PutCapacity(ctx, kv, "TAIHU-0", rec); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := GetCapacity(ctx, kv, "TAIHU-0")
+	if err != nil || !ok {
+		t.Fatalf("GetCapacity after put = (ok=%v, err=%v)", ok, err)
+	}
+	if got != rec {
+		t.Fatalf("record roundtrip mismatch: got %+v want %+v", got, rec)
+	}
+}
+
 func TestRegisterListUnregister(t *testing.T) {
 	kv := NewMemoryKV()
 	ctx := context.Background()

@@ -6,7 +6,10 @@ require (
 	github.com/cloudwego/netpoll v0.7.5
 	github.com/cloudwego/shmipc-go v0.2.0
 	github.com/cockroachdb/pebble v1.1.5
+	github.com/pingcap/log v1.1.1-0.20221110025148-ca232912c9f3
+	github.com/spf13/cobra v1.9.1
 	github.com/tikv/client-go/v2 v2.0.7
+	go.uber.org/zap v1.24.0
 	golang.org/x/sys v0.30.0
 )
 
@@ -39,6 +42,7 @@ require (
 	github.com/google/btree v1.1.2 // indirect
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware v1.1.0 // indirect
+	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/klauspost/compress v1.16.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
@@ -47,7 +51,6 @@ require (
 	github.com/pingcap/errors v0.11.5-0.20211224045212-9687c2b0f87c // indirect
 	github.com/pingcap/failpoint v0.0.0-20220801062533-2eaa32854a6c // indirect
 	github.com/pingcap/kvproto v0.0.0-20230403051650-e166ae588106 // indirect
-	github.com/pingcap/log v1.1.1-0.20221110025148-ca232912c9f3 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect
 	github.com/prometheus/client_golang v1.15.0 // indirect
@@ -57,6 +60,7 @@ require (
 	github.com/remyoudompheng/bigfft v0.0.0-20200410134404-eec4a21b6bb0 // indirect
 	github.com/rogpeppe/go-internal v1.9.0 // indirect
 	github.com/shirou/gopsutil/v3 v3.22.1 // indirect
+	github.com/spf13/pflag v1.0.6 // indirect
 	github.com/tiancaiamao/gp v0.0.0-20221230034425-4025bc8a4d4a // indirect
 	github.com/tikv/pd/client v0.0.0-20230329114254-1948c247c2b1 // indirect
 	github.com/twmb/murmur3 v1.1.3 // indirect
@@ -66,7 +70,6 @@ require (
 	go.etcd.io/etcd/client/v3 v3.5.2 // indirect
 	go.uber.org/atomic v1.10.0 // indirect
 	go.uber.org/multierr v1.9.0 // indirect
-	go.uber.org/zap v1.24.0 // indirect
 	golang.org/x/exp v0.0.0-20230626212559-97b1e661b5df // indirect
 	golang.org/x/net v0.24.0 // indirect
 	golang.org/x/sync v0.10.0 // indirect

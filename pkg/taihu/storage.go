@@ -17,29 +17,38 @@ import (
 type Storage struct {
 	db  metastore.Store
 	dev *device.Device
-	dir string // pebble 元数据目录（容量上报 statfs 用）
+
+	// 设备物理布局（启动时按读取的真实 nvme 容量计算注入，供对象上限/容量上报）。
+	layout layout.Layout
 }
 
-// NewStorage 构建 Storage：打开 pebble、打开裸设备。写游标由 db 首次分配时懒加载恢复。
+// NewStorage 构建 Storage：打开 pebble、打开裸设备。l 为设备物理布局（段大小/段数），
+// 由启动时读取的真实设备容量经 layout.ComputeLayout 计算。写游标由 db 首次分配时懒加载恢复。
 // 返回 (*Storage, error)，与 v1 文档略有出入，便于暴露初始化错误。
-func NewStorage(ctx context.Context, rocksdbDir, nvmePath string) (*Storage, error) {
-	db, err := metastore.Open(rocksdbDir)
+func NewStorage(ctx context.Context, rocksdbDir, nvmePath string, l layout.Layout) (*Storage, error) {
+	db, err := metastore.Open(rocksdbDir, l)
 	if err != nil {
 		return nil, err
 	}
-	dev, err := device.NewDevice(ctx, nvmePath)
+	dev, err := device.NewDevice(ctx, nvmePath, l.SegmentSizeBytes)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 
 	s := &Storage{
-		db:  db,
-		dev: dev,
-		dir: rocksdbDir,
+		db:     db,
+		dev:    dev,
+		layout: l,
 	}
 	return s, nil
 }
+
+// MaxObjectSize 单对象大小上限（= 单段大小，Put/传输层校验用）。
+func (s *Storage) MaxObjectSize() int64 { return s.layout.SegmentSizeBytes }
+
+// Layout 返回设备物理布局（段大小/段数，管理/容量上报用）。
+func (s *Storage) Layout() layout.Layout { return s.layout }
 
 // LoadCache 预热 store（metastore）内部的元数据加速缓存。用于 bench / 已知 key 集合场景，
 // 消除 GetMapping 的未命中回查，从而测纯设备读写带宽。
@@ -68,7 +77,7 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in []byte) er
 	if size < 0 {
 		return ErrInvalidRange
 	}
-	if size > layout.SegmentSizeBytes {
+	if size > s.layout.SegmentSizeBytes {
 		return ErrTooLarge
 	}
 	if int64(len(in)) < size {
@@ -172,10 +181,14 @@ func (s *Storage) IOStats() (io4M, ioOther, bytes4M, bytesOther int64) {
 	return s.dev.Stats()
 }
 
-// GetDiskCapacity 返回 pebble 元数据目录所在文件系统的容量/可用/已用字节
-// （集群注册与心跳上报用，statfs 取 Bavail）。失败时返回 (0,0,0,err)。
+// GetDiskCapacity 返回整盘容量/可用/已用字节（集群注册与心跳上报用）。
+// Capacity 为布局总容量（segmentSize×segmentCount，由启动时读取的真实 nvme 容量计算），
+// Used 为已写物理字节（metastore 按段状态统计），Available = Capacity - Used。
 func (s *Storage) GetDiskCapacity() (capacity, available, used int64, err error) {
-	return diskCapacity(s.dir)
+	capacity = s.layout.SegmentSizeBytes * s.layout.SegmentCount
+	used = s.db.UsedBytes()
+	available = capacity - used
+	return capacity, available, used, nil
 }
 
 // SegmentStats 返回各状态 segment 数量（GC/回收/复用验证用）。

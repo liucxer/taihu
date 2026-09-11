@@ -13,6 +13,9 @@ import (
 	"github.com/liucxer/taihu/internal/layout"
 )
 
+// testLayout 测试用默认布局：段大小 8GB、段数 2048（等价 v1 硬编码 16TB 布局）。
+var testLayout = layout.Layout{SegmentSizeBytes: layout.DefaultSegmentSizeBytes, SegmentCount: 2048}
+
 func openRawDB(t *testing.T, dir string) *pebble.DB {
 	t.Helper()
 	db, err := pebble.Open(dir, &pebble.Options{})
@@ -24,7 +27,7 @@ func openRawDB(t *testing.T, dir string) *pebble.DB {
 
 func openTestStore(t *testing.T) Store {
 	t.Helper()
-	s, err := Open(t.TempDir())
+	s, err := Open(t.TempDir(), testLayout)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -173,7 +176,14 @@ func TestAllocatorReuseFreeSegment(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	a := &allocator{curSeg: layout.SegmentCount - 1, curOff: layout.SegmentSizeBytes, segs: m, cursorLoaded: true}
+	a := &allocator{
+		curSeg:       testLayout.SegmentCount - 1,
+		curOff:       testLayout.SegmentSizeBytes,
+		segs:         m,
+		segSize:      testLayout.SegmentSizeBytes,
+		segCount:     testLayout.SegmentCount,
+		cursorLoaded: true,
+	}
 	s := &pebbleStore{db: db, alloc: a, cache: &metaCache{}, segs: m}
 
 	// 游标已到顶且下一段不存在：取空闲段 5。
@@ -205,7 +215,7 @@ func TestAllocatorReuseFreeSegment(t *testing.T) {
 func TestRebuildFromMapping(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	s, err := Open(dir)
+	s, err := Open(dir, testLayout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +235,7 @@ func TestRebuildFromMapping(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := Open(dir)
+	s2, err := Open(dir, testLayout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,8 +460,8 @@ func TestFullLifecycleReuse(t *testing.T) {
 	a := ps.alloc
 	a.mu.Lock()
 	a.db = ps.db
-	a.curSeg = layout.SegmentCount - 1
-	a.curOff = layout.SegmentSizeBytes
+	a.curSeg = testLayout.SegmentCount - 1
+	a.curOff = testLayout.SegmentSizeBytes
 	a.cursorLoaded = true
 	a.mu.Unlock()
 	// 5. 复用段 0。
@@ -468,5 +478,29 @@ func TestFullLifecycleReuse(t *testing.T) {
 	// 6. 复用后继续顺序写同一段。
 	if seg2, off2, err := s.AllocateSegment(4096); err != nil || seg2 != 0 || off2 != 4096 {
 		t.Fatalf("alloc2 = (%d,%d,%v), want (0,4096,nil)", seg2, off2, err)
+	}
+}
+
+// TestUsedBytes：Full/Reclaiming 段计整段、Active 段计已写偏移。
+func TestUsedBytes(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := openRawDB(t, dir)
+	defer db.Close()
+
+	m := newSegmentManager(db)
+	m.mu.Lock()
+	m.segs[0] = &segEntry{meta: SegmentMeta{State: SegmentStateFull}}
+	m.segs[1] = &segEntry{meta: SegmentMeta{State: SegmentStateActive}}
+	m.segs[2] = &segEntry{meta: SegmentMeta{State: SegmentStateReclaiming}}
+	m.mu.Unlock()
+	a := &allocator{segs: m, segSize: testLayout.SegmentSizeBytes, segCount: testLayout.SegmentCount, curSeg: 1, curOff: 4096}
+	s := &pebbleStore{db: db, alloc: a, cache: &metaCache{}, segs: m}
+	_ = ctx
+
+	// Full(seg0) + Active(seg1, curOff 4096) + Reclaiming(seg2) = 2*segSize + 4096。
+	want := 2*testLayout.SegmentSizeBytes + 4096
+	if got := s.UsedBytes(); got != want {
+		t.Fatalf("UsedBytes=%d want %d", got, want)
 	}
 }
