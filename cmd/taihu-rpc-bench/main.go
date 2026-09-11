@@ -32,18 +32,19 @@ type dataStore interface {
 }
 
 type config struct {
-	clientName  string
-	tikvPD      string
-	mode        string
-	size        int64
-	threads     int
-	conns       int
-	count       int
-	prefix      string
-	reportEvery time.Duration
-	latency     bool
-	cpuProfile  string
-	preload     bool
+	clientName   string
+	tikvPD       string
+	mode         string
+	size         int64
+	threads      int
+	conns        int
+	writeRouting string
+	count        int
+	prefix       string
+	reportEvery  time.Duration
+	latency      bool
+	cpuProfile   string
+	preload      bool
 }
 
 func parseFlags() *config {
@@ -54,6 +55,7 @@ func parseFlags() *config {
 	flag.Int64Var(&c.size, "size", 4096, "object size in bytes")
 	flag.IntVar(&c.threads, "threads", 1, "number of concurrent goroutines")
 	flag.IntVar(&c.conns, "conns", 1, "connections per TCP address (shmipc SessionNum for local / remote: per address, multi-IP instance builds addrs x conns, round-robin)")
+	flag.StringVar(&c.writeRouting, "write-routing", "", "write routing algorithm: local (default, prefer local instance) | round-robin (all instances)")
 	flag.IntVar(&c.count, "count", 1000, "total number of distinct objects")
 	flag.StringVar(&c.prefix, "keys-prefix", "rbench", "key prefix, keys are <prefix>/<seq>")
 	flag.DurationVar(&c.reportEvery, "report-interval", 2*time.Second, "progress report interval")
@@ -102,6 +104,8 @@ func main() {
 		ClientName: c.clientName,
 		// 每地址连接数：同机实例 shm 会话数、跨节点每 TCP 地址连接数（-conns；多 IP 实例总连接数=地址数×conns）。
 		Conns: c.conns,
+		// 写路由算法（-write-routing）：local 默认优先本地，round-robin 轮询全部实例。
+		WriteRouting: c.writeRouting,
 		// 压测场景无真实远端源：miss 即记为未命中（回源兜底语义不参与压测带宽）。
 		Source: func(ctx context.Context, key string) ([]byte, error) {
 			return nil, os.ErrNotExist

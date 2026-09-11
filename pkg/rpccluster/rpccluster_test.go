@@ -93,7 +93,7 @@ func TestPickerLocalFirstAndHealthy(t *testing.T) {
 	regs("b-ok", "node1", 10, 100)   // 本地健康
 	regs("c-ok", "node2", 10, 100)   // 远端健康
 	reg.refresh()
-	p := NewInstancePicker(reg, 80)
+	p := NewInstancePicker(reg, 80, RouteLocal)
 	for i := 0; i < 50; i++ {
 		inst, ok := p.Pick()
 		if !ok {
@@ -104,6 +104,61 @@ func TestPickerLocalFirstAndHealthy(t *testing.T) {
 		}
 		if inst.Name != "b-ok" {
 			t.Fatalf("expected local healthy b-ok, got %s", inst.Name)
+		}
+	}
+}
+
+func TestPickerRoundRobin(t *testing.T) {
+	kv := cluster.NewMemoryKV()
+	ctx := context.Background()
+	now := time.Now()
+	reg := NewInstanceRegistry(kv, "node1", time.Hour, 5*time.Second)
+	for _, inst := range []*cluster.InstanceInfo{
+		{Name: "a", Node: "node1", Hostname: "node1", Addr: "127.0.0.1:9", Used: 10, Capacity: 100, LastHeartbeat: now.Unix()},
+		{Name: "b", Node: "node2", Hostname: "node2", Addr: "127.0.0.1:8", Used: 10, Capacity: 100, LastHeartbeat: now.Unix()},
+		{Name: "c", Node: "node3", Hostname: "node3", Addr: "127.0.0.1:7", Used: 10, Capacity: 100, LastHeartbeat: now.Unix()},
+	} {
+		if err := cluster.Register(ctx, kv, inst); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reg.refresh()
+	// 3 个健康实例：轮询 12 次应均分，每实例恰 4 次。
+	p := NewInstancePicker(reg, 80, RouteRoundRobin)
+	counts := map[string]int{}
+	for i := 0; i < 12; i++ {
+		inst, ok := p.Pick()
+		if !ok {
+			t.Fatal("pick failed")
+		}
+		counts[inst.Name]++
+	}
+	for name, want := range map[string]int{"a": 4, "b": 4, "c": 4} {
+		if counts[name] != want {
+			t.Fatalf("round-robin %s: got %d want %d (counts=%v)", name, counts[name], want, counts)
+		}
+	}
+}
+
+func TestPickerRoundRobinSkipsFull(t *testing.T) {
+	kv := cluster.NewMemoryKV()
+	ctx := context.Background()
+	now := time.Now()
+	reg := NewInstanceRegistry(kv, "node1", time.Hour, 5*time.Second)
+	for _, inst := range []*cluster.InstanceInfo{
+		{Name: "full", Node: "node1", Hostname: "node1", Addr: "127.0.0.1:9", Used: 95, Capacity: 100, LastHeartbeat: now.Unix()},
+		{Name: "ok", Node: "node2", Hostname: "node2", Addr: "127.0.0.1:8", Used: 10, Capacity: 100, LastHeartbeat: now.Unix()},
+	} {
+		if err := cluster.Register(ctx, kv, inst); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reg.refresh()
+	p := NewInstancePicker(reg, 80, RouteRoundRobin)
+	for i := 0; i < 20; i++ {
+		inst, ok := p.Pick()
+		if !ok || inst.Name != "ok" {
+			t.Fatalf("round-robin should skip full instance, got %+v ok=%v", inst, ok)
 		}
 	}
 }
@@ -122,7 +177,7 @@ func TestPickerFullLocalFallbackRemote(t *testing.T) {
 		}
 	}
 	reg.refresh()
-	p := NewInstancePicker(reg, 80)
+	p := NewInstancePicker(reg, 80, RouteLocal)
 	for i := 0; i < 20; i++ {
 		inst, ok := p.Pick()
 		if !ok || inst.Name != "c-ok" {

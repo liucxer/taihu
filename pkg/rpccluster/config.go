@@ -17,6 +17,16 @@ import (
 // 返回 data 为整对象；实现方负责源侧错误语义。
 type SourceGetter func(ctx context.Context, key string) ([]byte, error)
 
+// 写路由算法取值。
+const (
+	// RouteLocal 本地优先（默认）：写请求先锚定同机实例（Hostname 一致，走共享内存），
+	// 本地无健康实例时 fallback 远端（水位数一致）。
+	RouteLocal = "local"
+	// RouteRoundRobin 轮询：写请求在所有在线实例间按 round-robin 均分（含跨节点 TCP），
+	// 单实例超水位时跳过该次（全满则兜底）。
+	RouteRoundRobin = "round-robin"
+)
+
 // ClusterConfig 集群客户端配置。
 type ClusterConfig struct {
 	// KV 注册/索引后端（必填；TiKV rawkv 或内存）。
@@ -32,6 +42,9 @@ type ClusterConfig struct {
 	// UsageThreshold 选实例的水位阈值百分比（<=0 或 >100 默认 80）：used/capacity
 	// 超过则跳过该实例（写路径避免打满盘）。
 	UsageThreshold float64
+	// WriteRouting 写路由算法：RouteLocal（"local"，默认，优先本地实例）或
+	// RouteRoundRobin（"round-robin"，所有在线实例轮询）。空字符串取默认 local。
+	WriteRouting string
 	// Conns 每地址数据面连接数：本地实例 shm 会话数（shmipc SessionNum）、跨节点每 TCP
 	// 地址连接数（DialPoolMulti perAddr）。<=0 默认 1。服务端通告多地址（Addrs）时，跨节点
 	// 总连接数 = 地址数 × Conns，读写请求 round-robin 均分到全部地址连接。

@@ -62,7 +62,7 @@ func NewCluster(cfg ClusterConfig) (*Storage, error) {
 		cache:    NewRouteCache(4096),
 	}
 	s.conns.Store(make(map[string]*rpcclient.Storage))
-	s.picker = NewInstancePicker(reg, cfg.UsageThreshold)
+	s.picker = NewInstancePicker(reg, cfg.UsageThreshold, cfg.WriteRouting)
 	reg.Start()
 	s.index.Start()
 	s.startClientKeepalive(cfg)

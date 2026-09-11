@@ -2,23 +2,32 @@ package rpccluster
 
 import (
 	"math/rand"
+	"sync/atomic"
 
 	"github.com/liucxer/taihu/internal/cluster"
 )
 
-// InstancePicker 实例选择器：本地优先（同机 Hostname 一致）→ 远端兜底；每档内只挑
-// 水位未超阈值的实例，全超时整档随机兜底（缓存场景：宁可写满盘也不丢写入）。
+// InstancePicker 实例选择器：写路由算法决定选路方式。
+//   - RouteLocal（默认）：本地优先（同机 Hostname 一致）→ 远端兜底；每档内只挑
+//     水位未超阈值的实例，全超时整档随机兜底（缓存场景：宁可写满盘也不丢写入）。
+//   - RouteRoundRobin：写请求在所有在线实例间轮询（含跨节点 TCP），单实例超水位跳过该次。
 type InstancePicker struct {
 	registry  *InstanceRegistry
-	threshold float64 // 0-100
+	threshold float64       // 0-100
+	routing   string        // RouteLocal / RouteRoundRobin
+	rr        atomic.Uint64 // round-robin 游标
 }
 
-// NewInstancePicker 构造选择器；threshold <=0 或 >100 时取默认 80。
-func NewInstancePicker(registry *InstanceRegistry, threshold float64) *InstancePicker {
+// NewInstancePicker 构造选择器；threshold <=0 或 >100 时取默认 80，routing 非
+// RouteRoundRobin 时按 RouteLocal 处理。
+func NewInstancePicker(registry *InstanceRegistry, threshold float64, routing string) *InstancePicker {
 	if threshold <= 0 || threshold > 100 {
 		threshold = 80
 	}
-	return &InstancePicker{registry: registry, threshold: threshold}
+	if routing != RouteRoundRobin {
+		routing = RouteLocal
+	}
+	return &InstancePicker{registry: registry, threshold: threshold, routing: routing}
 }
 
 // Pick 选择写路径锚定实例。无在线实例返回 false。
@@ -27,6 +36,16 @@ func (p *InstancePicker) Pick() (cluster.InstanceInfo, bool) {
 	if len(snap.all) == 0 {
 		return cluster.InstanceInfo{}, false
 	}
+	switch p.routing {
+	case RouteRoundRobin:
+		return p.pickRoundRobin(snap.all)
+	default:
+		return p.pickLocalFirst(snap)
+	}
+}
+
+// pickLocalFirst 本地优先：同机健康 → 远端健康 → 本地随机 → 全部随机。
+func (p *InstancePicker) pickLocalFirst(snap *instanceSnapshot) (cluster.InstanceInfo, bool) {
 	if inst, ok := pickRandomHealthy(snap.local, p.threshold); ok {
 		return inst, true
 	}
@@ -37,6 +56,19 @@ func (p *InstancePicker) Pick() (cluster.InstanceInfo, bool) {
 		return snap.local[rand.Intn(len(snap.local))], true
 	}
 	return snap.all[rand.Intn(len(snap.all))], true
+}
+
+// pickRoundRobin 在所有在线实例间轮询：从游标处向前找第一个水位未超阈值的实例；
+// 全部超水位时兜底返回游标处实例（不丢写入）。
+func (p *InstancePicker) pickRoundRobin(all []cluster.InstanceInfo) (cluster.InstanceInfo, bool) {
+	n := len(all)
+	start := int(p.rr.Add(1)-1) % n
+	for i := 0; i < n; i++ {
+		if inst := all[(start+i)%n]; usagePercent(inst) < p.threshold {
+			return inst, true
+		}
+	}
+	return all[start], true
 }
 
 // pickRandomHealthy 从实例列表中随机挑一个水位未超阈值的。
