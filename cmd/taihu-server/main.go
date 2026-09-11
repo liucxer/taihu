@@ -54,6 +54,9 @@ func main() {
 		// pprof 监听所有 IP（0.0.0.0），端口同样自动分配。
 		serverName = flag.String("server-name", "", "unique server name, e.g. TAIHU-0 (required)")
 		tikvPD     = flag.String("tikv-pd", "", "comma-separated TiKV PD addresses (required)")
+		tikvCA     = flag.String("tikv-ca", "", "TiKV TLS CA cert path (with -tikv-cert/-tikv-key; empty = plaintext)")
+		tikvCert   = flag.String("tikv-cert", "", "TiKV TLS client cert path")
+		tikvKey    = flag.String("tikv-key", "", "TiKV TLS client key path")
 	)
 	flag.Parse()
 	if *showVersion {
@@ -100,7 +103,9 @@ func main() {
 	// 容量读取 + TiKV 记录/比较：每次启动读取一次 nvme 容量，
 	// 与 TiKV 中该实例已有记录比对，不一致（换盘/容量变化）拒绝启动。
 	segSize := layout.DefaultSegmentSizeBytes // 段大小内置写死（8GiB），不允许命令行覆盖
-	kv, err := cluster.NewTiKVKV(ctx, strings.Split(*tikvPD, ","))
+	kv, err := cluster.NewTiKVKV(ctx, strings.Split(*tikvPD, ","), cluster.TLSConfig{
+		CA: *tikvCA, Cert: *tikvCert, Key: *tikvKey,
+	})
 	if err != nil {
 		log.Fatalf("tikv connect: %v", err)
 	}

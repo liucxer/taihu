@@ -44,6 +44,18 @@ func (k *MemoryKV) Delete(_ context.Context, key []byte) error {
 	return nil
 }
 
+func (k *MemoryKV) DeleteRange(_ context.Context, start, end []byte) error {
+	s, e := string(start), string(end)
+	k.mu.Lock()
+	for key := range k.m {
+		if (s == "" || key >= s) && (e == "" || key < e) {
+			delete(k.m, key)
+		}
+	}
+	k.mu.Unlock()
+	return nil
+}
+
 func (k *MemoryKV) Scan(_ context.Context, start, end []byte, limit int) ([][]byte, [][]byte, error) {
 	s, e := string(start), string(end)
 	k.mu.RLock()

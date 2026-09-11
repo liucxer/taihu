@@ -23,7 +23,7 @@ func requirePD() error {
 	return nil
 }
 
-// connectKV 连接注册区 KV（TiKV rawkv）。rawkv 对不可达 PD 的发现/重试不服从
+// connectKV 连接注册区 KV（TiKV TxnKV）。client-go 对不可达 PD 的发现/重试不服从
 // ctx，故包一层 goroutine + select 兜底：超过 ctx（-timeout）立即报错退出。
 func connectKV(ctx context.Context) (cluster.KV, error) {
 	type result struct {
@@ -32,7 +32,9 @@ func connectKV(ctx context.Context) (cluster.KV, error) {
 	}
 	ch := make(chan result, 1)
 	go func() {
-		kv, err := cluster.NewTiKVKV(ctx, splitCSV(global.pd))
+		kv, err := cluster.NewTiKVKV(ctx, splitCSV(global.pd), cluster.TLSConfig{
+			CA: global.tikvCA, Cert: global.tikvCert, Key: global.tikvKey,
+		})
 		ch <- result{kv, err}
 	}()
 	select {

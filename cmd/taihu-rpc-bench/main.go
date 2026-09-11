@@ -34,6 +34,9 @@ type dataStore interface {
 type config struct {
 	clientName   string
 	tikvPD       string
+	tikvCA       string
+	tikvCert     string
+	tikvKey      string
 	mode         string
 	size         int64
 	threads      int
@@ -51,6 +54,9 @@ func parseFlags() *config {
 	c := &config{}
 	flag.StringVar(&c.clientName, "client-name", "", "this client name (required; client identifier, a.k.a. -node)")
 	flag.StringVar(&c.tikvPD, "tikv-pd", "", "comma-separated TiKV PD addresses (required)")
+	flag.StringVar(&c.tikvCA, "tikv-ca", "", "TiKV TLS CA cert path (with -tikv-cert/-tikv-key; empty = plaintext)")
+	flag.StringVar(&c.tikvCert, "tikv-cert", "", "TiKV TLS client cert path")
+	flag.StringVar(&c.tikvKey, "tikv-key", "", "TiKV TLS client key path")
 	flag.StringVar(&c.mode, "mode", "", "write | read | delete")
 	flag.Int64Var(&c.size, "size", 4096, "object size in bytes")
 	flag.IntVar(&c.threads, "threads", 1, "number of concurrent goroutines")
@@ -92,7 +98,9 @@ func main() {
 	var s dataStore
 	var err error
 	// 集群模式：走 rpccluster（SDK 按客户端/服务端 hostname 一致 → shm，否则 TCP）。
-	kv, kerr := cluster.NewTiKVKV(ctx, strings.Split(c.tikvPD, ","))
+	kv, kerr := cluster.NewTiKVKV(ctx, strings.Split(c.tikvPD, ","), cluster.TLSConfig{
+		CA: c.tikvCA, Cert: c.tikvCert, Key: c.tikvKey,
+	})
 	if kerr != nil {
 		stopCPUProfile(cpuFile)
 		fmt.Fprintf(os.Stderr, "tikv %s: %v\n", c.tikvPD, kerr)

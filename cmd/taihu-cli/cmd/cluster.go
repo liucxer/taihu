@@ -205,7 +205,7 @@ var clusterIndexCmd = &cobra.Command{
 		defer kv.Close()
 
 		start, end := []byte(cluster.IndexKeyPrefix), []byte(cluster.IndexKeyPrefix+"\xff")
-		// TiKV rawkv Scan 受 MaxRawKVScanLimit(10240) 上限约束，取 10000。
+		// TxnKV 快照迭代无服务端 Scan 上限，取 10000 防御性截断。
 		keys, values, err := kv.Scan(ctx, start, end, 10000)
 		if err != nil {
 			return fmt.Errorf("index scan: %w", err)
@@ -283,4 +283,75 @@ func probeSegments(ctx context.Context, inst cluster.InstanceInfo) (taihu.Segmen
 func init() {
 	clusterCmd.AddCommand(clusterListCmd, clusterStatusCmd, clusterIndexCmd)
 	clusterIndexCmd.Flags().String("prefix", "", "只统计 key 前缀匹配的索引条目")
+	clusterCmd.AddCommand(clusterPurgeCmd)
+	clusterPurgeCmd.Flags().Bool("confirm", false, "二次确认：置 true 才真正执行删除（默认只统计/预览）")
+}
+
+// clusterPurgeCmd 清空 taihu 写入 TiKV 的全量元数据（实例注册/索引/SDK 客户端注册）。
+// 用 range 计数做"预览-确认-删除"三态，避免误删：不带 -confirm 只列数量并退出。
+var clusterPurgeCmd = &cobra.Command{
+	Use:   "purge",
+	Short: "清空 /taihu/ 命名空间（实例注册/索引/客户端注册）",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := requirePD(); err != nil {
+			return err
+		}
+		ctx, cancel := ctxWithTimeout(cmd.Context())
+		defer cancel()
+
+		kv, err := connectKV(ctx)
+		if err != nil {
+			return err
+		}
+		defer kv.Close()
+
+		// 预览：分别统计三类前缀数量（单次取 10000 防御性截断，
+		// 大概率不超，先按 Max 截断统计并提示）。
+		preview := func() map[string]int {
+			out := map[string]int{}
+			for _, prefix := range []string{cluster.InstanceKeyPrefix, cluster.IndexKeyPrefix, cluster.ClientKeyPrefix} {
+				ks, _, err := kv.Scan(ctx, []byte(prefix), []byte(prefix+"\xff"), 10000)
+				if err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "scan %s: %v\n", prefix, err)
+					continue
+				}
+				out[prefix] = len(ks)
+			}
+			return out
+		}
+
+		counts := preview()
+		total := counts[cluster.InstanceKeyPrefix] + counts[cluster.IndexKeyPrefix] + counts[cluster.ClientKeyPrefix]
+		const scanCap = 10000
+		fmt.Printf("taihu TiKV 元数据统计（/taihu 命名空间）:\n")
+		for _, p := range []string{cluster.InstanceKeyPrefix, cluster.IndexKeyPrefix, cluster.ClientKeyPrefix} {
+			label := map[string]string{cluster.InstanceKeyPrefix: "实例注册", cluster.IndexKeyPrefix: "索引", cluster.ClientKeyPrefix: "客户端"}[p]
+			mark := ""
+			if counts[p] >= scanCap {
+				mark = fmt.Sprintf("  (≥%d，已达 Scan 上限，实际更多)", scanCap)
+			}
+			fmt.Printf("  %s %s: %d%s\n", label, p, counts[p], mark)
+		}
+		fmt.Printf("  total: %d（范围删除不受 Scan 上限约束，删除按全部命中计算）\n", total)
+
+		if total == 0 {
+			fmt.Println("无元数据，无需清洗")
+			return nil
+		}
+		if !mustBool(cmd, "confirm") {
+			return fmt.Errorf("确认清洗: 重新带 --confirm 执行 DeleteRange(/taihu/..)；单独运行仅预览")
+		}
+		start, end := cluster.TaihuDataRange()
+		if err := kv.DeleteRange(ctx, start, end); err != nil {
+			return fmt.Errorf("delete range: %w", err)
+		}
+		fmt.Printf("已清空 /taihu/ 命名空间 %d 条元数据\n", total)
+		return nil
+	},
+}
+
+// mustBool 读取 bool 标志（避免重复断言）。
+func mustBool(cmd *cobra.Command, name string) bool {
+	v, err := cmd.Flags().GetBool(name)
+	return err == nil && v
 }

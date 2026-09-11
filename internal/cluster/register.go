@@ -42,8 +42,7 @@ func RunHeartbeat(ctx context.Context, kv KV, build func() *InstanceInfo, interv
 }
 
 // ListInstances 扫描注册区全部实例（含已过期未注销的，离线判定由调用方完成）。
-// 注意：TiKV rawkv 的 Scan limit<=0 视为返回 0 条（非"不限"），且受
-// MaxRawKVScanLimit 上限约束，故传固定正数（实例数远小于该上限）。
+// 传固定正数 limit 防御性截断（实例数远小于该值）。
 func ListInstances(ctx context.Context, kv KV) ([]InstanceInfo, error) {
 	start, end := InstanceScanRange()
 	_, values, err := kv.Scan(ctx, start, end, 10000)

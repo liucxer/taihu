@@ -2,7 +2,7 @@
 //
 // 定位层（Registry/Picker/Index/RouteCache）不进入数据面热路径：数据面复用
 // pkg/rpcclient（netpoll 零拷贝），集群层只负责"key 写到哪个实例、从哪个实例读"。
-// 注册/索引后端经 internal/cluster.KV 注入（内存 KV / TiKV rawkv），可降级：
+// 注册/索引后端经 internal/cluster.KV 注入（内存 KV / TiKV TxnKV），可降级：
 // TiKV 不可用时系统退化为"本地实例 + 回源"，功能不中断。
 package rpccluster
 
@@ -29,7 +29,7 @@ const (
 
 // ClusterConfig 集群客户端配置。
 type ClusterConfig struct {
-	// KV 注册/索引后端（必填；TiKV rawkv 或内存）。
+	// KV 注册/索引后端（必填；TiKV TxnKV 或内存）。
 	KV cluster.KV
 	// ClientName 客户端标识（如 taihu-rpc-bench 的 -client-name）：仅作标注/客户端注册用，
 	// 不参与路由。同机判定（同机走 shm、否则 TCP）由 SDK 比较本机 hostname 与

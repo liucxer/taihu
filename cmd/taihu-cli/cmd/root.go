@@ -21,6 +21,9 @@ func init() {
 // global 全局生效参数（root persistent flags），各子命令经 helpers 读取。
 var global = struct {
 	pd         string        // TiKV PD 地址列表（逗号分隔）
+	tikvCA     string        // TiKV TLS CA 证书路径（与 -tikv-cert/-tikv-key 同用；空=明文）
+	tikvCert   string        // TiKV TLS 客户端证书路径
+	tikvKey    string        // TiKV TLS 客户端私钥路径
 	clientName string        // 本客户端标识（标注 LOCAL、客户端清单过滤用）
 	timeout    time.Duration // 单次交互超时
 	json       bool          // 机器可读 JSON 输出
@@ -49,6 +52,9 @@ func Execute() error {
 func init() {
 	pf := rootCmd.PersistentFlags()
 	pf.StringVar(&global.pd, "pd", "", "TiKV PD 地址列表（逗号分隔），集群类命令必需")
+	pf.StringVar(&global.tikvCA, "tikv-ca", "", "TiKV TLS CA 证书路径（与 -tikv-cert/-tikv-key 同用；空=明文）")
+	pf.StringVar(&global.tikvCert, "tikv-cert", "", "TiKV TLS 客户端证书路径")
+	pf.StringVar(&global.tikvKey, "tikv-key", "", "TiKV TLS 客户端私钥路径")
 	pf.StringVar(&global.clientName, "client-name", "", "本客户端标识（标注 LOCAL、客户端清单过滤用；传本机 hostname 可高亮本机实例）")
 	pf.DurationVar(&global.timeout, "timeout", 5*time.Second, "单次交互超时")
 	pf.BoolVar(&global.json, "json", false, "机器可读 JSON 输出")

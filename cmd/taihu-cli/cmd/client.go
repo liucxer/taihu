@@ -137,7 +137,7 @@ var clientInfoCmd = &cobra.Command{
 				info.KVStatus = "error: " + err.Error()
 			} else {
 				defer kv.Close()
-				info.KVStatus = "tikv rawkv ok"
+				info.KVStatus = "tikv txnkv ok"
 				info.KVCounts = map[string]int{}
 				insts, err := cluster.ListInstances(ctx, kv)
 				if err == nil {
