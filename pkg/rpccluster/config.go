@@ -27,11 +27,21 @@ const (
 	RouteRoundRobin = "round-robin"
 )
 
+// 数据面传输方式取值。
+const (
+	// TransportAuto 自动（默认）：同机（Hostname 一致）走共享内存 shm，跨节点走 TCP。
+	TransportAuto = "auto"
+	// TransportRPC 强制 TCP：同机实例也走网络路径（测同机 RPC 性能 / 网络路径正确性）。
+	TransportRPC = "rpc"
+	// TransportShm 强制共享内存：仅同机实例可用（需实例注册 ShmAddr）。
+	TransportShm = "shm"
+)
+
 // ClusterConfig 集群客户端配置。
 type ClusterConfig struct {
 	// KV 注册/索引后端（必填；TiKV TxnKV 或内存）。
 	KV cluster.KV
-	// ClientName 客户端标识（如 taihu-rpc-bench 的 -client-name）：仅作标注/客户端注册用，
+	// ClientName 客户端标识（如 taihu-client-bench 的 -client-name）：仅作标注/客户端注册用，
 	// 不参与路由。同机判定（同机走 shm、否则 TCP）由 SDK 比较本机 hostname 与
 	// 服务端注册的 Hostname（os.Hostname）自动完成。
 	ClientName string
@@ -49,6 +59,10 @@ type ClusterConfig struct {
 	// 地址连接数（DialPoolMulti perAddr）。<=0 默认 1。服务端通告多地址（Addrs）时，跨节点
 	// 总连接数 = 地址数 × Conns，读写请求 round-robin 均分到全部地址连接。
 	Conns int
+	// Transport 数据面传输方式：TransportAuto（"auto"，默认，同机 shm / 跨节点 TCP）、
+	// TransportRPC（"rpc"，强制 TCP，含同机）或 TransportShm（"shm"，强制共享内存，仅同机）。
+	// 空字符串取默认 auto。
+	Transport string
 	// Source 回源回调（可选）：集群全 miss 时拉远端源并回写缓存。
 	Source SourceGetter
 

@@ -1,7 +1,10 @@
-// Command taihu-rpc-bench 是 rpccluster 跨节点端到端压测工具（设计文档_v3 §8）。
-// 与本地 taihu-bench 同语义：key 集合 <prefix>/<seq>，读模式区间切分保证每 key 全进程只读一次。
-// 集群模式（-client-name + -tikv-pd）：SDK 按"客户端/服务端 hostname 是否一致"自动选路
-// ——同机走共享内存（shmipc）、跨节点走 TCP；无需也不接受 -addr/-shm。
+// Command taihu-client-bench 是 rpccluster 端到端压测工具（设计文档_v3 §8）。
+// 与本地 taihu-storage-bench 同语义：key 集合 <prefix>/<seq>，读模式区间切分保证每 key 全进程只读一次。
+// 两种模式：
+//   - 集群模式（-client-name + -tikv-pd）：SDK 查 TiKV 定位实例后选路；-transport 控制数据面传输
+//     ——auto（默认，同机走 shm、跨节点走 TCP）/ rpc（强制 TCP，含同机）/ shm（强制共享内存）。
+//   - 直通模式（-direct + -transport + -addr/-shm）：不查 TiKV，直接与 taihu-server 通信
+//     ——rpc 用 -addr（TCP 地址，逗号分隔多地址）、shm 用 -shm（unix socket 路径）。
 // read 前须先用相同前缀 write 灌好数据。
 package main
 
@@ -20,10 +23,11 @@ import (
 	"github.com/liucxer/taihu/internal/cluster"
 	"github.com/liucxer/taihu/internal/transport"
 	"github.com/liucxer/taihu/pkg/rpccluster"
+	"github.com/liucxer/taihu/pkg/rpcclient"
 )
 
-// dataStore 压测数据面抽象：集群 rpccluster.Storage 实现同一套 Put/Get/Delete 签名，
-// 压测逻辑不关心底层是 shm 还是 TCP。数据面传输由 SDK 按 hostname 自动判定。
+// dataStore 压测数据面抽象：集群 rpccluster.Storage 与直通 rpcclient.Storage
+// 实现同一套 Put/Get/Delete 签名，压测逻辑不关心底层是 shm 还是 TCP。
 type dataStore interface {
 	Put(ctx context.Context, key string, size int64, in []byte) error
 	Get(ctx context.Context, key string, off, size int64) ([]byte, func(), error)
@@ -32,6 +36,10 @@ type dataStore interface {
 }
 
 type config struct {
+	direct       bool
+	transport    string
+	addr         string
+	shm          string
 	clientName   string
 	tikvPD       string
 	tikvCA       string
@@ -52,22 +60,26 @@ type config struct {
 
 func parseFlags() *config {
 	c := &config{}
-	flag.StringVar(&c.clientName, "client-name", "", "this client name (required; client identifier, a.k.a. -node)")
-	flag.StringVar(&c.tikvPD, "tikv-pd", "", "comma-separated TiKV PD addresses (required)")
+	flag.BoolVar(&c.direct, "direct", false, "direct mode: talk to a taihu-server directly, no TiKV lookup")
+	flag.StringVar(&c.transport, "transport", "auto", "data-plane transport: auto (cluster: shm same-host / rpc cross-host) | rpc (force TCP, incl. same-host) | shm (force shared memory, same-host only)")
+	flag.StringVar(&c.addr, "addr", "", "direct mode: taihu-server TCP address(es), comma-separated (with -transport rpc)")
+	flag.StringVar(&c.shm, "shm", "", "direct mode: taihu-server unix socket path (with -transport shm)")
+	flag.StringVar(&c.clientName, "client-name", "", "this client name (required in cluster mode; client identifier, a.k.a. -node)")
+	flag.StringVar(&c.tikvPD, "tikv-pd", "", "comma-separated TiKV PD addresses (required in cluster mode)")
 	flag.StringVar(&c.tikvCA, "tikv-ca", "", "TiKV TLS CA cert path (with -tikv-cert/-tikv-key; empty = plaintext)")
 	flag.StringVar(&c.tikvCert, "tikv-cert", "", "TiKV TLS client cert path")
 	flag.StringVar(&c.tikvKey, "tikv-key", "", "TiKV TLS client key path")
 	flag.StringVar(&c.mode, "mode", "", "write | read | delete")
 	flag.Int64Var(&c.size, "size", 4096, "object size in bytes")
 	flag.IntVar(&c.threads, "threads", 1, "number of concurrent goroutines")
-	flag.IntVar(&c.conns, "conns", 1, "connections per TCP address (shmipc SessionNum for local / remote: per address, multi-IP instance builds addrs x conns, round-robin)")
-	flag.StringVar(&c.writeRouting, "write-routing", "", "write routing algorithm: local (default, prefer local instance) | round-robin (all instances)")
+	flag.IntVar(&c.conns, "conns", 1, "connections per TCP address (shmipc SessionNum for shm / local: per address, multi-IP instance builds addrs x conns, round-robin)")
+	flag.StringVar(&c.writeRouting, "write-routing", "", "cluster write routing algorithm: local (default, prefer local instance) | round-robin (all instances)")
 	flag.IntVar(&c.count, "count", 1000, "total number of distinct objects")
 	flag.StringVar(&c.prefix, "keys-prefix", "rbench", "key prefix, keys are <prefix>/<seq>")
 	flag.DurationVar(&c.reportEvery, "report-interval", 2*time.Second, "progress report interval")
 	flag.BoolVar(&c.latency, "latency", false, "record per-op latency")
 	flag.StringVar(&c.cpuProfile, "cpuprofile", "", "write cpu profile to this file (pprof)")
-	flag.BoolVar(&c.preload, "preload", false, "read: preload RouteCache before timing (cluster mode)")
+	flag.BoolVar(&c.preload, "preload", false, "read: preload RouteCache before timing (cluster mode only)")
 	flag.Parse()
 	return c
 }
@@ -75,7 +87,7 @@ func parseFlags() *config {
 func main() {
 	c := parseFlags()
 	if err := c.validate(); err != nil {
-		fmt.Fprintln(os.Stderr, "taihu-rpc-bench:", err)
+		fmt.Fprintln(os.Stderr, "taihu-client-bench:", err)
 		os.Exit(2)
 	}
 
@@ -97,32 +109,49 @@ func main() {
 
 	var s dataStore
 	var err error
-	// 集群模式：走 rpccluster（SDK 按客户端/服务端 hostname 一致 → shm，否则 TCP）。
-	kv, kerr := cluster.NewTiKVKV(ctx, strings.Split(c.tikvPD, ","), cluster.TLSConfig{
-		CA: c.tikvCA, Cert: c.tikvCert, Key: c.tikvKey,
-	})
-	if kerr != nil {
-		stopCPUProfile(cpuFile)
-		fmt.Fprintf(os.Stderr, "tikv %s: %v\n", c.tikvPD, kerr)
-		os.Exit(1)
-	}
-	defer kv.Close()
-	s, err = rpccluster.NewCluster(rpccluster.ClusterConfig{
-		KV:         kv,
-		ClientName: c.clientName,
-		// 每地址连接数：同机实例 shm 会话数、跨节点每 TCP 地址连接数（-conns；多 IP 实例总连接数=地址数×conns）。
-		Conns: c.conns,
-		// 写路由算法（-write-routing）：local 默认优先本地，round-robin 轮询全部实例。
-		WriteRouting: c.writeRouting,
-		// 压测场景无真实远端源：miss 即记为未命中（回源兜底语义不参与压测带宽）。
-		Source: func(ctx context.Context, key string) ([]byte, error) {
-			return nil, os.ErrNotExist
-		},
-	})
-	if err != nil {
-		stopCPUProfile(cpuFile)
-		fmt.Fprintf(os.Stderr, "cluster %s: %v\n", c.clientName, err)
-		os.Exit(1)
+	if c.direct {
+		// 直通模式：不查 TiKV，直接与 taihu-server 通信（rpcclient 层，无集群路由/索引）。
+		switch c.transport {
+		case rpccluster.TransportRPC:
+			s, err = rpcclient.DialPoolMulti(ctx, strings.Split(c.addr, ","), c.conns)
+		case rpccluster.TransportShm:
+			s, err = rpcclient.DialShmPool(ctx, c.shm, c.conns)
+		}
+		if err != nil {
+			stopCPUProfile(cpuFile)
+			fmt.Fprintf(os.Stderr, "direct(%s): %v\n", c.transport, err)
+			os.Exit(1)
+		}
+	} else {
+		// 集群模式：先查 TiKV 定位实例（rpccluster；-transport 控制数据面传输方式）。
+		kv, kerr := cluster.NewTiKVKV(ctx, strings.Split(c.tikvPD, ","), cluster.TLSConfig{
+			CA: c.tikvCA, Cert: c.tikvCert, Key: c.tikvKey,
+		})
+		if kerr != nil {
+			stopCPUProfile(cpuFile)
+			fmt.Fprintf(os.Stderr, "tikv %s: %v\n", c.tikvPD, kerr)
+			os.Exit(1)
+		}
+		defer kv.Close()
+		s, err = rpccluster.NewCluster(rpccluster.ClusterConfig{
+			KV:           kv,
+			ClientName:   c.clientName,
+			// 每地址连接数：同机实例 shm 会话数、跨节点每 TCP 地址连接数（-conns；多 IP 实例总连接数=地址数×conns）。
+			Conns: c.conns,
+			// 写路由算法（-write-routing）：local 默认优先本地，round-robin 轮询全部实例。
+			WriteRouting: c.writeRouting,
+			// 数据面传输方式（-transport）：auto 同机 shm / 跨节点 TCP，rpc 强制 TCP（含同机），shm 强制共享内存。
+			Transport: c.transport,
+			// 压测场景无真实远端源：miss 即记为未命中（回源兜底语义不参与压测带宽）。
+			Source: func(ctx context.Context, key string) ([]byte, error) {
+				return nil, os.ErrNotExist
+			},
+		})
+		if err != nil {
+			stopCPUProfile(cpuFile)
+			fmt.Fprintf(os.Stderr, "cluster %s: %v\n", c.clientName, err)
+			os.Exit(1)
+		}
 	}
 	defer s.Close()
 
@@ -186,12 +215,35 @@ func (c *config) validate() error {
 	default:
 		return fmt.Errorf("invalid -mode %q: must be write, read or delete", c.mode)
 	}
-	// 集群模式：-client-name 与 -tikv-pd 必传；不接受 -addr/-shm（传输由 SDK 按 hostname 自动判定）。
-	if c.clientName == "" {
-		return fmt.Errorf("-client-name is required (cluster mode)")
+	switch c.transport {
+	case rpccluster.TransportAuto, rpccluster.TransportRPC, rpccluster.TransportShm:
+	default:
+		return fmt.Errorf("invalid -transport %q: must be %s, %s or %s",
+			c.transport, rpccluster.TransportAuto, rpccluster.TransportRPC, rpccluster.TransportShm)
 	}
-	if c.tikvPD == "" {
-		return fmt.Errorf("-client-name requires -tikv-pd")
+	if c.direct {
+		// 直通模式：不查 TiKV，直接与 taihu-server 通信；不需要 -client-name/-tikv-pd。
+		switch c.transport {
+		case rpccluster.TransportRPC:
+			if c.addr == "" {
+				return fmt.Errorf("-transport rpc requires -addr (taihu-server TCP address)")
+			}
+		case rpccluster.TransportShm:
+			if c.shm == "" {
+				return fmt.Errorf("-transport shm requires -shm (taihu-server unix socket)")
+			}
+		default:
+			return fmt.Errorf("-direct requires -transport %s or %s (not %s)",
+				rpccluster.TransportRPC, rpccluster.TransportShm, c.transport)
+		}
+	} else {
+		// 集群模式：-client-name 与 -tikv-pd 必传（先查 TiKV 定位实例）。
+		if c.clientName == "" {
+			return fmt.Errorf("-client-name is required (cluster mode)")
+		}
+		if c.tikvPD == "" {
+			return fmt.Errorf("-client-name requires -tikv-pd")
+		}
 	}
 	switch {
 	case c.size < 0:
@@ -319,8 +371,17 @@ func report(c *config, done int64, lat *latencyCollector, elapsed time.Duration)
 	opsPerSec := float64(done) / elapsed.Seconds()
 	bw := float64(totalBytes) / elapsed.Seconds() / (1024 * 1024)
 
-	fmt.Printf("\n==== taihu-rpc-bench %s ====\n", c.mode)
-	fmt.Printf("endpoint=cluster(client=%s) size=%d threads=%d count=%d\n", c.clientName, c.size, c.threads, c.count)
+	fmt.Printf("\n==== taihu-client-bench %s ====\n", c.mode)
+	if c.direct {
+		if c.transport == rpccluster.TransportRPC {
+			fmt.Printf("endpoint=direct(rpc:%s)", c.addr)
+		} else {
+			fmt.Printf("endpoint=direct(shm:%s)", c.shm)
+		}
+	} else {
+		fmt.Printf("endpoint=cluster(client=%s,transport=%s)", c.clientName, c.transport)
+	}
+	fmt.Printf(" size=%d threads=%d count=%d\n", c.size, c.threads, c.count)
 	fmt.Printf("objects=%d bytes=%d elapsed=%s\n", done, totalBytes, elapsed.Round(time.Millisecond))
 	fmt.Printf("throughput: %8.2f ops/s  %8.2f MiB/s\n", opsPerSec, bw)
 	if c.latency {

@@ -1,4 +1,4 @@
-// Command taihu-bench 是 Storage 层的性能测试工具，按设计文档 §9 实现。
+// Command taihu-storage-bench 是 Storage 层的性能测试工具，按设计文档 §9 实现。
 //
 // 支持两种模式：
 //   - write：并发写 count 个不同 key 的 object（每个 size 字节）。
@@ -58,7 +58,7 @@ func parseFlags() *config {
 func main() {
 	c := parseFlags()
 	if err := c.validate(); err != nil {
-		fmt.Fprintln(os.Stderr, "taihu-bench:", err)
+		fmt.Fprintln(os.Stderr, "taihu-storage-bench:", err)
 		os.Exit(2)
 	}
 
@@ -286,7 +286,7 @@ func report(c *config, done int64, lat *latencyCollector, elapsed time.Duration)
 	opsPerSec := float64(done) / elapsed.Seconds()
 	bw := float64(totalBytes) / elapsed.Seconds() / (1024 * 1024)
 
-	fmt.Printf("\n==== taihu-bench %s ====\n", c.mode)
+	fmt.Printf("\n==== taihu-storage-bench %s ====\n", c.mode)
 	fmt.Printf("size=%d threads=%d count=%d\n", c.size, c.threads, c.count)
 	fmt.Printf("objects=%d bytes=%d elapsed=%s\n", done, totalBytes, elapsed.Round(time.Millisecond))
 	fmt.Printf("throughput: %8.2f ops/s  %8.2f MiB/s\n", opsPerSec, bw)

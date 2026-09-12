@@ -95,10 +95,14 @@ func (s *Storage) startClientKeepalive(cfg ClusterConfig) {
 	s.clientID = cfg.ClientID
 }
 
-// conns 缓存键：本地实例用 shm 地址，跨节点用网络地址；同机 shm 走共享内存零拷贝，
-// 跨节点走 netpoll TCP。按传输类型分桶避免地址冲突。
-func connKey(inst cluster.InstanceInfo) string {
-	if inst.ShmAddr != "" {
+// conns 缓存键：按实际传输分桶——shm（共享内存零拷贝）走 "shm://"+ShmAddr，
+// TCP 走 "tcp://"+Addr，避免同一实例在强制传输下连接误复用。auto 时同机（有
+// ShmAddr 且 hostname 一致才可能走 shm）用 shm 键，否则 tcp 键。
+func connKey(inst cluster.InstanceInfo, transport string) string {
+	if transport == TransportRPC {
+		return "tcp://" + inst.Addr
+	}
+	if transport == TransportShm || inst.ShmAddr != "" {
 		return "shm://" + inst.ShmAddr
 	}
 	return "tcp://" + inst.Addr
@@ -107,9 +111,10 @@ func connKey(inst cluster.InstanceInfo) string {
 // clientFor 懒建并缓存某实例的数据面连接（幂等；连接复用避免重复拨号）。
 // 无锁快路径：连接缓存为 atomic.Value 只读快照，已建连接直接查表返回（零锁）；
 // miss 时加锁双检并 copy-on-write 替换快照（仅懒建首连触碰锁）。
-// 客户端与服务端同机（Hostname 一致）优先用 DialShm 共享内存；否则（跨节点）用 DialPool TCP。
+// 传输方式由 cfg.Transport 决定：auto（默认，同机 shm / 跨节点 TCP）、
+// rpc（强制 TCP，含同机）或 shm（强制共享内存，仅同机实例）。
 func (s *Storage) clientFor(inst cluster.InstanceInfo) (*rpcclient.Storage, error) {
-	key := connKey(inst)
+	key := connKey(inst, s.cfg.Transport)
 	if c, ok := s.conns.Load().(map[string]*rpcclient.Storage)[key]; ok {
 		return c, nil
 	}
@@ -123,21 +128,37 @@ func (s *Storage) clientFor(inst cluster.InstanceInfo) (*rpcclient.Storage, erro
 		c   *rpcclient.Storage
 		err error
 	)
-	if s.hostname != "" && inst.Hostname == s.hostname && inst.ShmAddr != "" {
-		// 客户端与服务端同机（Hostname 一致）：走共享内存（零拷贝传输）；
-		// shm 不可用（socket 未建等）回退 TCP，保证功能不中断。
-		c, err = rpcclient.DialShmPool(context.Background(), inst.ShmAddr, s.cfg.Conns)
-		if err != nil {
-			c, err = rpcclient.DialPool(context.Background(), inst.Addr, s.cfg.Conns)
-		}
-	} else {
-		// 跨节点（Hostname 不一致）：走 TCP。服务端通告多地址（Addrs）时为每个地址各建
-		// cfg.Conns 条连接，读写按 round-robin 均分到全部地址链路；旧 server 无 Addrs
-		// 时回退单地址（兼容）。
+	switch s.cfg.Transport {
+	case TransportRPC:
+		// 强制 TCP：同机实例也走网络路径（测同机 RPC 性能 / 网络路径正确性）。
 		if len(inst.Addrs) > 0 {
 			c, err = rpcclient.DialPoolMulti(context.Background(), inst.Addrs, s.cfg.Conns)
 		} else {
 			c, err = rpcclient.DialPool(context.Background(), inst.Addr, s.cfg.Conns)
+		}
+	case TransportShm:
+		// 强制共享内存：仅同机实例可用（uds socket）。
+		if inst.ShmAddr == "" {
+			return nil, errors.New("rpccluster: instance has no shm addr (transport=shm requires same-host instance)")
+		}
+		c, err = rpcclient.DialShmPool(context.Background(), inst.ShmAddr, s.cfg.Conns)
+	default:
+		// 自动（默认）：客户端与服务端同机（Hostname 一致）优先走共享内存（零拷贝传输），
+		// shm 不可用（socket 未建等）回退 TCP，保证功能不中断。
+		if s.hostname != "" && inst.Hostname == s.hostname && inst.ShmAddr != "" {
+			c, err = rpcclient.DialShmPool(context.Background(), inst.ShmAddr, s.cfg.Conns)
+			if err != nil {
+				c, err = rpcclient.DialPool(context.Background(), inst.Addr, s.cfg.Conns)
+			}
+		} else {
+			// 跨节点（Hostname 不一致）：走 TCP。服务端通告多地址（Addrs）时为每个地址各建
+			// cfg.Conns 条连接，读写按 round-robin 均分到全部地址链路；旧 server 无 Addrs
+			// 时回退单地址（兼容）。
+			if len(inst.Addrs) > 0 {
+				c, err = rpcclient.DialPoolMulti(context.Background(), inst.Addrs, s.cfg.Conns)
+			} else {
+				c, err = rpcclient.DialPool(context.Background(), inst.Addr, s.cfg.Conns)
+			}
 		}
 	}
 	if err != nil {
