@@ -16,6 +16,8 @@ import (
 var instanceCmd = &cobra.Command{
 	Use:   "instance",
 	Short: "实例信息：segment 汇总与明细",
+	Example: `  # 查询全部在线实例的 segment 汇总
+  taihu --pd 100.71.128.11:2379 instance segments`,
 }
 
 // segResult JSON 形态的单实例段汇总+明细。
@@ -31,6 +33,11 @@ type segResult struct {
 var instanceSegmentsCmd = &cobra.Command{
 	Use:   "segments",
 	Short: "查询实例的 segment 汇总（-detail 出明细）",
+	Example: `  # 全部实例 segment 汇总
+  taihu --pd 100.71.128.11:2379 instance segments
+
+  # 指定实例 + 每段明细
+  taihu --pd 100.71.128.11:2379 instance segments -instance TAIHU-0 -detail`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		instName, _ := cmd.Flags().GetString("instance")
 		detail, _ := cmd.Flags().GetBool("detail")

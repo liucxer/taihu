@@ -17,7 +17,7 @@
 4. 查询每个 taihu 实例的 segment 信息（汇总 + 明细，走服务端新增 RPC）。
 
 ### 非目标（首版不做）
-- 数据面性能压测（已有 taihu-bench / taihu-rpc-bench / taihu-loop-bench）。
+- 数据面性能压测（已有 taihu bench storage / taihu bench cluster / taihu-loop-bench）。
 - 在线扩缩容、实例下架等变更类操作（仅只读观测 + key 读写删 + 客户端注册）。
 - 图形界面、Web 面板。
 

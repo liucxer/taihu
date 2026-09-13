@@ -16,12 +16,22 @@ import (
 var clusterCmd = &cobra.Command{
 	Use:   "cluster",
 	Short: "集群信息：实例列表 / 健康体检 / 索引概览",
+	Example: `  # 列出全部实例
+  taihu --pd 100.71.128.11:2379 cluster list
+
+  # 逐实例健康体检
+  taihu --pd 100.71.128.11:2379 cluster status`,
 }
 
 // clusterListCmd 实例列表。
 var clusterListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "列出注册区全部实例（含心跳超时的僵尸）",
+	Example: `  # 列出注册区全部实例（含僵尸）
+  taihu --pd 100.71.128.11:2379 cluster list
+
+  # JSON 输出
+  taihu --pd 100.71.128.11:2379 cluster list --json`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := requirePD(); err != nil {
 			return err
@@ -91,6 +101,8 @@ var clusterListCmd = &cobra.Command{
 var clusterStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "逐实例探测连通性(RTT)、段汇总与水位",
+	Example: `  # 逐实例连通性/段汇总/水位体检
+  taihu --pd 100.71.128.11:2379 cluster status`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := requirePD(); err != nil {
 			return err
@@ -190,6 +202,11 @@ var clusterStatusCmd = &cobra.Command{
 var clusterIndexCmd = &cobra.Command{
 	Use:   "index",
 	Short: "扫描 /taihu/index/ 索引区，按实例归组计数",
+	Example: `  # 索引按实例归组计数
+  taihu --pd 100.71.128.11:2379 cluster index
+
+  # 只看指定 key 前缀
+  taihu --pd 100.71.128.11:2379 cluster index --prefix bench`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := requirePD(); err != nil {
 			return err
@@ -292,6 +309,11 @@ func init() {
 var clusterPurgeCmd = &cobra.Command{
 	Use:   "purge",
 	Short: "清空 /taihu/ 命名空间（实例注册/索引/客户端注册）",
+	Example: `  # 预览（只统计不删除）
+  taihu --pd 100.71.128.11:2379 cluster purge
+
+  # 确认清空 /taihu/ 命名空间
+  taihu --pd 100.71.128.11:2379 cluster purge --confirm`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := requirePD(); err != nil {
 			return err

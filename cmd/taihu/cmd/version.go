@@ -12,7 +12,9 @@ import (
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "显示版本号",
+	Example: `  # 显示版本（commit_时间）
+  taihu version`,
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Printf("taihu-cli %s\n", version.String())
+		fmt.Printf("taihu %s\n", version.String())
 	},
 }

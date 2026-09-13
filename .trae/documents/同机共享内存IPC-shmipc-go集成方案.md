@@ -59,8 +59,8 @@ func DialShm(ctx context.Context, uds string) (*Storage, error) // = DialShmPool
 - `shmipc_other.go`（//go:build !linux）：同签名 stub 报错。
 
 ### 5. 命令入口
-- `cmd/taihu-server/main.go`：加 `-shm`（uds 路径，默认空=禁用）。非空时 `go transport.ServeShm(storage, *shm)`，返回的 `io.Closer` 纳入关闭流程。TCP 监听（现有 `gs.Serve(lis)`）与 shm 服务并行，互不干扰。
-- `cmd/taihu-rpc-bench/main.go`：加 `-shm`，validate 要求 `-addr`/`-shm` 二选一；`if c.shm != "" { s = rpcclient.DialShmPool(...) } else { s = rpcclient.DialPool(...) }`。`runWorker` 零改动复用。
+- `cmd/taihu server/main.go`：加 `-shm`（uds 路径，默认空=禁用）。非空时 `go transport.ServeShm(storage, *shm)`，返回的 `io.Closer` 纳入关闭流程。TCP 监听（现有 `gs.Serve(lis)`）与 shm 服务并行，互不干扰。
+- `cmd/taihu bench cluster/main.go`：加 `-shm`，validate 要求 `-addr`/`-shm` 二选一；`if c.shm != "" { s = rpcclient.DialShmPool(...) } else { s = rpcclient.DialPool(...) }`。`runWorker` 零改动复用。
 
 ### 6. 容量配置
 - `ShareMemoryBufferCap = chunkSize + 4KiB`（按帧而非整对象 SegmentSizeBytes=8GB——buffer 按流分配，8GB×SessionNum 会耗尽内存；且分帧与现有 4MiB 帧断言/统计 1:1 对齐）。
@@ -73,12 +73,12 @@ func DialShm(ctx context.Context, uds string) (*Storage, error) // = DialShmPool
 - `internal/transport/shmipc_server.go`、`internal/transport/shmipc_server_other.go`（新增）
 - `pkg/rpcclient/storage_rpc.go`、`pkg/rpcclient/dial.go`（rpcConn 接口）
 - `pkg/rpcclient/shmipc.go`、`pkg/rpcclient/shmipc_other.go`（新增）
-- `cmd/taihu-server/main.go`、`cmd/taihu-rpc-bench/main.go`（-shm 参数）
+- `cmd/taihu server/main.go`、`cmd/taihu bench cluster/main.go`（-shm 参数）
 
 ## 验证
 1. **Windows 本地**：`go build ./...`、`go vet ./...` 必须通过（shmipc 文件被 build tag 排除，stub 兜底）。
 2. **Linux（128.12）**：
-   - `taihu-server -addr :50051 -shm /tmp/taihu.shm -db ... -dev ...` 起服，TCP 与 shm 双监听。
-   - `taihu-rpc-bench -shm /tmp/taihu.shm -mode write -size 4194304 ...` → read，与 `-addr 127.0.0.1:50051` 全量对比：吞吐/延迟/帧统计（`transport.StatsString()`）。
+   - `taihu server -addr :50051 -shm /tmp/taihu.shm -db ... -dev ...` 起服，TCP 与 shm 双监听。
+   - `taihu bench cluster -shm /tmp/taihu.shm -mode write -size 4194304 ...` → read，与 `-addr 127.0.0.1:50051` 全量对比：吞吐/延迟/帧统计（`transport.StatsString()`）。
    - 重点验证：Get 零拷贝 release 幂等、`PutBack` 后数据不被后续请求覆盖、跨帧（多帧 Get）正确性、容量配置生效（无 shared memory exhausted fallback 报错）。
 3. 同机端到端对比报告：shmipc vs loopback TCP 的带宽与 CPU（预期 shmipc 消除内核拷贝，CPU busy 显著下降，带宽不受 loopback 单流上限约束）。

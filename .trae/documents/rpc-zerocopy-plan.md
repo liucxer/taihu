@@ -49,7 +49,7 @@
 ## 验证
 1. `go build ./...`、`go vet ./...`。
 2. `go test ./...`（含 `-race`），重点 `pkg/rpcclient/pool_test.go` 的 bufconn e2e round-trip；多帧对象（>4MiB）、单帧对象（≤4MiB）、`bufpool` 归还不漏。
-3. 本机端到端：`taihu-server`(本地 TCP) + `taihu-client/rpc-bench` 单帧/多帧 put/get，SHA256 对比；`-race` 跑一遍确保 zero-copy 归还无双重释放。
+3. 本机端到端：`taihu server`(本地 TCP) + `taihu-client/rpc-bench` 单帧/多帧 put/get，SHA256 对比；`-race` 跑一遍确保 zero-copy 归还无双重释放。
 4. （可选）性能采样：客户端 Get 路径 memmove 占比应显著下降（历史 43%-62%）。
 
 ## 风险与回退

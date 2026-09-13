@@ -1,4 +1,4 @@
-// Package cmd 实现 taihu-cli 的子命令树（cobra）。
+// Package cmd 实现 taihu 命令的子命令树（cobra）。
 package cmd
 
 import (
@@ -31,11 +31,36 @@ var global = struct {
 
 // rootCmd 根命令：无子命令时打印帮助。
 var rootCmd = &cobra.Command{
-	Use:   "taihu-cli",
-	Short: "taihu 对象数据库命令行运维工具",
-	Long: `taihu-cli：查询集群/实例/segment 信息、key 读写删与定位、SDK 客户端清单。
+	Use:   "taihu",
+	Short: "taihu 对象数据库统一命令行工具",
+	Long: `taihu：服务端（server）、性能压测（bench storage/cluster/single）、
+运维/客户端（cluster/key/instance/client）与版本（version）的统一入口。
+
+分层：
+  taihu server ...                 启动 taihu 对象服务端（daemon）
+  taihu bench storage ...          本地裸盘 Storage 层压测（不走网络）
+  taihu bench cluster ...          集群端到端压测（走 TiKV 定位实例）
+  taihu bench single ...           单机直通压测（不走 TiKV，直连 taihu-server）
+  taihu cluster list|status|...    集群/实例/索引运维
+  taihu key put|get|delete|...     对象读写删与定位
+  taihu instance segments          实例 segment 信息
+  taihu client list|info           SDK 客户端清单与工具环境信息
+  taihu version                    显示版本
+
 集群类命令需要 -pd 指向 TiKV PD（实例/索引/客户端注册区所在）；无 TiKV 环境可用
 -addr/instance 直连单个实例。`,
+	Example: `  # 启动服务端
+  taihu server -listen 10.0.0.1 -db /mnt/db -dev /dev/nvme0n1 -server-name TAIHU-0 -pd 100.71.128.11:2379
+
+  # 集群端到端压测（写）
+  taihu --pd 100.71.128.11:2379,100.71.128.12:2379 bench cluster -mode write -client-name t11 -size 4194304 -count 40000
+
+  # 集群运维
+  taihu --pd 100.71.128.11:2379 cluster status
+
+  # 对象读写
+  echo hello | taihu --pd 100.71.128.11:2379 key put -key hello
+  taihu --pd 100.71.128.11:2379 key get -key hello`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 }
@@ -43,7 +68,7 @@ var rootCmd = &cobra.Command{
 // Execute 执行根命令（命令错误已打印，返回后 main 按码退出）。
 func Execute() error {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, "taihu-cli:", err)
+		fmt.Fprintln(os.Stderr, "taihu:", err)
 		return err
 	}
 	return nil
@@ -61,6 +86,8 @@ func init() {
 
 	rootCmd.AddCommand(
 		versionCmd,
+		serverCmd,
+		benchCmd,
 		clusterCmd,
 		keyCmd,
 		instanceCmd,

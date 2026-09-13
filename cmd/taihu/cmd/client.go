@@ -16,12 +16,19 @@ import (
 var clientCmd = &cobra.Command{
 	Use:   "client",
 	Short: "客户端信息：SDK 注册客户端清单 / 本工具环境信息",
+	Example: `  # SDK 客户端清单
+  taihu --pd 100.71.128.11:2379 client list
+
+  # 工具环境信息
+  taihu client info`,
 }
 
 // clientListCmd SDK 注册客户端清单（心跳存活状态）。
 var clientListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "列出注册的 SDK 客户端（/taihu/clients/）",
+	Example: `  # 列出注册的 SDK 客户端
+  taihu --pd 100.71.128.11:2379 client list`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := requirePD(); err != nil {
 			return err
@@ -101,6 +108,11 @@ var clientListCmd = &cobra.Command{
 var clientInfoCmd = &cobra.Command{
 	Use:   "info",
 	Short: "显示工具版本、配置、KV 后端状态与实例连通性",
+	Example: `  # 显示版本/配置/KV 状态/连通性
+  taihu client info
+
+  # 带集群视角（标注本机实例）
+  taihu --pd 100.71.128.11:2379 --client-name t12 client info`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx, cancel := ctxWithTimeout(cmd.Context())
 		defer cancel()

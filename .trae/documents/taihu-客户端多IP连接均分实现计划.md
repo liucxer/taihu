@@ -2,7 +2,7 @@
 
 ## Context
 
-当前 taihu-server 支持 `-listen` 逗号分隔绑定多个 IP（`listenMultiPort` 将所有 IP 绑到同一端口），但注册到 TiKV 的通告地址 **只取第一个 IP**（`advAddr = ips[0]:port`）。客户端从 TiKV 拿到 `InstanceInfo.Addr` 后只与第一个 IP 建立连接，其余绑定的 IP 上的监听虽存在但从未被使用——多 IP 绑定形同虚设，25G 分流也无法利用（146 集群测试已证明 bond1 饱和而 bond2 空闲的 2:1 分流瓶颈）。
+当前 taihu server 支持 `-listen` 逗号分隔绑定多个 IP（`listenMultiPort` 将所有 IP 绑到同一端口），但注册到 TiKV 的通告地址 **只取第一个 IP**（`advAddr = ips[0]:port`）。客户端从 TiKV 拿到 `InstanceInfo.Addr` 后只与第一个 IP 建立连接，其余绑定的 IP 上的监听虽存在但从未被使用——多 IP 绑定形同虚设，25G 分流也无法利用（146 集群测试已证明 bond1 饱和而 bond2 空闲的 2:1 分流瓶颈）。
 
 目标：**当服务端绑定多个 IP 时，客户端与每个 IP 都建立 TCP 连接，读写请求在全部 IP 连接上 round-robin 均分**。利用 `rpcclient.Storage` 现有的 `pick()` round-robin（`atomic.AddUint64(&s.rr,1) % len(conns)`），只要把多个 IP 的连接合并进同一个 `Storage.conns`，即可零新增轮询代码实现"按 IP 均分"。
 
@@ -49,9 +49,9 @@ func DialPoolMulti(ctx context.Context, addrs []string, perAddr int) (*Storage, 
 }
 ```
 
-所有现有 `DialPool` 调用点（`dial.go:14`、`pool_test.go:54,101`、`storage.go:131,135`、`cmd/taihu-cli/cmd/key.go:31`、`common.go:96`）零改动。
+所有现有 `DialPool` 调用点（`dial.go:14`、`pool_test.go:54,101`、`storage.go:131,135`、`cmd/taihu/cmd/key.go:31`、`common.go:96`）零改动。
 
-### 3. `cmd/taihu-server/main.go` —— 注册时填充 Addrs
+### 3. `cmd/taihu server/main.go` —— 注册时填充 Addrs
 
 `info` 构造处（约 L151-158）新增：
 
@@ -91,7 +91,7 @@ for _, ip := range ips {
 ### 5. 注释/帮助文本更新
 
 - `pkg/rpccluster/config.go` L35-37：`Conns` 语义 "每实例数据面连接数" → "**每地址**数据面连接数：本地实例 shm 会话数、跨节点每 IP TCP 连接数（DialPoolMulti perAddr）；多 IP 时总连接数 = IP 数 × Conns"。
-- `cmd/taihu-rpc-bench/main.go` L56 `-conns` 帮助文本 + L103 内联注释同步措辞。
+- `cmd/taihu bench cluster/main.go` L56 `-conns` 帮助文本 + L103 内联注释同步措辞。
 
 ## 测试计划
 
@@ -119,7 +119,7 @@ for _, ip := range ips {
 ## 验证
 
 1. `go build ./...` 通过；`go test ./pkg/rpcclient/... ./pkg/rpccluster/...` 全绿。
-2. 本地 linux/arm64 交叉编译 `taihu-server.50ebbe4` 与 `taihu-rpc-bench.50ebbe4`。
+2. 本地 linux/arm64 交叉编译 `taihu server.50ebbe4` 与 `taihu bench cluster.50ebbe4`。
 3. 146 集群验证（部署 skill `taihu146-perf`）：
    - 重部署：每节点变更为 **TAIHU-N/N+1 绑定 bond1+bond2 双 IP**（`-listen <bond1>,<bond2>`）等拓扑，使数据面跨节点能同时走两 bond。
    - 跨节点读：确认 bond1.2175 与 bond2.2372 的 rx 差分**均衡**（不再 2:1），单扇入节点带宽突破当前 8.0-8.6 GiB/s 上限（预期接近 2×bond 总和）。

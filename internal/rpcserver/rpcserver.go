@@ -2,7 +2,7 @@
 //
 // 单 Storage 实例，对外暴露 4 个 RPC：Put（client 流式上传）、Get（server 流式下发，
 // 支持 off/size 区间）、Delete、Stat。传输层实现在 internal/transport（netpoll +
-// LinkBuffer 零拷贝），本包仅做薄封装以保持 cmd/taihu-server 生命周期接口不变
+// LinkBuffer 零拷贝），本包仅做薄封装以保持 taihu server 子命令生命周期接口不变
 // （Serve/GracefulStop/Stop）。
 package rpcserver
 

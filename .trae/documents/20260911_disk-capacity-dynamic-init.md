@@ -70,9 +70,9 @@ func (s *Storage) Layout() layout.Layout       // 供心跳/审计
 - `Put` 大小上限（原 L71 `layout.SegmentSizeBytes`）改用 `s.MaxObjectSize()`。
 - `GetDiskCapacity` 语义修正：`Capacity = l.CapacityBytes`（来自 Config/记录值）、`Available = Capacity - Used`、`Used = db.UsedBytes()`（替代 statfs；`diskcapacity_linux.go/_other.go` 删除）。
   - `UsedBytes()`：`internal/metastore/segments.go` 的 segmentManager 遍历 `segs`：Full 段计 `segSize`、Active 段计 allocator 当前 `curOff`（读锁内取快照；段数 ≤2048，心跳 1s 一次开销可忽略）。
-- **注意**：Storage 不再自行读容量/连 TiKV；读容量、TiKV 比较、布局计算编排在 `cmd/taihu-server/main.go`。
+- **注意**：Storage 不再自行读容量/连 TiKV；读容量、TiKV 比较、布局计算编排在 `cmd/taihu server/main.go`。
 
-### 5. 入口（cmd/taihu-server/main.go）
+### 5. 入口（cmd/taihu server/main.go）
 
 启动编排顺序：
 1. flag 校验：`-name`、`-tikv-pd`、`-db`、`-dev`、`-addr` 全部必填（`-addr` 必须具体 ip:port，拒绝通配）；`-seg-size` 可选（0=默认 8GB）。
@@ -99,14 +99,14 @@ func (s *Storage) Layout() layout.Layout       // 供心跳/审计
 4. `internal/cluster/capacity.go`（新增：key/记录/Get/Put）+ 单测
 5. `pkg/taihu/storage.go`（NewStorage 签名/MaxObjectSize/Layout/GetDiskCapacity）+ 删 `diskcapacity_*.go`
 6. `internal/transport/server.go:145`、`shmipc_server.go:215` 上限改 `storage.MaxObjectSize()`
-7. `cmd/taihu-server/main.go`（编排读容量/TiKV 比较/布局注入）
+7. `cmd/taihu server/main.go`（编排读容量/TiKV 比较/布局注入）
 8. `go test ./...` 全量
 
 ## 验证
 
 - 开发机端到端（需本地起一个 TiKV 或先用 MemoryKV 通路验证逻辑，`-tikv-pd` 指向可用 PD）：
-  1. `go build ./cmd/taihu-server`；
-  2. 首次启动 `./taihu-server -name TAIHU-0 -tikv-pd <pd> -db /tmp/meta -dev /tmp/dev.img -addr 127.0.0.1:50051` → 成功，TiKV 写入容量记录；
+  1. `go build ./cmd/taihu server`；
+  2. 首次启动 `./taihu server -name TAIHU-0 -tikv-pd <pd> -db /tmp/meta -dev /tmp/dev.img -addr 127.0.0.1:50051` → 成功，TiKV 写入容量记录；
   3. 再次启动（同参数）→ 读容量与记录一致 → 正常启动；
   4. 换 `dev.img`（不同大小）再启动 → 报"容量不一致"拒绝启动；
   5. 缺 `-name`/`-tikv-pd`/`-addr` 之一 → 启动前报错退出。

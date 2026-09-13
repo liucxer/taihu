@@ -17,6 +17,13 @@ import (
 var keyCmd = &cobra.Command{
 	Use:   "key",
 	Short: "key 操作：put / get / delete / stat / meta / list",
+	Example: `  # 集群路由写/读/删（-pd 定位实例）
+  echo hello | taihu --pd 100.71.128.11:2379 key put -key hello
+  taihu --pd 100.71.128.11:2379 key get -key hello
+  taihu --pd 100.71.128.11:2379 key delete -key hello
+
+  # 直连实例查询
+  taihu key stat -key hello -addr 100.71.128.12:50051`,
 }
 
 // keyTarget 本次 key 命令命中的目标实例信息（nil=集群路由模式）。
@@ -108,6 +115,11 @@ func prepareKeyStore(ctx context.Context) (objectStore, *keyTarget, func(), erro
 var keyPutCmd = &cobra.Command{
 	Use:   "put",
 	Short: "上传对象（缺省 stdin / -file）",
+	Example: `  # 从 stdin 上传（-size 缺省=输入长度）
+  echo hello | taihu --pd 100.71.128.11:2379 key put -key hello
+
+  # 从文件上传并指定逻辑大小（直连）
+  taihu key put -key big -file /tmp/data.bin -size 4194304 -addr 100.71.128.12:50051`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		key, _ := cmd.Flags().GetString("key")
 		if key == "" {
@@ -158,6 +170,11 @@ var keyPutCmd = &cobra.Command{
 var keyGetCmd = &cobra.Command{
 	Use:   "get",
 	Short: "下载对象（size=-1 全量，缺省 stdout / -file）",
+	Example: `  # 全量下载到 stdout
+  taihu --pd 100.71.128.11:2379 key get -key hello
+
+  # 区间读取到文件（直连）
+  taihu key get -key big -off 0 -size 4194304 -file /tmp/out.bin -addr 100.71.128.12:50051`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		key, _ := cmd.Flags().GetString("key")
 		if key == "" {
@@ -214,6 +231,8 @@ var keyGetCmd = &cobra.Command{
 var keyDeleteCmd = &cobra.Command{
 	Use:   "delete",
 	Short: "删除对象",
+	Example: `  # 删除对象
+  taihu --pd 100.71.128.11:2379 key delete -key hello`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		key, _ := cmd.Flags().GetString("key")
 		if key == "" {
@@ -243,6 +262,8 @@ var keyDeleteCmd = &cobra.Command{
 var keyStatCmd = &cobra.Command{
 	Use:   "stat",
 	Short: "返回对象逻辑大小",
+	Example: `  # 查询对象逻辑大小
+  taihu --pd 100.71.128.11:2379 key stat -key hello`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		key, _ := cmd.Flags().GetString("key")
 		if key == "" {
@@ -273,6 +294,8 @@ var keyStatCmd = &cobra.Command{
 var keyMetaCmd = &cobra.Command{
 	Use:   "meta",
 	Short: "返回对象落盘元数据 seg/off/size（需 -addr / -instance 直连）",
+	Example: `  # 查询落盘元数据（需直连）
+  taihu key meta -key hello -addr 100.71.128.12:50051`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		key, _ := cmd.Flags().GetString("key")
 		if key == "" {
@@ -308,6 +331,11 @@ var keyMetaCmd = &cobra.Command{
 var keyListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "按前缀枚举 key（需 -addr / -instance 直连；prefix 缺省=全部）",
+	Example: `  # 按前缀枚举 key（需直连）
+  taihu key list -prefix bench -addr 100.71.128.12:50051
+
+  # 限制条数
+  taihu key list -prefix bench -limit 100 -addr 100.71.128.12:50051`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		prefix, _ := cmd.Flags().GetString("prefix")
 		limit, _ := cmd.Flags().GetInt("limit")

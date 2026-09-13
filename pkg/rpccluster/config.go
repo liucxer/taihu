@@ -41,7 +41,7 @@ const (
 type ClusterConfig struct {
 	// KV 注册/索引后端（必填；TiKV TxnKV 或内存）。
 	KV cluster.KV
-	// ClientName 客户端标识（如 taihu-client-bench 的 -client-name）：仅作标注/客户端注册用，
+	// ClientName 客户端标识（如 taihu bench cluster 的 -client-name）：仅作标注/客户端注册用，
 	// 不参与路由。同机判定（同机走 shm、否则 TCP）由 SDK 比较本机 hostname 与
 	// 服务端注册的 Hostname（os.Hostname）自动完成。
 	ClientName string
