@@ -36,15 +36,10 @@ const shmDataPad = 4096
 // ≈ 4MiB+8KiB；取 4K 对齐值（同时满足 arm64 约束）。
 const shmSliceSize = chunkSize + 8*1024
 
-// shmMaxParallel 服务端从共享内存直读一个多块（>4MiB）对象时，单批并行在途切片的
-// 上限（≥1，通常 8~64）。它把 handleShmGet 对大对象的多 4MiB chunk 从串行 DMA 改为
-// 同批并发 ReadAtInto，提升磁盘队列深度、追平裸盘带宽。
-//
-// 约束：单批在途切片数不能超过共享内存池大切片档（2GiB @95% ≈ 480）。4MiB 小对象
-// 单块不占并行批；16MiB 对象每请求 4 块 ≤ shmMaxParallel，96 并发流最坏 96×4=384 <
-// 480 安全。若对象更大（≥32MiB）或并发更高需推高 BufferCap，否则池耗尽时 shmipc
-// 自动降级 unix socket 拷贝（inFallbackState）并熔断整连接，带宽断崖 + 读失败。
-const shmMaxParallel = 8
+// shm 直读在途切片不再设批上限：整请求单链方案（shmWriteDataFramesChain）把请求段内
+// 全部整 4MiB 块一次收进同一条共享内存链并发直读，单请求在途 = 请求整块数，由共享内存
+// 池容量（2GiB @95% ≈ 480 个大切片）动态约束——池耗尽时 Reserve 逐块失败即截断，回退
+// 路径兜底续读，无需静态常量控制。
 
 // maxKeyLen 请求中 key 的最大长度，防止畸形长度字段放大内存。
 const maxKeyLen = 1 << 16
