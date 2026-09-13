@@ -147,7 +147,7 @@ func init() {
 	f := benchClusterCmd.Flags()
 	f.String("transport", rpccluster.TransportAuto, "data-plane transport: auto (shm same-host / rpc cross-host) | rpc (force TCP, incl. same-host) | shm (force shared memory, same-host only)")
 	f.String("write-routing", "", "write routing algorithm: local (default, prefer local instance) | round-robin (all instances)")
-	f.Int("conns", 1, "connections per TCP address (shmipc SessionNum for shm / local: per address, multi-IP instance builds addrs x conns, round-robin)")
+	f.Int("conns", 4, "connections per TCP address (shmipc SessionNum for shm / local: per address, multi-IP instance builds addrs x conns, round-robin)")
 	f.Bool("preload", false, "read: preload RouteCache before timing")
 	f.String("cpuprofile", "", "write cpu profile to this file (pprof)")
 	f.String("mode", "", "write | read | delete")

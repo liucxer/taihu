@@ -109,7 +109,7 @@ func init() {
 	f.String("transport", "", "data-plane transport: rpc (TCP, with -addr) | shm (shared memory, with -shm)")
 	f.String("addr", "", "taihu-server TCP address(es), comma-separated (with -transport rpc)")
 	f.String("shm", "", "taihu-server unix socket path (with -transport shm)")
-	f.Int("conns", 1, "connections per TCP address (shmipc SessionNum for shm; multi-address builds addrs x conns, round-robin)")
+	f.Int("conns", 4, "connections per TCP address (shmipc SessionNum for shm; multi-address builds addrs x conns, round-robin)")
 	f.String("cpuprofile", "", "write cpu profile to this file (pprof)")
 	f.String("mode", "", "write | read | delete")
 	f.Int64("size", 4096, "object size in bytes")
