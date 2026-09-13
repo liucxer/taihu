@@ -27,10 +27,10 @@ import (
 // 大切片数量 = BufferCap × 大档百分比 / shmSliceSize：读路径每个并发流在途 1 个
 // 4MiB 响应切片，池数量必须 ≥ 期望并发读线程数，否则 Reserve 失败自动 fallback
 // 到 unix socket 拷贝（带宽断崖 + 熔断）。故大切片档占比拉到 95%（控制帧仅占
-// 5% 小巧致密），1GiB 池 ≈ 240 个 4MiB 切片，覆盖 128+ 并发读。
+// 5% 小巧致密），2GiB 池 ≈ 480 个 4MiB 切片，覆盖 128+ 并发读。
 const (
 	shmSmallSlice   = 16 * 1024         // 控制帧切片数据容量
-	shmBufferCap    = 1 << 30           // 每会话共享内存容量 1GiB
+	shmBufferCap    = 2 << 30           // 每会话共享内存容量 2GiB
 	shmMaxStreamNum = 256               // 流池上限（超过 GetStream 阻塞等待 PutBack）
 	shmInitTimeout  = 30 * time.Second  // 会话初始化（建 memfd + 握手）超时
 )
