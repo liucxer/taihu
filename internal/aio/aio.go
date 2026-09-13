@@ -28,6 +28,12 @@ var ErrFull = errors.New("aio: submission queue full")
 // errInvalidMaxEvents 表示 New 的 maxEvents 超出内核允许范围。
 var errInvalidMaxEvents = errors.New("aio: maxEvents must be in [1, 65536]")
 
+// ReadSpec 批读的一个提交项：读 off 处 len(Buf) 字节到 Buf。同一批共享同一 fd。
+type ReadSpec struct {
+	Buf []byte
+	Off int64
+}
+
 // Event 一次已完成的异步 IO 结果。
 type Event struct {
 	// Data 提交时写入的用户数据（本封装固定为自增序号 seq，用于关联请求）。
@@ -42,6 +48,12 @@ type Ring interface {
 	// SubmitRead 异步读 fd 上 off 处 len(buf) 字节到 buf，返回关联序号。
 	// 队列满时返回 ErrFull（Wait 回收后重试）。
 	SubmitRead(fd int, buf []byte, off int64) (uint64, error)
+
+	// SubmitReadBatch 一次 io_submit 批量提交多条异步读（同一 fd，摊薄 syscall）。
+	// 返回首个关联序号 firstSeq（第 i 项序号 = firstSeq+i，i∈[0,submitted)）与成功排队
+	// 条数 submitted。submitted 可能 < len(specs)（内核提交队列截断），调用方须把未排队
+	// 部分追加提交；队列满且一条未排入时返回 ErrFull。各 buf 须存活到完成事件被取回。
+	SubmitReadBatch(fd int, specs []ReadSpec) (firstSeq uint64, submitted int, err error)
 
 	// SubmitWrite 异步写 buf 到 fd 上 off 处，返回关联序号。语义同 SubmitRead。
 	SubmitWrite(fd int, buf []byte, off int64) (uint64, error)

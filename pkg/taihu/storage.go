@@ -226,6 +226,103 @@ func (s *Storage) ReadAtInto(ctx context.Context, key string, off, size int64, d
 	return want, nil
 }
 
+// BatchReadBlock 批读的一个对象块（直读快路径前置：Off/Size 4K 对齐，Size 为整块）。
+type BatchReadBlock struct {
+	Key  string
+	Off  int64
+	Size int64
+	Dst  []byte // 4K 对齐，cap ≥ align4K(Size)（请求窗口 + 尾部对齐余量）
+}
+
+// BatchedReadResult 单块批读结果。
+type BatchedReadResult struct {
+	N   int64 // 请求窗口读入字节数（读到对象末尾不足 Size 时截断）
+	Err error // io.EOF 表示读到对象/设备末尾短读；其余为映射/设备错误
+}
+
+// BatchRead 一次性批读多个对象块：把各块解析为设备直读 job 后，交给 device 以一次
+// io_submit 批量提交（摊薄系统调用），完成后再返回各块结果。逐块语义与 ReadAtInto
+// 完全等价（cost 短读截断 + io.EOF）。供服务端"多 stream 一 worker 聚合读"使用。
+func (s *Storage) BatchRead(ctx context.Context, blocks []BatchReadBlock) ([]BatchedReadResult, error) {
+	res := make([]BatchedReadResult, len(blocks))
+	if len(blocks) == 0 {
+		return res, nil
+	}
+	// Phase 1：逐块解析对象映射 → 段内物理区间，构建 device.ReadJob；持段读引用。
+	devJobs := make([]device.ReadJob, len(blocks))
+	refed := make([]bool, len(blocks))
+	wants := make([]int64, len(blocks))
+	for i := range blocks {
+		b := &blocks[i]
+		meta, err := s.db.GetMapping(ctx, b.Key)
+		if err != nil {
+			return res, err
+		}
+		if b.Off < 0 || b.Off > meta.Size || b.Off%layout.BlockSize != 0 {
+			return res, ErrInvalidRange
+		}
+		remaining := meta.Size - b.Off
+		want := b.Size
+		if want > remaining {
+			want = remaining
+		}
+		if want == 0 {
+			res[i] = BatchedReadResult{N: 0, Err: io.EOF}
+			continue
+		}
+		relStart := meta.Offset + b.Off
+		dlen := layout.Align4k(relStart+want) - relStart
+		if int64(len(b.Dst)) < dlen {
+			return res, fmt.Errorf("taihu: batchread dst %d < dlen %d", len(b.Dst), dlen)
+		}
+		s.db.RefSegment(meta.SegmentID)
+		refed[i] = true
+		devJobs[i] = device.ReadJob{SegmentID: meta.SegmentID, Off: relStart, Buf: b.Dst[:dlen], Size: dlen}
+		wants[i] = want
+	}
+	// 整批都无有效 job 时直接返回（已逐块置 EOF）。
+	any := false
+	for i := range devJobs {
+		if refed[i] {
+			any = true
+			break
+		}
+	}
+	// Phase 2：一次设备批提交。
+	if any {
+		if ns, err := s.dev.ReadAtIntoBatch(ctx, devJobs); err != nil {
+			for i := range blocks {
+				if refed[i] {
+					s.db.UnrefSegment(devJobs[i].SegmentID)
+				}
+			}
+			return res, err
+		} else {
+			for i := range blocks {
+				if refed[i] {
+					n := ns[i]
+					want := wants[i]
+					if n < want {
+						want = n
+					}
+					if want < blocks[i].Size {
+						res[i] = BatchedReadResult{N: want, Err: io.EOF}
+					} else {
+						res[i] = BatchedReadResult{N: want}
+					}
+				}
+			}
+		}
+	}
+	// Phase 3：释放所有段读引用。
+	for i := range blocks {
+		if refed[i] {
+			s.db.UnrefSegment(devJobs[i].SegmentID)
+		}
+	}
+	return res, nil
+}
+
 // Delete 删除对象的持久化映射。缓存失效由 store 内部处理。物理空间回收留待 segment 级 GC。
 // key 不存在时返回 ErrNotFound。
 func (s *Storage) Delete(ctx context.Context, key string) error {

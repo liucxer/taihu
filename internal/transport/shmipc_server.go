@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/cloudwego/shmipc-go"
 
@@ -131,12 +132,130 @@ type shmServer struct {
 	wg        sync.WaitGroup
 	closed    chan struct{}
 	closeOnce sync.Once
+	batched   *shmBatchReader // 非 nil 时启用"多 stream 一 worker"批读（4MiB 整块聚合 io_submit）
 }
 
 // ServeShm 在 unix socket 路径 uds 上提供 shmipc 服务，返回 io.Closer 关闭服务。
 // 与 TCP 监听（Server.Serve）互不干扰，可同时启用。共享内存由客户端创建并传入
 // （MemFd），服务端仅映射，因此本处配置只须通过 shmipc.VerifyConfig。
 func ServeShm(storage *taihu.Storage, uds string) (io.Closer, error) {
+	return ServeShmWithBatch(storage, uds, 0)
+}
+
+// shmBatchTask 服务端"多 stream 一 worker"批读的一个待调任务：把 key 上 pos 处 want 字节
+// 直读进共享内存数据区 buf。done 由提交方（对应 stream goroutine）阻塞等待批读结果。
+type shmBatchTask struct {
+	key  string
+	pos  int64
+	want int64
+	buf  []byte // 4K 对齐共享内存数据区（cap ≥ align4K(want)），O_DIRECT DMA 目标
+	done chan shmBatchResult
+}
+
+// shmBatchResult 单任务批读结果。
+type shmBatchResult struct {
+	n     int64 // 请求窗口读入字节数
+	final bool  // 该块是本次 Get 末帧（读满请求窗口或读至对象末尾）
+	rerr  error // 非 nil 非 io.EOF 为设备/映射错误；io.EOF 表示短读收尾
+}
+
+// shmBatchReader 批读协调器：收集多个 stream 的对齐整块 4MiB 直读任务，攒满 target 或
+// 超时后交给 Storage.BatchRead 一次 io_submit 批量提交（摊薄系统调用），再按任务路由
+// 结果。单一执行 goroutine（run），任务完成路由通过每任务 done 通道。
+//
+// 池约束：对端 stream goroutine 在 Reserve 共享内存切片后才 submit 本任务，故批协调器
+// 在途持有的切片数与并发在途 Get 相同（不额外占用共享内存池）；只在攒批/批提交窗口
+// 内短暂延后 DMA。批内任一返回错误仍按任务独立回写，不污染后续请求。
+type shmBatchReader struct {
+	storage *taihu.Storage
+	target  int           // 攒满即提交的批量
+	timeout time.Duration // 未攒满时的最大攒批等待
+	in      chan *shmBatchTask
+}
+
+// newShmBatchReader 构建批读协调器并启动 run goroutine。target<=0 表示不启用。
+func newShmBatchReader(st *taihu.Storage, target int) *shmBatchReader {
+	if target <= 0 {
+		return nil
+	}
+	if target > 256 {
+		target = 256
+	}
+	b := &shmBatchReader{
+		storage: st,
+		target:  target,
+		timeout: 5 * time.Microsecond,
+		in:      make(chan *shmBatchTask, target*2),
+	}
+	go b.run()
+	return b
+}
+
+// run 批协调器主循环：攒批 → Storage.BatchRead → 逐任务路由。
+func (b *shmBatchReader) run() {
+	var drain []*shmBatchTask
+	var timer *time.Timer
+	var timerCh <-chan time.Time
+	flush := func() {
+		if timer != nil {
+			timer.Stop()
+			timer = nil
+			timerCh = nil
+		}
+		if len(drain) == 0 {
+			return
+		}
+		batch := drain
+		drain = nil
+		blocks := make([]taihu.BatchReadBlock, len(batch))
+		for i, tk := range batch {
+			blocks[i] = taihu.BatchReadBlock{Key: tk.key, Off: tk.pos, Size: tk.want, Dst: tk.buf}
+		}
+		res, berr := b.storage.BatchRead(context.Background(), blocks)
+		for i, tk := range batch {
+			var r shmBatchResult
+			if berr != nil {
+				r = shmBatchResult{rerr: berr}
+			} else {
+				rr := res[i]
+				r.n = rr.N
+				r.final = rr.N >= tk.want || rr.Err == io.EOF
+				if rr.Err != nil && rr.Err != io.EOF {
+					r.rerr = rr.Err
+				}
+			}
+			tk.done <- r
+		}
+	}
+	for {
+		select {
+		case tk := <-b.in:
+			drain = append(drain, tk)
+			if len(drain) >= b.target {
+				flush()
+			} else if timer == nil {
+				timer = time.NewTimer(b.timeout)
+				timerCh = timer.C
+			}
+		case <-timerCh:
+			flush()
+		}
+	}
+}
+
+// submit 提交单块直读任务并阻塞至完成，返回读入字节数、是否末帧与错误。
+func (b *shmBatchReader) submit(key string, pos, want int64, buf []byte) (int64, bool, error) {
+	tk := &shmBatchTask{key: key, pos: pos, want: want, buf: buf, done: make(chan shmBatchResult, 1)}
+	b.in <- tk
+	r := <-tk.done
+	return r.n, r.final, r.rerr
+}
+
+// ServeShmWithBatch 在 unix socket 路径 uds 上提供 shmipc 服务，并启用"多 stream 一 worker"
+// 的批读（batchTarget>0）：对齐整块 4MiB 直读聚合进 storage.BatchRead 一次 io_submit
+// 批量提交。batchTarget<=0 时退化为常规 ServeShm（每块独立直读）。
+// 返回 io.Closer 关闭服务。共享内存由客户端创建传入（MemFd），服务端仅映射。
+func ServeShmWithBatch(storage *taihu.Storage, uds string, batchTarget int) (io.Closer, error) {
 	conf := shmipc.DefaultConfig()
 	_ = os.Remove(uds)
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: uds, Net: "unix"})
@@ -148,6 +267,7 @@ func ServeShm(storage *taihu.Storage, uds string) (io.Closer, error) {
 		ln:      ln,
 		conf:    conf,
 		closed:  make(chan struct{}),
+		batched: newShmBatchReader(storage, batchTarget),
 	}
 	go s.acceptLoop()
 	return s, nil
@@ -340,6 +460,15 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 		return shmWriteFrame(st, opGetErr, encCode(codeInvalidRange))
 	}
 	pos, end := off, off+size
+	// 批读快路径（多 stream 聚合）：请求恰为单个对齐整块（off 4K 对齐且段长==chunkSize）时，
+	// 送入批协调器与其它 stream 的读合并为一次 io_submit 批量提交，摊薄系统调用。仅此
+	// 场景走批读；多块/尾块/非对齐仍走下方确定性单链/回退路径。
+	if s.batched != nil && pos%layout.BlockSize == 0 && end-pos == chunkSize {
+		_, rerr := s.shmWriteDataFrameBatch(st, s.batched, key, pos, end-pos, end)
+		// 无论 full read / 短读 EOF / 错误帧，均已整帧发出，读完毕。
+		_ = rerr
+		return nil
+	}
 	// 对齐快路径（整请求单链）：当 off 4K 对齐时，把 [pos,end) 内所有整 4MiB 块一次收进
 	// 同一条链并发直读（shmWriteDataFramesChain 整链一次 Flush 保序，多块并行 DMA 提升
 	// 磁盘队列深度）。off 非对齐或段长不足整块的尾块交给下方串行回退路径。
@@ -415,6 +544,56 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 		}
 	}
 	return nil
+}
+
+// shmWriteDataFrameBatch 批读协调路径的数据帧写：Reserve 对齐切片后先写 opGetErr
+// 占位帧头，数据区 [shmDataPad:shmDataPad+dlen] 交给批协调器（shmBatchReader）与其它
+// stream 的读合并为一次 io_submit 批量提交；批完成回读 n 后更新帧头为数据帧
+// （opGetData/opGetDataFinal）并 Flush。命中请求恰为单个对齐整块（handleShmGet 已过滤）。
+//
+// 成功返回实际 payload 字节数 n；读失败时已 Flush 错误帧，返回 rerr（调用方按读完毕
+// 收尾，不追加错误帧）。
+func (s *shmServer) shmWriteDataFrameBatch(st *shmipc.Stream, b *shmBatchReader, key string, pos, want, end int64) (int64, error) {
+	dlen := layout.Align4k(want)
+	buf, err := st.BufferWriter().Reserve(shmDataPad + int(dlen))
+	if err != nil {
+		return 0, err
+	}
+	// 占位错误帧头 [4B len=5][1B op=opGetErr][4B 错误码]：批读失败时客户端直接收错误帧，
+	// 不会读到未写帧头的垃圾切片。
+	binary.BigEndian.PutUint32(buf[:shmLenPrefixLen], uint32(shmOpLen+4))
+	buf[shmLenPrefixLen] = byte(opGetErr)
+	copy(buf[shmLenPrefixLen+shmOpLen:], encCode(codeInternal))
+
+	n, final, rerr := b.submit(key, pos, want, buf[shmDataPad:shmDataPad+dlen])
+	if rerr != nil {
+		// 批读失败：更新错误码后 Flush 错误帧。
+		copy(buf[shmLenPrefixLen+shmOpLen:], encCode(mapStorageErr(rerr)))
+		statTxFrames.Add(1)
+		statTxBytes.Add(4)
+		if err := st.Flush(false); err != nil {
+			return 0, err
+		}
+		return 0, rerr
+	}
+	// 成功：更新帧头为数据帧，len = op(1) + payload 字节数；final 帧按批完成判定。
+	op := byte(opGetData)
+	if final {
+		op = byte(opGetDataFinal)
+	}
+	binary.BigEndian.PutUint32(buf[:shmLenPrefixLen], uint32(shmOpLen+n))
+	buf[shmLenPrefixLen] = op
+	statTxFrames.Add(1)
+	statTxBytes.Add(n)
+	statTxDataFrames.Add(1)
+	statTxDataBytes.Add(n)
+	if n == chunkSize {
+		statTxData4M.Add(1)
+	}
+	if err := st.Flush(false); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // shmWriteDataFrameDirect O_DIRECT 直读共享内存的数据帧写（免 memcpy 快路径）：

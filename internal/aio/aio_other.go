@@ -42,6 +42,21 @@ func (r *ring) SubmitRead(fd int, buf []byte, off int64) (uint64, error) {
 	return r.submit(fd, buf, off, true)
 }
 
+// SubmitReadBatch 实现 Ring.SubmitReadBatch：非 Linux 兜底逐条 submit（编号连续）。
+func (r *ring) SubmitReadBatch(fd int, specs []ReadSpec) (uint64, int, error) {
+	var first uint64
+	for i := range specs {
+		seq, err := r.submit(fd, specs[i].Buf, specs[i].Off, true)
+		if err != nil {
+			return first, i, err
+		}
+		if i == 0 {
+			first = seq
+		}
+	}
+	return first, len(specs), nil
+}
+
 // SubmitWrite 实现 Ring.SubmitWrite。
 func (r *ring) SubmitWrite(fd int, buf []byte, off int64) (uint64, error) {
 	return r.submit(fd, buf, off, false)

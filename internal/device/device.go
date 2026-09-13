@@ -365,6 +365,7 @@ func (d *Device) ReadAt(ctx context.Context, segmentID, off, size int64) ([]byte
 // 要求 off 与 size 均为 4K 对齐（O_DIRECT 约束），dst 首地址 4K 对齐（bufAligned）
 // 且 cap ≥ size；dst 由调用方持有至本函数返回（submit 同步等待完成）。
 // 返回实际读入字节数（读到设备/对象末尾不足时短读，不附错误）；size == 0 返回 (0, nil)。
+// 单条：同一 ring 异步 submit + pump 完成泵；返回实际读入字节数（请求窗口），短读为 io.EOF。
 func (d *Device) ReadAtInto(ctx context.Context, segmentID, off, size int64, dst []byte) (int64, error) {
 	if off < 0 || off%layout.BlockSize != 0 {
 		return 0, fmt.Errorf("taihu: read offset %d not 4K aligned", off)
@@ -394,6 +395,157 @@ func (d *Device) ReadAtInto(ctx context.Context, segmentID, off, size int64, dst
 		return 0, io.EOF
 	}
 	return n, nil
+}
+
+// ReadJob 设备级批读项：读 segmentID 段内 off 处 size 字节到 buf。
+// 仅供 O_DIRECT 直读快路径使用：off、size 均须 4K 对齐，buf 首地址 4K 对齐且 cap ≥ size。
+type ReadJob struct {
+	SegmentID int64
+	Off       int64
+	Buf       []byte
+	Size      int64
+}
+
+// ReadAtIntoBatch 一次 io_submit 批量提交多条段内直读（同一 ring、共用设备 fd），
+// 全部完成后按 jobs 顺序返回各项读入字节数。批内任意项不满足直读快路径（非 4K 对齐
+// 等）时，该项回退为单条 ReadAtInto；整批 submit 失败（队列满/截断）时全量回退单条。
+// 语义与逐条 ReadAtInto 完全等价，仅合并 io_submit 摊薄系统调用开销。
+func (d *Device) ReadAtIntoBatch(ctx context.Context, jobs []ReadJob) ([]int64, error) {
+	ns := make([]int64, len(jobs))
+	if len(jobs) == 0 {
+		return ns, nil
+	}
+	// 收集批直读项（4K 对齐 + buf 对齐），其余标特殊标记回退单条。
+	specs0 := make([]aio.ReadSpec, 0, len(jobs))
+	idx0 := make([]int, 0, len(jobs)) // spec→jobs 位置
+	req0 := make([]int64, 0, len(jobs))
+	fallback := make(map[int]struct{})
+	for i := range jobs {
+		j := &jobs[i]
+		if j.Off < 0 || j.Off%layout.BlockSize != 0 || j.Size <= 0 ||
+			j.Size%layout.BlockSize != 0 || int64(len(j.Buf)) < j.Size ||
+			!bufAligned(j.Buf[:1]) {
+			fallback[i] = struct{}{}
+			continue
+		}
+		specs0 = append(specs0, aio.ReadSpec{Buf: j.Buf[:j.Size], Off: d.segmentBase(j.SegmentID) + j.Off})
+		idx0 = append(idx0, i)
+		req0 = append(req0, j.Size)
+	}
+	if len(specs0) == 0 {
+		return d.readJobsIndividually(ctx, jobs)
+	}
+
+	fd := int(d.f.Fd())
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return nil, errDeviceClosed
+	}
+	d.inSubmit += len(specs0)
+	d.mu.Unlock()
+
+	firstSeq, submitted, err := d.ring.SubmitReadBatch(fd, specs0)
+	if err != nil || submitted == 0 {
+		d.mu.Lock()
+		d.inSubmit -= len(specs0)
+		d.mu.Unlock()
+		return d.readJobsIndividually(ctx, jobs)
+	}
+
+	evs, err := d.batchWait(firstSeq, submitted)
+	d.mu.Lock()
+	d.inSubmit -= len(specs0)
+	d.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < submitted; i++ {
+		j := idx0[i]
+		ev := evs[i]
+		d.recordIO(req0[i])
+		switch {
+		case ev.Res < 0:
+			ns[j] = 0
+			return ns, syscall.Errno(-ev.Res)
+		case ev.Res == 0:
+			ns[j] = 0
+			// 对象/设备末尾：短读。交给剩余 jobs 逐条填，return 由本次短读语义交给调用方。
+		default:
+			n := ev.Res
+			if n < req0[i] {
+				n = req0[i]
+			}
+			ns[j] = n
+		}
+	}
+	// 回退未批排队的项（submitted 截断后的尾部或非批项）。
+	for j := range fallback {
+		if ns[j] == 0 && jobs[j].Size > 0 {
+			n, e := d.ReadAtInto(ctx, jobs[j].SegmentID, jobs[j].Off, jobs[j].Size, jobs[j].Buf)
+			ns[j] = n
+			if e != nil && e != io.EOF {
+				return ns, e
+			}
+		}
+	}
+	// submitted 可能 < len(specs0)：specs0[submitted:] 对应的 jobs 尚未读，补单条。
+	for k := submitted; k < len(specs0); k++ {
+		j := idx0[k]
+		n, e := d.ReadAtInto(ctx, jobs[j].SegmentID, jobs[j].Off, jobs[j].Size, jobs[j].Buf)
+		ns[j] = n
+		if e != nil && e != io.EOF {
+			return ns, e
+		}
+	}
+	return ns, nil
+}
+
+// batchWait 等待 firstSeq 起 n 个已完成事件（镜像 submitOp 的 pending/m 消费语义：
+// 事件先到 pump 则进 pending，由注册通道时消费）。泵退出的安全处理与 submitOp 一致。
+func (d *Device) batchWait(firstSeq uint64, n int) ([]aio.Event, error) {
+	evs := make([]aio.Event, n)
+	for i := 0; i < n; i++ {
+		seq := firstSeq + uint64(i)
+		ch := make(chan aio.Event, 1)
+		d.mu.Lock()
+		if ev, ok := d.pending[seq]; ok {
+			delete(d.pending, seq)
+			d.mu.Unlock()
+			evs[i] = ev
+			continue
+		}
+		d.m[seq] = ch
+		d.mu.Unlock()
+		select {
+		case ev := <-ch:
+			evs[i] = ev
+		case <-d.pumpDone:
+			d.mu.Lock()
+			delete(d.m, seq)
+			d.mu.Unlock()
+			return evs, errDeviceClosed
+		}
+	}
+	return evs, nil
+}
+
+// readJobsIndividually 逐条 ReadAtInto 回退（非批项 / 整批提交失败时）。
+func (d *Device) readJobsIndividually(ctx context.Context, jobs []ReadJob) ([]int64, error) {
+	ns := make([]int64, len(jobs))
+	for i := range jobs {
+		j := &jobs[i]
+		if j.Size <= 0 {
+			ns[i] = 0
+			continue
+		}
+		n, e := d.ReadAtInto(ctx, j.SegmentID, j.Off, j.Size, j.Buf)
+		ns[i] = n
+		if e != nil && e != io.EOF {
+			return ns, e
+		}
+	}
+	return ns, nil
 }
 
 // Delete 将整段标记可回收。当前采用 append-only，物理擦除/重写延迟到 segment 级 GC 实现，

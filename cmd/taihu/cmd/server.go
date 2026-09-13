@@ -189,7 +189,9 @@ var serverCmd = &cobra.Command{
 		gs := rpcserver.New(storage)
 
 		// 同机共享内存 IPC（shmipc）：unix socket 固定 /dev/<server-name>，与 TCP 监听并行（默认开启）。
-		shmCloser, err := transport.ServeShm(storage, shmPath)
+		// -batch>0 时启用"多 stream 一 worker"批读（对齐整块 4MiB 直读聚合 io_submit）。
+		batchTarget, _ := cmd.Flags().GetInt("batch")
+		shmCloser, err := transport.ServeShmWithBatch(storage, shmPath, batchTarget)
 		if err != nil {
 			return fmt.Errorf("serve shm %s: %w", shmPath, err)
 		}
@@ -256,6 +258,7 @@ func init() {
 	f.String("db", "", "pebble metadata directory (required)")
 	f.String("dev", "", "raw device path (required)")
 	f.String("server-name", "", "unique server name, e.g. TAIHU-0 (required)")
+	f.Int("batch", 0, "shm 批读批量：>0 启用\"多 stream 一 worker\"聚合批读（一次 io_submit 提交多个任务）；0 关闭")
 }
 
 // listenMultiPort 在 -listen 指定的一批 IP 上抢占同一未使用 TCP 端口（[50000,51000]），

@@ -72,6 +72,12 @@ func (r *ring) SubmitRead(fd int, buf []byte, off int64) (uint64, error) {
 	return r.submit(fd, buf, off, opcodePread)
 }
 
+// SubmitReadBatch 实现 Ring.SubmitReadBatch：一次 io_submit 批量提交多条读。
+// 返回首个序号与成功排队条数（submitted<len(specs) 表示部分截断）。
+func (r *ring) SubmitReadBatch(fd int, specs []ReadSpec) (uint64, int, error) {
+	return r.submitBatch(fd, specs, opcodePread)
+}
+
 // SubmitWrite 实现 Ring.SubmitWrite。
 func (r *ring) SubmitWrite(fd int, buf []byte, off int64) (uint64, error) {
 	return r.submit(fd, buf, off, opcodePwrite)
@@ -103,6 +109,53 @@ func (r *ring) submit(fd int, buf []byte, off int64, op uint16) (uint64, error) 
 	}
 	// 缓冲交由调用方持有到 Wait 取回事件（O_DIRECT 下内核直读 buf）。
 	return seq, nil
+}
+
+// submitBatch 一次 io_submit 批量提交 n 个 iocb。整批共用一个 fd。内核在 io_submit
+// 内深拷贝 iocb，返回后可复用。成功时返回 count（排队条数），随后以首序号 firstSeq
+// 关联（第 i 项序号 = firstSeq+i）；EAGAIN 返回 ErrFull。seq 递增只在已排队条数上推进，
+// 未排队部分由调用方追加提交，序号不重叠。
+func (r *ring) submitBatch(fd int, specs []ReadSpec, op uint16) (uint64, int, error) {
+	n := len(specs)
+	if n == 0 {
+		return 0, 0, nil
+	}
+	r.mu.Lock()
+	cbs := make([]iocb, n)
+	ptrs := make([]*iocb, n)
+	base := r.seq
+	for i := range specs {
+		sp := specs[i]
+		cb := &cbs[i]
+		cb.Data = base + uint64(i+1)
+		cb.LioOp = op
+		cb.Fildes = uint32(fd)
+		cb.Nbytes = uint64(len(sp.Buf))
+		cb.Offset = sp.Off
+		if len(sp.Buf) > 0 {
+			cb.Buf = uint64(uintptr(unsafe.Pointer(&sp.Buf[0])))
+		}
+		ptrs[i] = cb
+	}
+	cnt, _, errno := unix.Syscall(unix.SYS_IO_SUBMIT, uintptr(r.ctx), uintptr(n), uintptr(unsafe.Pointer(&ptrs[0])))
+	if errno != 0 {
+		r.mu.Unlock()
+		if errno == unix.EAGAIN {
+			return 0, 0, ErrFull
+		}
+		return 0, 0, errno
+	}
+	submitted := int(cnt)
+	if submitted < 0 {
+		r.mu.Unlock()
+		return 0, 0, unix.Errno(-submitted)
+	}
+	if submitted > n {
+		submitted = n
+	}
+	r.seq = base + uint64(submitted)
+	r.mu.Unlock()
+	return base + 1, submitted, nil
 }
 
 // Wait 实现 Ring.Wait：io_getevents 阻塞取回 [min, max] 个完成事件。
