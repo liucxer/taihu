@@ -338,6 +338,35 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 		return shmWriteFrame(st, opGetErr, encCode(codeInvalidRange))
 	}
 	pos, end := off, off+size
+	// 对齐快路径批量：当 off 4K 对齐时，把连续多个整 4MiB 块收进一批并发直读（多块并行
+	// DMA 提升磁盘队列深度）；每批 ≤shmMaxParallel，整批一次 Flush 保序。off 非对齐或
+	// 段长不足一块的尾块交给下方串行回退路径。
+	for pos < end {
+		// 收集本批：全部为 4K 对齐的整 chunkSize 块（want==chunkSize 且 %4K==0）。
+		var slots []getSlot
+		for n := 0; n < shmMaxParallel; n++ {
+			want := end - pos
+			if want > chunkSize {
+				want = chunkSize
+			}
+			if want != chunkSize || want%layout.BlockSize != 0 {
+				break // 非整块（尾块）或非对齐，留给下方回退路径
+			}
+			slots = append(slots, getSlot{pos: pos, want: want, dlen: layout.Align4k(want)})
+			pos += want
+		}
+		if len(slots) == 0 {
+			break // 遇到非整块/非对齐，跳出批量进入串行回退
+		}
+		done, red := shmWriteDataFramesDirect(st, s.storage, key, slots, end)
+		if red != nil {
+			return nil // 错误帧已整批发出，读完毕
+		}
+		if done {
+			return nil // final 帧已发，读完毕
+		}
+	}
+	// 串行回退/尾块：off 非对齐，或段末不足整块的尾块（或批 Reserve 未消耗尽的残留）。
 	for pos < end {
 		want := end - pos
 		if want > chunkSize {
@@ -436,6 +465,98 @@ func shmWriteDataFrameDirect(st *shmipc.Stream, storage *taihu.Storage, key stri
 		return 0, err
 	}
 	return n, rerr
+}
+
+// getSlot 记录从共享内存直读的一个 4K 对齐块：Reserve 返回的共享内存切片 buf 与
+// DMA 读出的 n/错误。只允许整 4MiB（chunkSize）块参与批量直读；切片各自独立，
+// 并行 DMA 各写各切片无竞争。
+type getSlot struct {
+	pos, want, dlen int64
+	buf             []byte
+	n               int64
+	rerr            error
+}
+
+// shmWriteDataFramesDirect 把一个多 4MiB 块对象段从串行 DMA 改为同批并发直读：
+//
+//	Phase A（主 goroutine，串行按序）:块内无竞争，逐块 Reserve 共享内存切片 + 写占位
+//	  opGetErr 帧头；链序==块序，是保序地基，严禁并发 Reserve。
+//	Phase B（并行）:每块 goroutine 调 storage.ReadAtInto 直读各自切片数据区，随后按
+//	  结果写帧头（成功写 opGetData/opGetDataFinal，失败写 opGetErr+mapStorageErr）。
+//	Phase C（主 goroutine）:一次 Flush 整链送出；客户端 shmReadFrame 按 [4B len] 定界
+//	  逐帧读，天然保序。
+//
+// 契约：无论成败，本批所有已 Reserve 槽都填成合法帧（data/final 或 opGetErr）并整批
+// Flush 一次，保证批次边界发送缓冲干净、流可复用、不污染下一请求。Reserve 中途失败
+// 时收缩只处理已 Reserve 前缀，剩余交给调用方回退路径。
+//
+// 返回 done（对象已读毕，末槽已发 final）与 rerr（首个非 EOF 读错误，错误帧已整批发出）。
+func shmWriteDataFramesDirect(st *shmipc.Stream, storage *taihu.Storage, key string, slots []getSlot, end int64) (bool, error) {
+	// Phase A：串行按序 Reserve + 占位错误帧头。
+	reserved := 0
+	for i := range slots {
+		buf, err := st.BufferWriter().Reserve(shmDataPad + int(slots[i].dlen))
+		if err != nil {
+			break
+		}
+		slots[i].buf = buf
+		binary.BigEndian.PutUint32(buf[:shmLenPrefixLen], uint32(shmOpLen+4))
+		buf[shmLenPrefixLen] = byte(opGetErr)
+		copy(buf[shmLenPrefixLen+shmOpLen:], encCode(codeInternal))
+		reserved++
+	}
+	if reserved == 0 {
+		return false, nil // 未 Reserve 到任何切片，交由调用方回退路径
+	}
+	slots = slots[:reserved]
+
+	// Phase B：并行 DMA + 各自收尾帧头。
+	var wg sync.WaitGroup
+	for i := range slots {
+		wg.Add(1)
+		go func(sl *getSlot) {
+			defer wg.Done()
+			n, rerr := storage.ReadAtInto(context.Background(), key, sl.pos, sl.want,
+				sl.buf[shmDataPad:shmDataPad+sl.dlen])
+			sl.n, sl.rerr = n, rerr
+			if rerr != nil && rerr != io.EOF {
+				// 直读失败：填错误码，错帧本批整发。
+				copy(sl.buf[shmLenPrefixLen+shmOpLen:], encCode(mapStorageErr(rerr)))
+				statTxFrames.Add(1)
+				statTxBytes.Add(4)
+				return
+			}
+			op := byte(opGetData)
+			if sl.pos+n >= end || rerr == io.EOF {
+				op = byte(opGetDataFinal)
+			}
+			binary.BigEndian.PutUint32(sl.buf[:shmLenPrefixLen], uint32(shmOpLen+n))
+			sl.buf[shmLenPrefixLen] = op
+			statTxFrames.Add(1)
+			statTxBytes.Add(n)
+			statTxDataFrames.Add(1)
+			statTxDataBytes.Add(n)
+			if n == chunkSize {
+				statTxData4M.Add(1)
+			}
+		}(&slots[i])
+	}
+	wg.Wait()
+
+	// Phase C：单次 Flush 整链。
+	if err := st.Flush(false); err != nil {
+		return false, err
+	}
+	last := &slots[len(slots)-1]
+	if last.pos+last.n >= end || last.rerr == io.EOF {
+		return true, nil
+	}
+	for _, sl := range slots {
+		if sl.rerr != nil && sl.rerr != io.EOF {
+			return false, sl.rerr
+		}
+	}
+	return false, nil
 }
 
 // handleShmDelete 处理 Delete 请求（一元），语义镜像 TCP handleDelete。
