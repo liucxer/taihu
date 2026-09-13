@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cloudwego/shmipc-go"
@@ -139,7 +140,7 @@ type shmServer struct {
 // 与 TCP 监听（Server.Serve）互不干扰，可同时启用。共享内存由客户端创建并传入
 // （MemFd），服务端仅映射，因此本处配置只须通过 shmipc.VerifyConfig。
 func ServeShm(storage *taihu.Storage, uds string) (io.Closer, error) {
-	return ServeShmWithBatch(storage, uds, 0)
+	return ServeShmWithBatch(storage, uds, 0, 0)
 }
 
 // shmBatchTask 服务端"多 stream 一 worker"批读的一个待调任务：把 key 上 pos 处 want 字节
@@ -161,7 +162,9 @@ type shmBatchResult struct {
 
 // shmBatchReader 批读协调器：收集多个 stream 的对齐整块 4MiB 直读任务，攒满 target 或
 // 超时后交给 Storage.BatchRead 一次 io_submit 批量提交（摊薄系统调用），再按任务路由
-// 结果。单一执行 goroutine（run），任务完成路由通过每任务 done 通道。
+// 结果。worker 池（K 个）各跑一个 run goroutine，submission 按原子轮转分发——避免单 worker
+// 串行化整机并发（单 worker 在途≈target，会把磁盘队列深度压到 target 而引发带宽回退）。K×target
+// 即整机在途批读数；任务完成路由通过每任务 done 通道。
 //
 // 池约束：对端 stream goroutine 在 Reserve 共享内存切片后才 submit 本任务，故批协调器
 // 在途持有的切片数与并发在途 Get 相同（不额外占用共享内存池）；只在攒批/批提交窗口
@@ -170,29 +173,37 @@ type shmBatchReader struct {
 	storage *taihu.Storage
 	target  int           // 攒满即提交的批量
 	timeout time.Duration // 未攒满时的最大攒批等待
-	in      chan *shmBatchTask
+	workers []chan *shmBatchTask
+	rr      atomic.Uint64
 }
 
-// newShmBatchReader 构建批读协调器并启动 run goroutine。target<=0 表示不启用。
-func newShmBatchReader(st *taihu.Storage, target int) *shmBatchReader {
+// newShmBatchReader 构建批读协调器并启动 worker 池。target<=0 表示不启用。K 为 worker 数
+// （整机在途 ≈ K×target；K*target 过大逼近共享内存池上限时并发流会储备失败）。
+func newShmBatchReader(st *taihu.Storage, target, workers int) *shmBatchReader {
 	if target <= 0 {
 		return nil
 	}
 	if target > 256 {
 		target = 256
 	}
+	if workers < 1 {
+		workers = 1
+	}
 	b := &shmBatchReader{
 		storage: st,
 		target:  target,
 		timeout: 5 * time.Microsecond,
-		in:      make(chan *shmBatchTask, target*2),
+		workers: make([]chan *shmBatchTask, workers),
 	}
-	go b.run()
+	for i := range b.workers {
+		b.workers[i] = make(chan *shmBatchTask, target*2)
+		go b.run(b.workers[i])
+	}
 	return b
 }
 
-// run 批协调器主循环：攒批 → Storage.BatchRead → 逐任务路由。
-func (b *shmBatchReader) run() {
+// run 单 worker 批协调主循环：攒批 → Storage.BatchRead → 逐任务路由。
+func (b *shmBatchReader) run(in chan *shmBatchTask) {
 	var drain []*shmBatchTask
 	var timer *time.Timer
 	var timerCh <-chan time.Time
@@ -229,7 +240,7 @@ func (b *shmBatchReader) run() {
 	}
 	for {
 		select {
-		case tk := <-b.in:
+		case tk := <-in:
 			drain = append(drain, tk)
 			if len(drain) >= b.target {
 				flush()
@@ -245,17 +256,19 @@ func (b *shmBatchReader) run() {
 
 // submit 提交单块直读任务并阻塞至完成，返回读入字节数、是否末帧与错误。
 func (b *shmBatchReader) submit(key string, pos, want int64, buf []byte) (int64, bool, error) {
+	w := (b.rr.Add(1) - 1) % uint64(len(b.workers))
 	tk := &shmBatchTask{key: key, pos: pos, want: want, buf: buf, done: make(chan shmBatchResult, 1)}
-	b.in <- tk
+	b.workers[w] <- tk
 	r := <-tk.done
 	return r.n, r.final, r.rerr
 }
 
-// ServeShmWithBatch 在 unix socket 路径 uds 上提供 shmipc 服务，并启用"多 stream 一 worker"
+// ServeShmWithBatch 在 unix socket 路径 uds 上提供 shmipc 服务，并启用"多 stream 多 worker"
 // 的批读（batchTarget>0）：对齐整块 4MiB 直读聚合进 storage.BatchRead 一次 io_submit
-// 批量提交。batchTarget<=0 时退化为常规 ServeShm（每块独立直读）。
+// 批量提交。batchWorkers 为 worker 池大小（>1 并行批提交，避免单 worker 串行化整机并发）。
+// batchTarget<=0 时退化为常规 ServeShm（每块独立直读）。
 // 返回 io.Closer 关闭服务。共享内存由客户端创建传入（MemFd），服务端仅映射。
-func ServeShmWithBatch(storage *taihu.Storage, uds string, batchTarget int) (io.Closer, error) {
+func ServeShmWithBatch(storage *taihu.Storage, uds string, batchTarget, batchWorkers int) (io.Closer, error) {
 	conf := shmipc.DefaultConfig()
 	_ = os.Remove(uds)
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: uds, Net: "unix"})
@@ -267,7 +280,7 @@ func ServeShmWithBatch(storage *taihu.Storage, uds string, batchTarget int) (io.
 		ln:      ln,
 		conf:    conf,
 		closed:  make(chan struct{}),
-		batched: newShmBatchReader(storage, batchTarget),
+		batched: newShmBatchReader(storage, batchTarget, batchWorkers),
 	}
 	go s.acceptLoop()
 	return s, nil
