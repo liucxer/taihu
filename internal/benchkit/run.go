@@ -7,6 +7,7 @@ package benchkit
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -27,6 +28,9 @@ type Config struct {
 	ReportEvery time.Duration
 	// Latency 记录每 op 延迟并输出 p50/p90/p99。
 	Latency bool
+	// Pipeline 每个 worker 保持的在途 op 数（read/write 用 bounded-pump 并发下发，
+	// 让单线程也能同时持有多个在途请求，摊薄同步往返的 per-op 等待；1 表示串行逐 op）。
+	Pipeline int
 }
 
 // Store 压测数据面抽象：集群 rpccluster.Storage 与直连 rpcclient.Storage
@@ -52,6 +56,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("-threads must be > 0")
 	case c.Count <= 0:
 		return fmt.Errorf("-count must be > 0")
+	case c.Pipeline < 1:
+		return fmt.Errorf("-pipeline must be >= 1")
 	}
 	return nil
 }
@@ -105,8 +111,12 @@ func Run(ctx context.Context, s Store, cfg Config, toolName, endpoint string) er
 	return nil
 }
 
-// runWorker write 逐个 Put，read 逐个 Get 整对象。
+// runWorker write 逐个 Put，read 逐个 Get 整对象。Pipeline>1 时改用
+// runPipelinedWorker 让单 worker 同时保持多个在途 op。
 func runWorker(ctx context.Context, s Store, cfg Config, s0, e0 int, ops *atomic.Int64, lat *latencyCollector) error {
+	if cfg.Pipeline > 1 {
+		return runPipelinedWorker(ctx, s, cfg, s0, e0, ops, lat)
+	}
 	payload := make([]byte, int(cfg.Size))
 	for j := range payload {
 		payload[j] = byte(j & 0xff)
@@ -140,4 +150,65 @@ func runWorker(ctx context.Context, s Store, cfg Config, s0, e0 int, ops *atomic
 		ops.Add(1)
 	}
 	return nil
+}
+
+// runPipelinedWorker 每个 worker 以 bounded-pump 方式并发下发一整个区间的 op：固定
+// Pipeline 个 goroutine 轮流原子摘取下一个 key，使单 worker 同时保持 Pipeline 个在途
+// op。对单个 4MiB 对象（每请求只有 1 次磁盘 DMA），这是把"每线程在途=1"提升为
+// "每线程在途=Pipeline"，从而加深磁盘队列、摊薄同步往返等待。读模式用；语义与
+// Run/runWorker 完全一致（区间切分、短读校验、Get 缓冲即取即还、延迟与计数）。
+func runPipelinedWorker(ctx context.Context, s Store, cfg Config, s0, e0 int, ops *atomic.Int64, lat *latencyCollector) error {
+	payload := make([]byte, int(cfg.Size))
+	for j := range payload {
+		payload[j] = byte(j & 0xff)
+	}
+	var idx int64 = int64(s0 - 1)
+	var firstErr error
+	var errMu sync.Mutex
+	var wg sync.WaitGroup
+	for w := 0; w < cfg.Pipeline; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(atomic.AddInt64(&idx, 1))
+				if i >= e0 {
+					return
+				}
+				key := KeyFor(cfg.Prefix, i)
+				t0 := time.Now()
+				var got []byte
+				var rel func()
+				var err error
+				switch cfg.Mode {
+				case "write":
+					err = s.Put(ctx, key, cfg.Size, payload)
+				case "read":
+					got, rel, err = s.Get(ctx, key, 0, cfg.Size)
+					if err == nil && int64(len(got)) != cfg.Size {
+						err = fmt.Errorf("key %s: short read %d != %d", key, len(got), cfg.Size)
+					}
+					if got != nil {
+						rel()
+					}
+				case "delete":
+					err = s.Delete(ctx, key)
+				}
+				if cfg.Latency {
+					lat.add(time.Since(t0))
+				}
+				if err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+					return
+				}
+				ops.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
 }

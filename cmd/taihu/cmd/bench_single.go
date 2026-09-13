@@ -51,6 +51,7 @@ var benchSingleCmd = &cobra.Command{
 		c.Count, _ = cmd.Flags().GetInt("count")
 		c.ReportEvery, _ = cmd.Flags().GetDuration("report-interval")
 		c.Latency, _ = cmd.Flags().GetBool("latency")
+		c.Pipeline, _ = cmd.Flags().GetInt("pipeline")
 
 		if err := c.validate(); err != nil {
 			return err
@@ -118,6 +119,7 @@ func init() {
 	f.Int("count", 1000, "total number of distinct objects")
 	f.Duration("report-interval", 2*time.Second, "progress report interval")
 	f.Bool("latency", false, "record per-op latency")
+	f.Int("pipeline", 1, "per-worker in-flight ops (1 = serial; >1 deepens disk queue for single-block objects)")
 }
 
 func (c *singleBenchConfig) validate() error {
