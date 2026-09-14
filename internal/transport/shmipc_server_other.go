@@ -18,3 +18,8 @@ var errShmUnsupported = errors.New("taihu: shmipc only supported on linux")
 func ServeShm(storage *taihu.Storage, uds string) (io.Closer, error) {
 	return nil, errShmUnsupported
 }
+
+// ServeShmWithBatch 非 Linux 平台的占位实现。
+func ServeShmWithBatch(storage *taihu.Storage, uds string, batchTarget, batchWorkers int) (io.Closer, error) {
+	return nil, errShmUnsupported
+}

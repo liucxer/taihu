@@ -7,7 +7,7 @@
 ## 1. 测试目标
 
 1. 用 **taihu bench single**（单机直通压测，rpcclient 直连 taihu-server，不查 TiKV）做 4 MiB IO 读写测试，`-transport shm`（同机共享内存 IPC，shmipc）。
-2. 对比 [c8336a2 taihu-storage-bench 4M IO 读写性能测试报告](./20260913_c8336a2%20taihu-storage-bench%204M%20IO%20读写性能测试报告.md) 的裸盘 Storage 层基线，量化**端到端链路（客户端 → shmipc → taihu-server → Storage → 裸盘）相对纯 Storage 层的带宽/延迟开销**。
+2. 对比 [c8336a2 taihu-storage-bench 4M IO 读写性能测试报告](./202609130703_c8336a2_taihu-storage-bench_4M_IO_读写性能测试报告.md) 的裸盘 Storage 层基线，量化**端到端链路（客户端 → shmipc → taihu-server → Storage → 裸盘）相对纯 Storage 层的带宽/延迟开销**。
 3. 验证 shm 单帧传输的零拷贝命中（take/copy 帧统计）。
 
 ## 2. 测试环境
