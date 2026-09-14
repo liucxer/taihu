@@ -1,6 +1,7 @@
-// Package ierr 定义 taihu 存储的公共错误。
-// 内部各层（device/metastore）直接使用本包错误，对外根包 re-export（见 taihu/error.go），
-// 保证调用方感知的 API 不变。
+// Package ierr 定义 taihu 存储的公共错误 —— **唯一事实源**。
+// 内部各层（device/metastore/storage/transport/protocol）直接使用本包错误；
+// 面向客户端的 re-export 只有一处：pkg/rpcclient/reexport.go（pkg/rpccluster/reexport.go
+// 再转指一层）。internal/ 下的包不得自建错误别名层。
 package ierr
 
 import "errors"

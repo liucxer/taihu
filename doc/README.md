@@ -33,7 +33,7 @@
 | [io_uring 可行性分析与改造方案](设计文档/20260914_io_uring可行性分析与改造方案.md) | 【现行】 | 磁盘层已落地并真机验收（§7）；§7.6 列出尚未处理项 |
 
 > **① Compaction 文档的状态行已过时。** 该文档页首写「状态：**方案评审版**（仅设计，未实现）」，
-> 但代码已经实现、接线并测试：`pkg/taihu/compact.go`（`NewCompactor`/`compactOnce`/`moveObject`，
+> 但代码已经实现、接线并测试：`internal/storage/compact.go`（`NewCompactor`/`compactOnce`/`moveObject`，
 > 用 `MoveMapping` 做 CAS 搬移）、`cmd/taihu/cmd/server.go` 启动后台 Compaction、并有 2 个单测。
 > 标签按**代码实况**给，不按那句已失效的自述。
 >

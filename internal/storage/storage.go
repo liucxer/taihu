@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/liucxer/taihu/internal/device"
+	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
 )
@@ -55,9 +56,6 @@ func NewStorage(ctx context.Context, rocksdbDir, nvmePath string, l layout.Layou
 // MaxObjectSize 单对象大小上限（= 单段大小，Put/传输层校验用）。
 func (s *Storage) MaxObjectSize() int64 { return s.layout.SegmentSizeBytes }
 
-// Layout 返回设备物理布局（段大小/段数，管理/容量上报用）。
-func (s *Storage) Layout() layout.Layout { return s.layout }
-
 // LoadCache 预热 store（metastore）内部的元数据加速缓存。用于 bench / 已知 key 集合场景，
 // 消除 GetMapping 的未命中回查，从而测纯设备读写带宽。
 func (s *Storage) LoadCache(ctx context.Context) error {
@@ -99,10 +97,10 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in []byte) er
 // key 仅语义占位（分配不依赖 key，映射在 PutCommit 建立）。
 func (s *Storage) PutBegin(ctx context.Context, key string, size int64) (segmentID, off int64, err error) {
 	if size < 0 {
-		return 0, 0, ErrInvalidRange
+		return 0, 0, ierr.ErrInvalidRange
 	}
 	if size > s.layout.SegmentSizeBytes {
-		return 0, 0, ErrTooLarge
+		return 0, 0, ierr.ErrTooLarge
 	}
 	return s.db.AllocateSegment(size)
 }
@@ -112,7 +110,7 @@ func (s *Storage) PutBegin(ctx context.Context, key string, size int64) (segment
 // 分段调用方须保证 off 递增（off + 已写字节数）且各段相邻。
 func (s *Storage) PutAppend(ctx context.Context, segmentID, off, size int64, data []byte) error {
 	if int64(len(data)) < size {
-		return ErrShortWrite
+		return ierr.ErrShortWrite
 	}
 	return s.dev.Append(ctx, segmentID, off, size, data)
 }
@@ -120,7 +118,7 @@ func (s *Storage) PutAppend(ctx context.Context, segmentID, off, size int64, dat
 // PutCommit 建立 key→(segmentID, off, size) 映射。顺序保证：先写设备数据，再写元数据，
 // 避免出现「有映射无数据」。
 func (s *Storage) PutCommit(ctx context.Context, key string, segmentID, off, size int64) error {
-	meta := ObjectMeta{SegmentID: segmentID, Offset: off, Size: size}
+	meta := metastore.ObjectMeta{SegmentID: segmentID, Offset: off, Size: size}
 	return s.db.PutMapping(ctx, key, meta)
 }
 
@@ -132,7 +130,7 @@ func (s *Storage) PutCommit(ctx context.Context, key string, segmentID, off, siz
 // 零拷贝直读，非对齐区间在池化缓冲内原址平移一次。
 //
 // 错误与边界：
-//   - off < 0 或 off > Size：ErrInvalidRange；
+//   - off < 0 或 off > Size：ierr.ErrInvalidRange；
 //   - 请求超出对象结尾：截断到剩余字节，返回的部分不足 size 时附 io.EOF；
 //   - off == Size（剩余 0）：返回 (nil, io.EOF)。
 func (s *Storage) ReadAt(ctx context.Context, key string, off, size int64) ([]byte, error) {
@@ -141,7 +139,7 @@ func (s *Storage) ReadAt(ctx context.Context, key string, off, size int64) ([]by
 		return nil, err
 	}
 	if off < 0 || off > meta.Size {
-		return nil, ErrInvalidRange
+		return nil, ierr.ErrInvalidRange
 	}
 	remaining := meta.Size - off
 	want := size
@@ -196,7 +194,7 @@ func (s *Storage) ReadAtInto(ctx context.Context, key string, off, size int64, d
 		return 0, err
 	}
 	if off < 0 || off > meta.Size || off%layout.BlockSize != 0 {
-		return 0, ErrInvalidRange
+		return 0, ierr.ErrInvalidRange
 	}
 	remaining := meta.Size - off
 	want := size
@@ -266,7 +264,7 @@ func (s *Storage) BatchRead(ctx context.Context, blocks []BatchReadBlock) ([]Bat
 			return res, err
 		}
 		if b.Off < 0 || b.Off > meta.Size || b.Off%layout.BlockSize != 0 {
-			return res, ErrInvalidRange
+			return res, ierr.ErrInvalidRange
 		}
 		remaining := meta.Size - b.Off
 		want := b.Size
@@ -331,7 +329,7 @@ func (s *Storage) BatchRead(ctx context.Context, blocks []BatchReadBlock) ([]Bat
 }
 
 // Delete 删除对象的持久化映射。缓存失效由 store 内部处理。物理空间回收留待 segment 级 GC。
-// key 不存在时返回 ErrNotFound。
+// key 不存在时返回 ierr.ErrNotFound。
 func (s *Storage) Delete(ctx context.Context, key string) error {
 	if _, err := s.db.GetMapping(ctx, key); err != nil {
 		return err
@@ -340,7 +338,7 @@ func (s *Storage) Delete(ctx context.Context, key string) error {
 }
 
 // Stat 返回对象逻辑大小。远程层（taihu-server）Get size=-1 全量读等场景使用。
-// key 不存在时返回 ErrNotFound。
+// key 不存在时返回 ierr.ErrNotFound。
 func (s *Storage) Stat(ctx context.Context, key string) (int64, error) {
 	meta, err := s.db.GetMapping(ctx, key)
 	if err != nil {

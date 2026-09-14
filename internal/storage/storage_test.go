@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/liucxer/taihu/internal/bufpool"
+	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
 )
@@ -71,10 +72,10 @@ func TestStoragePutShortData(t *testing.T) {
 	defer s.Close()
 
 	// 数据不足声明 size 应报错，且不留下映射。
-	if err := s.Put(context.Background(), "short", 4096, make([]byte, 100)); err != ErrShortWrite {
-		t.Fatalf("Put short: err=%v want ErrShortWrite", err)
+	if err := s.Put(context.Background(), "short", 4096, make([]byte, 100)); err != ierr.ErrShortWrite {
+		t.Fatalf("Put short: err=%v want ierr.ErrShortWrite", err)
 	}
-	if _, err := s.ReadAt(context.Background(), "short", 0, 4096); err != ErrNotFound {
+	if _, err := s.ReadAt(context.Background(), "short", 0, 4096); err != ierr.ErrNotFound {
 		t.Fatalf("short object should not exist, err=%v", err)
 	}
 }
@@ -136,8 +137,8 @@ func TestStorageReadRange(t *testing.T) {
 		t.Fatalf("off==Size err=%v want io.EOF", err)
 	}
 	// off > Size 越界
-	if _, err := s.ReadAt(context.Background(), "obj", int64(len(payload)+1), 1); err != ErrInvalidRange {
-		t.Fatalf("off>Size err=%v want ErrInvalidRange", err)
+	if _, err := s.ReadAt(context.Background(), "obj", int64(len(payload)+1), 1); err != ierr.ErrInvalidRange {
+		t.Fatalf("off>Size err=%v want ierr.ErrInvalidRange", err)
 	}
 }
 
@@ -152,19 +153,19 @@ func TestStorageDelete(t *testing.T) {
 	if err := s.Delete(context.Background(), "d"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ReadAt(context.Background(), "d", 0, int64(layout.BlockSize)); err != ErrNotFound {
-		t.Fatalf("after delete ReadAt err=%v want ErrNotFound", err)
+	if _, err := s.ReadAt(context.Background(), "d", 0, int64(layout.BlockSize)); err != ierr.ErrNotFound {
+		t.Fatalf("after delete ReadAt err=%v want ierr.ErrNotFound", err)
 	}
-	if err := s.Delete(context.Background(), "d"); err != ErrNotFound {
-		t.Fatalf("double delete err=%v want ErrNotFound", err)
+	if err := s.Delete(context.Background(), "d"); err != ierr.ErrNotFound {
+		t.Fatalf("double delete err=%v want ierr.ErrNotFound", err)
 	}
 }
 
 func TestStorageNotFound(t *testing.T) {
 	s, _, _ := newTestStorage(t)
 	defer s.Close()
-	if _, err := s.ReadAt(context.Background(), "nope", 0, int64(layout.BlockSize)); err != ErrNotFound {
-		t.Fatalf("ReadAt missing err=%v want ErrNotFound", err)
+	if _, err := s.ReadAt(context.Background(), "nope", 0, int64(layout.BlockSize)); err != ierr.ErrNotFound {
+		t.Fatalf("ReadAt missing err=%v want ierr.ErrNotFound", err)
 	}
 }
 

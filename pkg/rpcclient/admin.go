@@ -5,8 +5,6 @@ import (
 	"errors"
 	"time"
 
-	"github.com/liucxer/taihu/internal/metastore"
-	"github.com/liucxer/taihu/internal/storage"
 	"github.com/liucxer/taihu/internal/transport"
 )
 
@@ -29,29 +27,29 @@ func (s *Storage) Ping(ctx context.Context) (rtt time.Duration, serverTime int64
 }
 
 // Meta 返回对象落盘元数据（segment/offset/size）；key 不存在返回 ErrNotFound。
-func (s *Storage) Meta(ctx context.Context, key string) (storage.ObjectMeta, error) {
+func (s *Storage) Meta(ctx context.Context, key string) (ObjectMeta, error) {
 	conn, err := s.adminConn()
 	if err != nil {
-		return storage.ObjectMeta{}, err
+		return ObjectMeta{}, err
 	}
 	segID, off, size, err := conn.Meta(ctx, key)
 	if err != nil {
-		return storage.ObjectMeta{}, err
+		return ObjectMeta{}, err
 	}
-	return storage.ObjectMeta{SegmentID: segID, Offset: off, Size: size}, nil
+	return ObjectMeta{SegmentID: segID, Offset: off, Size: size}, nil
 }
 
 // Segments 返回段汇总与全部段明细。
-func (s *Storage) Segments(ctx context.Context) (storage.SegmentSummary, []storage.SegmentEntry, error) {
+func (s *Storage) Segments(ctx context.Context) (SegmentSummary, []SegmentEntry, error) {
 	conn, err := s.adminConn()
 	if err != nil {
-		return storage.SegmentSummary{}, nil, err
+		return SegmentSummary{}, nil, err
 	}
 	sum, entries, err := conn.Segments(ctx)
 	if err != nil {
-		return storage.SegmentSummary{}, nil, err
+		return SegmentSummary{}, nil, err
 	}
-	tsum := storage.SegmentSummary{
+	tsum := SegmentSummary{
 		Total:       sum.Total,
 		Free:        sum.Free,
 		Active:      sum.Active,
@@ -62,11 +60,11 @@ func (s *Storage) Segments(ctx context.Context) (storage.SegmentSummary, []stora
 		SegSize:     sum.SegSize,
 		ObjectCount: sum.ObjectCount,
 	}
-	tentries := make([]storage.SegmentEntry, 0, len(entries))
+	tentries := make([]SegmentEntry, 0, len(entries))
 	for _, e := range entries {
-		tentries = append(tentries, storage.SegmentEntry{
+		tentries = append(tentries, SegmentEntry{
 			SegmentID:  e.SegmentID,
-			State:      metastoreSegmentState(e.State),
+			State:      SegmentState(e.State),
 			AliveCount: e.AliveCount,
 			ReclaimSeq: e.ReclaimSeq,
 		})
@@ -91,9 +89,4 @@ func (s *Storage) adminConn() (*transport.Conn, error) {
 		}
 	}
 	return nil, errors.New("taihu: admin RPC not supported on this transport (shm only)")
-}
-
-// metastoreSegmentState 将 wire(uint8) 还原为 metastore.SegmentState。
-func metastoreSegmentState(b uint8) metastore.SegmentState {
-	return metastore.SegmentState(b)
 }

@@ -1,6 +1,6 @@
 # taihu — 高性能对象存储引擎
 
-`taihu` 是一个面向裸盘（NVMe）的高性能对象存储系统，提供**本地存储库（Storage）**与**多节点集群（TiKV 注册/路由）**两种形态。数据以对象（key → 任意大小字节序列）组织，单对象上限等于段大小（8 GiB）。
+`taihu` 是一个面向裸盘（NVMe）的高性能对象存储系统：服务端（`taihu server`）把本机裸盘组织为对象存储，客户端以**直连单实例**（`pkg/rpcclient`）或**经 TiKV 集群路由**（`pkg/rpccluster`）两种方式访问。数据以对象（key → 任意大小字节序列）组织，单对象上限等于段大小（8 GiB）。
 
 核心设计取向：**O_DIRECT 裸盘直写直读 + 异步 IO + 全程零拷贝**，配合纯 Go 元数据层（Pebble）与共享内存（shmipc）同机加速，追求极致的端到端读写带宽。
 
@@ -38,7 +38,7 @@
         └──────────────────────────────┬──────────────────────┐
                                        ▼                      ▼
         ┌────────────────────────────────────────────────────────────────┐
-        │   pkg/taihu.Storage（对象存储库）                               │
+        │   internal/storage.Storage（对象存储库）                        │
         │   ├─ metastore（Pebble：mapping / state 两命名空间）            │
         │   │    ├─ 1GiB LRU 分片元数据缓存                               │
         │   │    ├─ segment 生命周期：Free→Active→Full→(Compacting)→      │
@@ -74,11 +74,11 @@ internal/
   ├── ierr/           库错误原始定义
   ├── layout/         物理布局参数：段大小（8GiB）、4K 对齐工具
   ├── metastore/      Pebble 元数据层：mapping/state、1GiB LRU 缓存、段状态机与 GC、游标分配、CAS 搬移
+  ├── storage/        对象存储引擎（Storage：Put/ReadAt/BatchRead、Compactor、裸盘直写直读）
   ├── transport/      netpoll 帧协议（收发循环 / 流式多路复用）+ shmipc 服务端/客户端
   └── version/        版本信息
-pkg/
-  ├── taihu/          Storage 对象存储库（ObjectStore 接口、Put/ReadAt/BatchRead、Compactor）
-  ├── rpcclient/      远程对象存储（rpcConn 抽象：TCP netpoll / shmipc 共享内存，round-robin 分发）
+pkg/                  只放客户端 SDK（外部调用方唯一入口）
+  ├── rpcclient/      直连客户端（rpcConn 抽象：TCP netpoll / shmipc 共享内存，round-robin 分发）
   └── rpccluster/     集群客户端：实例发现、本地优先选路、TiKV 索引、路由缓存、回源
 third_party/          两份 fork 并入主模块（无嵌套 go.mod），改动清单与运维约束见 third_party/README.md
   ├── netpoll/        cloudwego/netpoll v0.7.5 fork（对齐节点分配器 + TakeTry 零拷贝移交）
@@ -86,7 +86,9 @@ third_party/          两份 fork 并入主模块（无嵌套 go.mod），改动
 doc/                  README.md 是全目录索引；下分 设计文档 / 性能测试报告 / 部署记录
 ```
 
-对外公共接口（[pkg/taihu/objectstore.go](pkg/taihu/objectstore.go)）：`ObjectStore` 定义 `Put / Delete`；本地 `Storage` 另暴露 `Get/Stat/ReadAt/ReadAtInto/BatchRead`，远程 `rpcclient.Storage` 与 `rpccluster.Storage` 与之方法级一致，调用方可无感切换本地/远程/集群。
+对外公共接口（[pkg/rpcclient/objectstore.go](pkg/rpcclient/objectstore.go)）：`ObjectStore` 定义 `Put / Get / Delete / Stat / Close`，由两个客户端实现 —— `rpcclient.Storage`（直连）与 `rpccluster.Storage`（集群路由），调用方持该接口即可在两种客户端形态间切换（断言见 `pkg/rpccluster/storage.go`）。
+
+**分层约定**：`pkg/` 只放客户端 SDK，非客户端调用的接口一律在 `internal/`（引擎 `internal/storage`、传输 `internal/transport`、元数据 `internal/metastore`）。`internal/**` 不得 import `pkg/**`，由 `make check` 的 `check-layering` / `check-sdk-only` 两条门禁守着。**代价**：本地引擎不再对外可嵌入 —— 外部调用方只能通过客户端访问。
 
 ---
 

@@ -27,12 +27,12 @@ func newTestServer(t *testing.T) (string, func()) {
 	}
 	_ = f.Close()
 
-	storage, err := storage.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
+	st, err := storage.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
 		layout.Layout{SegmentSizeBytes: layout.DefaultSegmentSizeBytes, SegmentCount: 2048})
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
 	}
-	gs := transport.NewServer(storage)
+	gs := transport.NewServer(st)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -42,7 +42,7 @@ func newTestServer(t *testing.T) (string, func()) {
 	}()
 	return ln.Addr().String(), func() {
 		gs.Stop()
-		_ = storage.Close()
+		_ = st.Close()
 		_ = ln.Close()
 	}
 }
@@ -135,7 +135,7 @@ func TestDialPoolMultiFrame(t *testing.T) {
 	}
 }
 
-// newTestServerMultiAddr 起一个跑在本机 TCP 上的 taihu-server（同一 storage），
+// newTestServerMultiAddr 起一个跑在本机 TCP 上的 taihu-server（同一 Storage 实例），
 // 通过 2 个独立 listener（不同端口）模拟"多 IP 监听"——两个地址连的是同一实例，
 // 数据一致，round-robin 到任一地址读写均命中。返回两个监听地址。
 func newTestServerMultiAddr(t *testing.T) (string, string, func()) {
@@ -148,12 +148,12 @@ func newTestServerMultiAddr(t *testing.T) (string, string, func()) {
 	}
 	_ = f.Close()
 
-	storage, err := storage.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
+	st, err := storage.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
 		layout.Layout{SegmentSizeBytes: layout.DefaultSegmentSizeBytes, SegmentCount: 2048})
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
 	}
-	gs := transport.NewServer(storage)
+	gs := transport.NewServer(st)
 	lnA, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen A: %v", err)
@@ -167,7 +167,7 @@ func newTestServerMultiAddr(t *testing.T) (string, string, func()) {
 	go func() { _ = gs.Serve(lnB) }()
 	return lnA.Addr().String(), lnB.Addr().String(), func() {
 		gs.Stop()
-		_ = storage.Close()
+		_ = st.Close()
 		_ = lnA.Close()
 		_ = lnB.Close()
 	}

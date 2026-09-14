@@ -8,8 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/liucxer/taihu/internal/cluster"
-	"github.com/liucxer/taihu/internal/metastore"
-	"github.com/liucxer/taihu/internal/storage"
+	"github.com/liucxer/taihu/pkg/rpcclient"
 )
 
 // instanceCmd instance 命令父节点。
@@ -22,11 +21,11 @@ var instanceCmd = &cobra.Command{
 
 // segResult JSON 形态的单实例段汇总+明细。
 type segResult struct {
-	Name     string                 `json:"name"`
-	Addr     string                 `json:"addr"`
-	Summary  storage.SegmentSummary `json:"summary"`
-	Segments []storage.SegmentEntry `json:"segments,omitempty"`
-	Error    string                 `json:"error,omitempty"`
+	Name     string                   `json:"name"`
+	Addr     string                   `json:"addr"`
+	Summary  rpcclient.SegmentSummary `json:"summary"`
+	Segments []rpcclient.SegmentEntry `json:"segments,omitempty"`
+	Error    string                   `json:"error,omitempty"`
 }
 
 // instanceSegmentsCmd 查询每个实例的 segment 信息（汇总 + -detail 明细）。
@@ -104,7 +103,7 @@ var instanceSegmentsCmd = &cobra.Command{
 			if detail {
 				fmt.Printf("  segID  state      alive  reclaim_seq\n")
 				for _, e := range res.Segments {
-					if e.State == metastore.SegmentStateFree && e.AliveCount == 0 && e.ReclaimSeq == 0 {
+					if e.State == rpcclient.SegmentStateFree && e.AliveCount == 0 && e.ReclaimSeq == 0 {
 						continue // 空 Free 段不展示（默认 2048 段全打太噪）
 					}
 					fmt.Printf("  %-7d %-9s %-6d %d\n", e.SegmentID, stateName(e.State), e.AliveCount, e.ReclaimSeq)
@@ -122,15 +121,15 @@ func init() {
 }
 
 // stateName 段状态字面名。
-func stateName(s metastore.SegmentState) string {
+func stateName(s rpcclient.SegmentState) string {
 	switch s {
-	case metastore.SegmentStateFree:
+	case rpcclient.SegmentStateFree:
 		return "free"
-	case metastore.SegmentStateActive:
+	case rpcclient.SegmentStateActive:
 		return "active"
-	case metastore.SegmentStateFull:
+	case rpcclient.SegmentStateFull:
 		return "full"
-	case metastore.SegmentStateReclaiming:
+	case rpcclient.SegmentStateReclaiming:
 		return "reclaiming"
 	default:
 		return fmt.Sprintf("unknown(%d)", s)

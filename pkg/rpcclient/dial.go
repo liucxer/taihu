@@ -1,5 +1,6 @@
-// Package rpcclient 提供 taihu 远程访问层客户端（设计文档_v3 §5，netpoll 传输层改造）。
-// 与本地库 pkg/taihu 同签名，调用方可无感切换本地/远程存储。
+// Package rpcclient 提供 taihu 客户端（设计文档_v3 §5，netpoll 传输层改造）。
+// 本包是直连客户端（连一个已知实例）；集群路由客户端见 pkg/rpccluster。
+// 两者方法集一致、共同满足本包 ObjectStore，调用方可在直连/集群间无感切换。
 package rpcclient
 
 import (

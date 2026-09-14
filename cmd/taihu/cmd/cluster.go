@@ -9,7 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/liucxer/taihu/internal/cluster"
-	"github.com/liucxer/taihu/internal/storage"
+	"github.com/liucxer/taihu/pkg/rpcclient"
 )
 
 // clusterCmd 集群命令父节点。
@@ -286,10 +286,10 @@ func pingInstance(ctx context.Context, inst cluster.InstanceInfo) (pingInfo, err
 }
 
 // probeSegments 对实例拉取段汇总（明细可空）。
-func probeSegments(ctx context.Context, inst cluster.InstanceInfo) (storage.SegmentSummary, []storage.SegmentEntry, error) {
+func probeSegments(ctx context.Context, inst cluster.InstanceInfo) (rpcclient.SegmentSummary, []rpcclient.SegmentEntry, error) {
 	c, err := dialInstance(ctx, inst)
 	if err != nil {
-		return storage.SegmentSummary{}, nil, err
+		return rpcclient.SegmentSummary{}, nil, err
 	}
 	defer c.Close()
 	ctx2, cancel := context.WithTimeout(ctx, 3*time.Second)

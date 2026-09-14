@@ -2,8 +2,6 @@ package rpcclient
 
 import (
 	"context"
-
-	"github.com/liucxer/taihu/internal/storage"
 )
 
 // rpcConn 一条底层传输连接的统一接口：TCP（transport.Conn，netpoll 帧协议）或
@@ -18,9 +16,8 @@ type rpcConn interface {
 }
 
 // Storage 远程对象存储实现（设计文档_v3 §5.1，整对象 []byte 语义）。
-// Put/Delete/Stat 与本地 storage.Storage 同签名；读路径本地为 ReadAt（返回池化缓冲，
-// 须 bufpool.Put 归还），远端 Get 返回 (data, release, err)——data 为整块数据，
-// 调用方用毕调用 release()（幂等）归还（内部经 bufpool）。内部可持有 1..n 条
+// 满足 ObjectStore（见 objectstore.go）；Get 返回 (data, release, err)——data 为整块
+// 数据，调用方用毕调用 release()（幂等）归还（内部经 bufpool）。内部可持有 1..n 条
 // 连接（DialPool：netpoll TCP；DialShmPool：shmipc 共享内存），RPC 按 round-robin
 // 分发以提升单进程并发吞吐。
 //
@@ -31,8 +28,6 @@ type Storage struct {
 	conns []rpcConn
 	rr    uint64 // round-robin 分发计数器（原子）
 }
-
-var _ storage.ObjectStore = (*Storage)(nil)
 
 // Close 关闭全部底层连接。
 func (s *Storage) Close() error {

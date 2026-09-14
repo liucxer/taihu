@@ -18,7 +18,7 @@ import (
 	"github.com/liucxer/taihu/third_party/shmipc-go"
 
 	"github.com/liucxer/taihu/internal/bufpool"
-	"github.com/liucxer/taihu/internal/storage"
+	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/transport/protocol"
 )
 
@@ -78,7 +78,7 @@ func (c *ShmConn) Close() error {
 // 数据帧一次 Reserve 直写共享内存（一次用户态拷贝，无内核参与），Flush 即对端可见。
 func (c *ShmConn) Put(ctx context.Context, key string, size int64, in []byte) error {
 	if int64(len(in)) < size {
-		return storage.ErrShortWrite
+		return ierr.ErrShortWrite
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -141,7 +141,7 @@ func (c *ShmConn) Get(ctx context.Context, key string, off, size int64) ([]byte,
 		size = total - off
 	}
 	if size < 0 {
-		return nil, nil, storage.ErrInvalidRange
+		return nil, nil, ierr.ErrInvalidRange
 	}
 	if size == 0 {
 		return nil, func() {}, nil
@@ -242,7 +242,7 @@ func (c *ShmConn) Get(ctx context.Context, key string, off, size int64) ([]byte,
 // 协议与服务端 handleShmPut 兼容（OpPutData 带 pad 数据帧，服务端逐帧直写设备）。
 func (c *ShmConn) PutBegin(ctx context.Context, key string, size int64) (*ShmPutWriter, error) {
 	if size < 0 {
-		return nil, storage.ErrInvalidRange
+		return nil, ierr.ErrInvalidRange
 	}
 	st, err := c.sm.GetStream()
 	if err != nil {
@@ -323,7 +323,7 @@ func (w *ShmPutWriter) Commit() error {
 		return w.err
 	}
 	if w.written != w.size {
-		w.err = storage.ErrShortWrite
+		w.err = ierr.ErrShortWrite
 		return w.err
 	}
 	if w.curLen > 0 {

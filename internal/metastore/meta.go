@@ -109,6 +109,37 @@ func decodeSegmentMeta(b []byte) (SegmentMeta, error) {
 	}, nil
 }
 
+// SegmentEntry 单个 segment 的状态明细（领域态，唯一一份定义）。
+//
+// 为什么在这里：本包已拥有 segment 的状态机（SegmentState）与 SegmentMeta，
+// 段明细只是把 SegmentMeta 加上段号后摊平，归属本包最自然。
+//
+// 编解码另有一份 wire 结构：internal/transport/protocol.SegmentEntry，字段相同
+// 但 State 是 uint8。**刻意不让 protocol import 本包** —— 本包依赖
+// github.com/cockroachdb/pebble，而 protocol 是一个只依赖 encoding/binary 的
+// 纯 codec（带表驱动单测），把持久化模型拖进编解码层不划算；领域态与 wire 态
+// 本就是两个东西，转换发生在服务端边界（internal/transport/server_admin.go）
+// 是合理的。两份结构的字段平齐性由 protocol_test.go 的 TestSegmentWireParity 守着。
+type SegmentEntry struct {
+	SegmentID  int64
+	State      SegmentState
+	AliveCount int64
+	ReclaimSeq int64
+}
+
+// SegmentSummary 实例段汇总与写游标（领域态，唯一一份定义）。
+type SegmentSummary struct {
+	Total       int64
+	Free        int64
+	Active      int64
+	Full        int64
+	Reclaiming  int64
+	CursorSeg   int64
+	CursorOff   int64
+	SegSize     int64
+	ObjectCount int64
+}
+
 // state 列族中关键字。
 const (
 	kvCursorKey     = "cursor"

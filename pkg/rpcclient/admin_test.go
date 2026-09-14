@@ -3,9 +3,6 @@ package rpcclient
 import (
 	"context"
 	"testing"
-
-	"github.com/liucxer/taihu/internal/metastore"
-	"github.com/liucxer/taihu/internal/storage"
 )
 
 // admin RPC 往返测试（taihu-cli 设计文档 §4）：Ping / Meta / Segments / ListKeys。
@@ -45,7 +42,7 @@ func TestAdminMeta(t *testing.T) {
 	ctx := context.Background()
 
 	// 缺失 key → ErrNotFound。
-	if _, err := s.Meta(ctx, "no-such-key"); err != storage.ErrNotFound {
+	if _, err := s.Meta(ctx, "no-such-key"); err != ErrNotFound {
 		t.Fatalf("Meta missing: %v, want ErrNotFound", err)
 	}
 
@@ -53,7 +50,7 @@ func TestAdminMeta(t *testing.T) {
 	if err := s.Put(ctx, "m1", size, make([]byte, size)); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	var m storage.ObjectMeta
+	var m ObjectMeta
 	m, err = s.Meta(ctx, "m1")
 	if err != nil {
 		t.Fatalf("Meta: %v", err)
@@ -82,8 +79,8 @@ func TestAdminSegments(t *testing.T) {
 	}
 
 	// 新实例初始无 Free 段（段状态表随首次写入创建）；至少应有 Active 段。
-	var sum storage.SegmentSummary
-	var entries []storage.SegmentEntry
+	var sum SegmentSummary
+	var entries []SegmentEntry
 	sum, entries, err = s.Segments(ctx)
 	if err != nil {
 		t.Fatalf("Segments: %v", err)
@@ -109,7 +106,7 @@ func TestAdminSegments(t *testing.T) {
 	}
 	found := false
 	for _, e := range entries {
-		if e.SegmentID == sum.CursorSeg && e.State == metastore.SegmentStateActive {
+		if e.SegmentID == sum.CursorSeg && e.State == SegmentStateActive {
 			found = true
 		}
 	}

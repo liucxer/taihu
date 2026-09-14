@@ -133,7 +133,7 @@ func TestCompactConcurrentDelete(t *testing.T) {
 
 	// k13 应已删除（不复活）；其余存活对象可读。
 	if _, err := s.ObjectMeta(ctx, "k13"); err != ierr.ErrNotFound {
-		t.Fatalf("k13 mapping = %v, want ErrNotFound", err)
+		t.Fatalf("k13 mapping = %v, want ierr.ErrNotFound", err)
 	}
 	for i := 14; i < 2*perSeg; i++ {
 		key := fmt.Sprintf("k%02d", i)

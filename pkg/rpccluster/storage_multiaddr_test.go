@@ -15,7 +15,7 @@ import (
 	"github.com/liucxer/taihu/internal/transport"
 )
 
-// multiAddrTestServerPair 起一个跑在本机 TCP 上的 taihu-server（同一 storage），通过
+// multiAddrTestServerPair 起一个跑在本机 TCP 上的 taihu-server（同一 Storage 实例），通过
 // 2 个独立 listener（不同端口）模拟"多 IP 监听"——两个地址连的是同一实例、数据一致。
 // 返回 ()[addrA, addrB]，供 clientFor 多地址均分验证。
 func multiAddrTestServerPair(t *testing.T) (string, string) {
@@ -25,12 +25,12 @@ func multiAddrTestServerPair(t *testing.T) (string, string) {
 	if err := os.WriteFile(devPath, nil, 0o644); err != nil {
 		t.Fatalf("create device: %v", err)
 	}
-	storage, err := storage.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
+	st, err := storage.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
 		layout.Layout{SegmentSizeBytes: layout.DefaultSegmentSizeBytes, SegmentCount: 2048})
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
 	}
-	gs := transport.NewServer(storage)
+	gs := transport.NewServer(st)
 	lnA, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen A: %v", err)
@@ -43,7 +43,7 @@ func multiAddrTestServerPair(t *testing.T) (string, string) {
 	go func() { _ = gs.Serve(lnB) }()
 	t.Cleanup(func() {
 		gs.Stop()
-		_ = storage.Close()
+		_ = st.Close()
 		_ = lnA.Close()
 		_ = lnB.Close()
 	})
@@ -59,12 +59,12 @@ func multiAddrTestServer(t *testing.T) string {
 	if err := os.WriteFile(devPath, nil, 0o644); err != nil {
 		t.Fatalf("create device: %v", err)
 	}
-	storage, err := storage.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
+	st, err := storage.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
 		layout.Layout{SegmentSizeBytes: layout.DefaultSegmentSizeBytes, SegmentCount: 2048})
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
 	}
-	gs := transport.NewServer(storage)
+	gs := transport.NewServer(st)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -72,7 +72,7 @@ func multiAddrTestServer(t *testing.T) string {
 	go func() { _ = gs.Serve(ln) }()
 	t.Cleanup(func() {
 		gs.Stop()
-		_ = storage.Close()
+		_ = st.Close()
 		_ = ln.Close()
 	})
 	return ln.Addr().String()

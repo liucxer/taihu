@@ -23,7 +23,7 @@ import (
 
 	"github.com/liucxer/taihu/third_party/netpoll"
 
-	"github.com/liucxer/taihu/internal/storage"
+	"github.com/liucxer/taihu/internal/ierr"
 )
 
 // ChunkSize 单条数据帧负载上限（4MiB），与旧 gRPC 方案一致。
@@ -112,13 +112,13 @@ const (
 // MapStorageErr 将库错误映射为错误码（对应旧 gRPC status 映射）。
 func MapStorageErr(err error) ErrCode {
 	switch {
-	case errors.Is(err, storage.ErrNotFound):
+	case errors.Is(err, ierr.ErrNotFound):
 		return CodeNotFound
-	case errors.Is(err, storage.ErrInvalidRange):
+	case errors.Is(err, ierr.ErrInvalidRange):
 		return CodeInvalidRange
-	case errors.Is(err, storage.ErrTooLarge):
+	case errors.Is(err, ierr.ErrTooLarge):
 		return CodeTooLarge
-	case errors.Is(err, storage.ErrNoSpace):
+	case errors.Is(err, ierr.ErrNoSpace):
 		return CodeNoSpace
 	default:
 		return CodeInternal
@@ -131,13 +131,13 @@ func MapCode(c ErrCode) error {
 	case CodeOK:
 		return nil
 	case CodeNotFound:
-		return storage.ErrNotFound
+		return ierr.ErrNotFound
 	case CodeInvalidRange:
-		return storage.ErrInvalidRange
+		return ierr.ErrInvalidRange
 	case CodeTooLarge:
-		return storage.ErrTooLarge
+		return ierr.ErrTooLarge
 	case CodeNoSpace:
-		return storage.ErrNoSpace
+		return ierr.ErrNoSpace
 	case CodeInvalidArgument:
 		return errors.New("taihu: invalid argument")
 	default:

@@ -10,7 +10,7 @@ import (
 	"github.com/liucxer/taihu/third_party/netpoll"
 
 	"github.com/liucxer/taihu/internal/bufpool"
-	"github.com/liucxer/taihu/internal/storage"
+	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/transport/protocol"
 )
 
@@ -66,11 +66,11 @@ func clientDispatch(c *Conn, sid uint32, op protocol.OpCode, sub netpoll.Reader)
 	}
 }
 
-// Put 上传对象（与本地 storage.Storage.Put 同语义）。首帧发 key+size，随后按
+// Put 上传对象（与引擎侧 storage.Storage.Put 同语义）。首帧发 key+size，随后按
 // ChunkSize 分帧零拷贝发送（in 在返回前不会被引用），OpPutEnd 后等待 OpResp。
 func (c *Conn) Put(ctx context.Context, key string, size int64, in []byte) error {
 	if int64(len(in)) < size {
-		return storage.ErrShortWrite
+		return ierr.ErrShortWrite
 	}
 	st := c.newStream()
 	defer c.removeStream(st)
@@ -127,7 +127,7 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 		size = total - off
 	}
 	if size < 0 {
-		return nil, nil, storage.ErrInvalidRange
+		return nil, nil, ierr.ErrInvalidRange
 	}
 	if size == 0 {
 		return nil, func() {}, nil

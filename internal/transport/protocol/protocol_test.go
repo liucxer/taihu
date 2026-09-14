@@ -4,12 +4,52 @@ import (
 	"errors"
 	"io"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
-	"github.com/liucxer/taihu/internal/storage"
+	"github.com/liucxer/taihu/internal/ierr"
+	"github.com/liucxer/taihu/internal/metastore"
 )
+
+// TestSegmentWireParity 断言 wire 结构与领域态结构的字段平齐。
+//
+// 为什么需要：这两处结构各有定义（本包的 wire 态、internal/metastore 的领域态），
+// 靠 server_admin.go 与 pkg/rpcclient/admin.go 逐字段手工转换。**任一侧加字段编译器
+// 不会报错** —— EncodeSegSum 固定写 9 个 int64、ParseSegSum 固定读 9 个，多出来的字段
+// 会静默丢值过网。本测试把「两侧字段名/顺序/类型一致」变成可执行的断言。
+//
+// 允许的唯一差异：SegmentEntry.State —— 领域态是 metastore.SegmentState（底层 uint8 的
+// 具名类型），wire 是裸 uint8（编码层不引入领域类型，理由见 metastore.SegmentEntry 注释）。
+//
+// 本测试只做 import（编译期 + 反射），不构成库依赖：protocol 包自身仍只依赖
+// encoding/binary 等标准库，metastore 仅出现在 _test.go 里。
+func TestSegmentWireParity(t *testing.T) {
+	check := func(name string, wire, domain any, allowStateUint8 bool) {
+		w, d := reflect.TypeOf(wire), reflect.TypeOf(domain)
+		if w.NumField() != d.NumField() {
+			t.Fatalf("%s 字段数不一致：wire=%d domain=%d", name, w.NumField(), d.NumField())
+		}
+		for i := 0; i < w.NumField(); i++ {
+			wf, df := w.Field(i), d.Field(i)
+			if wf.Name != df.Name {
+				t.Errorf("%s 第 %d 个字段名不一致：wire=%s domain=%s", name, i, wf.Name, df.Name)
+				continue
+			}
+			if wf.Type == df.Type {
+				continue
+			}
+			if allowStateUint8 && wf.Name == "State" &&
+				wf.Type.Kind() == reflect.Uint8 && df.Type.Kind() == reflect.Uint8 {
+				continue
+			}
+			t.Errorf("%s 字段 %s 类型不一致：wire=%s domain=%s", name, wf.Name, wf.Type, df.Type)
+		}
+	}
+	check("SegmentEntry", SegmentEntry{}, metastore.SegmentEntry{}, true)
+	check("SegmentSummary", SegmentSummary{}, metastore.SegmentSummary{}, false)
+}
 
 // assertMappedErr 断言 parse 失败时返回的错误与 MapCode 的映射结果等价。
 //
@@ -387,10 +427,10 @@ func TestParseHugeDeclaredKeyLenDoesNotAllocate(t *testing.T) {
 
 func TestMapStorageErrAndMapCodeRoundTrip(t *testing.T) {
 	mapped := []error{
-		storage.ErrNotFound,
-		storage.ErrInvalidRange,
-		storage.ErrTooLarge,
-		storage.ErrNoSpace,
+		ierr.ErrNotFound,
+		ierr.ErrInvalidRange,
+		ierr.ErrTooLarge,
+		ierr.ErrNoSpace,
 	}
 	for _, err := range mapped {
 		code := MapStorageErr(err)
