@@ -3,7 +3,7 @@
 // 与 device 的 O_DIRECT 对齐缓冲共用本池）。
 //
 // 约定：
-//   - Get 返回 4K 对齐、len>=n 的切片，len 为 2 的幂（分桶容量）；
+//   - Get 返回 4K 对齐、len>=n 的切片，len 为 2 的幂（分桶容量）；n<=0 返回 nil；
 //   - Put 归还 Get 返回的原始切片或其子切片均可：按 cap 归一化回整桶容量再入桶，
 //     保证再次 Get 到的是长度完整的桶容量缓冲（清空由消费方按需处理）。
 //
@@ -55,9 +55,10 @@ func newAlignedPool() *alignedBufPool {
 }
 
 // Get 返回 4K 对齐、len>=n 的缓冲。缓冲取自池，池空时新分配。
+// n<=0 返回 nil（与 GetExact 一致），不返回空缓冲。
 func Get(n int) []byte {
-	if n < 0 {
-		n = 0
+	if n <= 0 {
+		return nil
 	}
 	return pool.get(n)
 }
@@ -71,6 +72,9 @@ func Put(buf []byte) {
 }
 
 // bufBucket 返回 n 向上取 2 的幂（下限 4KB、上限 8GB）对应的桶索引。
+// 前置条件 n > 0：n<=0 时 uint64(n-1) 会下溢成 2^64-1，bits.Len64 得 64，
+// 算出的索引超出 pools 数组（曾表现为 Get(0) 索引越界 panic）。两个调用方
+// （Get 经 get、Put 经 put）均已在前置处挡住 n<=0。
 func bufBucket(n int) int {
 	b := bits.Len64(uint64(n - 1)) // n>0 时向上取整 2 幂的指数
 	if b < logBlockSize {
