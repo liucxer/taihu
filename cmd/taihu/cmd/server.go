@@ -157,7 +157,6 @@ var serverCmd = &cobra.Command{
 			hostname = ""
 		}
 		shmPath := "/dev/" + serverName
-		var clusterCancel context.CancelFunc
 		info := &cluster.InstanceInfo{
 			Name:      serverName,
 			Node:      hostname,
@@ -185,8 +184,10 @@ var serverCmd = &cobra.Command{
 		if err := cluster.Register(context.Background(), kv, refresh()); err != nil {
 			return fmt.Errorf("cluster register: %w", err)
 		}
-		var hctx context.Context
-		hctx, clusterCancel = context.WithCancel(context.Background())
+		// defer 兜住所有 return 路径（含 shm 启动失败等中途错误）：否则心跳 ctx 只在
+		// 收到信号时被取消，错误退出会让心跳 goroutine 泄漏到进程结束（vet lostcancel）。
+		hctx, clusterCancel := context.WithCancel(context.Background())
+		defer clusterCancel()
 		go cluster.RunHeartbeat(hctx, kv, refresh, time.Second)
 		log.Printf("cluster registered name=%s node=%s hostname=%s addr=%s kv=%T", serverName, hostname, hostname, advAddr, kv)
 
@@ -238,10 +239,9 @@ var serverCmd = &cobra.Command{
 			<-sig
 			log.Println("shutting down...")
 			// 先注销集群注册（避免残留僵尸实例），再停数据面。
-			if clusterCancel != nil {
-				clusterCancel()
-				_ = cluster.Unregister(context.Background(), kv, serverName)
-			}
+			// clusterCancel 已由上面的 defer 保证调用，这里提前调一次让心跳先停。
+			clusterCancel()
+			_ = cluster.Unregister(context.Background(), kv, serverName)
 			gs.GracefulStop()
 		}()
 
