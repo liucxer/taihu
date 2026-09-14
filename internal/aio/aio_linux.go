@@ -54,8 +54,8 @@ type ring struct {
 	events []ioEvent // Wait 复用缓冲
 }
 
-// newRing 创建内核 AIO 上下文（io_setup）。
-func newRing(maxEvents int) (Ring, error) {
+// newLibAIORing 创建内核 AIO 上下文（io_setup）。
+func newLibAIORing(maxEvents int) (Ring, error) {
 	if maxEvents <= 0 || maxEvents > 1<<16 {
 		return nil, errInvalidMaxEvents
 	}

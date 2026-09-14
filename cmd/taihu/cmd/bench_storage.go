@@ -101,7 +101,12 @@ var benchStorageCmd = &cobra.Command{
 			return fmt.Errorf("DeviceCapacity: %w", err)
 		}
 		l := layout.ComputeLayout(capacity, layout.DefaultSegmentSizeBytes)
-		s, err := taihu.NewStorage(ctx, c.dbDir, c.devPath, l)
+		aioOpts, err := aioOptions()
+		if err != nil {
+			stopCPUProfile(cpuFile)
+			return err
+		}
+		s, err := taihu.NewStorage(ctx, c.dbDir, c.devPath, l, aioOpts...)
 		if err != nil {
 			stopCPUProfile(cpuFile)
 			return fmt.Errorf("NewStorage: %w", err)

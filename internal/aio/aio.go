@@ -1,14 +1,18 @@
 // Package aio 提供异步磁盘 IO 的纯 Go 实现，不依赖任何外部库。
 //
-// 设计背景：部署节点内核过旧不支持 io_uring，故采用 Linux 原生 AIO（libaio 内核接口，
-// 自 Linux 2.6 起可用）。本包只封装四个系统调用：
+// Linux 上有两个后端，都只封装系统调用、结构体按 UAPI 手工声明（无需 cgo）：
 //
-//	io_setup / io_submit / io_getevents / io_destroy
+//   - libaio：io_setup / io_submit / io_getevents / io_destroy，
+//     结构体见 linux/aio_abi.h。自 Linux 2.6 起可用，是兼容性兜底。
+//   - io_uring：io_uring_setup / io_uring_enter / io_uring_register，
+//     结构体见 linux/io_uring.h。自 5.1 起可用，完成事件零系统调用收割。
 //
-// struct iocb / io_event 直接按 linux/aio_abi.h 的布局声明，无需 cgo。
+// 选哪个由 Mode 决定（auto 时按 io_uring_setup 的 errno 运行期探测，不比较版本号），
+// 见 NewWithOptions / Probe。两个后端实现同一个 Ring 接口，调用方无感。
 //
 // 平台策略：
-//   - Linux：真异步（libaio），缓冲必须由调用方持有到 Wait 返回（对应 O_DIRECT 对齐池）。
+//   - Linux：真异步（libaio 或 io_uring），缓冲必须由调用方持有到 Wait 返回
+//     （对应 O_DIRECT 对齐池）。
 //   - 其余平台（macOS 开发/自测）：goroutine + 同步 pread/pwrite 兜底，
 //     接口语义一致（Submit 立即返回序号，Wait 阻塞收集完成），便于本地开发测试。
 //
@@ -70,8 +74,13 @@ type Ring interface {
 // ErrTimeout 表示 Wait 在超时时间内未取够 min 个事件。
 var ErrTimeout = errors.New("aio: wait timeout")
 
-// New 创建容量为 maxEvents 的异步 IO 队列。
-// Linux 上 maxEvents 为 io_setup 的队列深度上限（1..65536）；非 Linux 平台忽略上限语义。
+// New 创建容量为 maxEvents 的异步 IO 队列，后端固定为 libaio（保持既有行为）。
+//
+// 需要 io_uring 请用 NewWithMode / NewWithOptions —— 本函数暂不改为 auto 探测，
+// 以免既有的直接调用方（测试等）在支持 io_uring 的机器上静默切换后端。
+// 生产路径（device 层）默认走 ModeAuto，并在启动日志里标明实际生效的后端。
+//
+// Linux 上 maxEvents 为队列深度上限（1..65536）；非 Linux 平台忽略上限语义。
 func New(maxEvents int) (Ring, error) {
-	return newRing(maxEvents)
+	return NewWithOptions(maxEvents, Options{Mode: ModeLibAIO})
 }

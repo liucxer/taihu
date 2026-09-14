@@ -25,13 +25,20 @@ type Storage struct {
 
 // NewStorage 构建 Storage：打开 pebble、打开裸设备。l 为设备物理布局（段大小/段数），
 // 由启动时读取的真实设备容量经 layout.ComputeLayout 计算。写游标由 db 首次分配时懒加载恢复。
+// 磁盘异步 IO 后端由 opts 选择（默认 auto：支持 io_uring 则用）。
 // 返回 (*Storage, error)，与 v1 文档略有出入，便于暴露初始化错误。
-func NewStorage(ctx context.Context, rocksdbDir, nvmePath string, l layout.Layout) (*Storage, error) {
+func NewStorage(ctx context.Context, rocksdbDir, nvmePath string, l layout.Layout, opts ...Option) (*Storage, error) {
+	o := defaultOptions()
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	db, err := metastore.Open(rocksdbDir, l)
 	if err != nil {
 		return nil, err
 	}
-	dev, err := device.NewDevice(ctx, nvmePath, l.SegmentSizeBytes)
+	dev, err := device.NewDevice(ctx, nvmePath, l.SegmentSizeBytes,
+		device.WithAIOMode(o.aioMode), device.WithAIOIOPoll(o.aioIOPoll))
 	if err != nil {
 		_ = db.Close()
 		return nil, err

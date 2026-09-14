@@ -10,6 +10,13 @@ import (
 
 const testChunk = 4096
 
+// backend 一个待测的后端实现。new 负责建好队列；后端在当前机器不可用时应 t.Skipf
+// （带上原因，避免「静默跳过」在日志里看起来和「通过」一样）。
+type backend struct {
+	name string
+	new  func(t *testing.T, maxEvents int) Ring
+}
+
 // newTestFile 建一个定长临时文件并返回句柄。
 func newTestFile(t *testing.T, size int64) *os.File {
 	t.Helper()
@@ -33,12 +40,16 @@ func pattern(seed byte, n int) []byte {
 	return b
 }
 
-// TestRoundTrip 写后读回，校验数据一致。
+// TestRoundTrip 写后读回，校验数据一致。对每个可用后端各跑一遍。
 func TestRoundTrip(t *testing.T) {
-	r, err := New(8)
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	for _, b := range testBackends(t) {
+		t.Run(b.name, func(t *testing.T) { assertRoundTrip(t, b.new(t, 8)) })
 	}
+}
+
+// assertRoundTrip 是 TestRoundTrip 的后端无关断言体。
+func assertRoundTrip(t *testing.T, r Ring) {
+	t.Helper()
 	defer r.Close()
 
 	f := newTestFile(t, testChunk)
@@ -77,10 +88,14 @@ func TestRoundTrip(t *testing.T) {
 
 // TestMultipleInflight 一次提交多请求，按 seq 关联各偏移结果。
 func TestMultipleInflight(t *testing.T) {
-	r, err := New(16)
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	for _, b := range testBackends(t) {
+		t.Run(b.name, func(t *testing.T) { assertMultipleInflight(t, b.new(t, 16)) })
 	}
+}
+
+// assertMultipleInflight 是 TestMultipleInflight 的后端无关断言体。
+func assertMultipleInflight(t *testing.T, r Ring) {
+	t.Helper()
 	defer r.Close()
 
 	const n = 8
@@ -150,10 +165,14 @@ func TestMultipleInflight(t *testing.T) {
 
 // TestReadBeyondEOF 越界读返回 0 字节而非错误。
 func TestReadBeyondEOF(t *testing.T) {
-	r, err := New(4)
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	for _, b := range testBackends(t) {
+		t.Run(b.name, func(t *testing.T) { assertReadBeyondEOF(t, b.new(t, 4)) })
 	}
+}
+
+// assertReadBeyondEOF 是 TestReadBeyondEOF 的后端无关断言体。
+func assertReadBeyondEOF(t *testing.T, r Ring) {
+	t.Helper()
 	defer r.Close()
 
 	f := newTestFile(t, testChunk)
@@ -172,11 +191,16 @@ func TestReadBeyondEOF(t *testing.T) {
 }
 
 // TestWaitTimeout 无事件时 Wait 按超时返回 ErrTimeout 与空列表。
+// 零超时这一例同时校验「不阻塞进内核、纯 deadline 判定」这条路径。
 func TestWaitTimeout(t *testing.T) {
-	r, err := New(2)
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	for _, b := range testBackends(t) {
+		t.Run(b.name, func(t *testing.T) { assertWaitTimeout(t, b.new(t, 2)) })
 	}
+}
+
+// assertWaitTimeout 是 TestWaitTimeout 的后端无关断言体。
+func assertWaitTimeout(t *testing.T, r Ring) {
+	t.Helper()
 	defer r.Close()
 
 	zero := time.Duration(0)
@@ -186,5 +210,33 @@ func TestWaitTimeout(t *testing.T) {
 	}
 	if len(evs) != 0 {
 		t.Fatalf("want no events, got %d", len(evs))
+	}
+}
+
+// TestWaitTimeoutExpires 非零超时且无事件时，Wait 应在超时后返回 ErrTimeout。
+func TestWaitTimeoutExpires(t *testing.T) {
+	for _, b := range testBackends(t) {
+		t.Run(b.name, func(t *testing.T) { assertWaitTimeoutExpires(t, b.new(t, 2)) })
+	}
+}
+
+// assertWaitTimeoutExpires 校验非零超时路径：既不能提前返回，也不能一直挂着。
+func assertWaitTimeoutExpires(t *testing.T, r Ring) {
+	t.Helper()
+	defer r.Close()
+
+	d := 50 * time.Millisecond
+	start := time.Now()
+	evs, err := r.Wait(1, 4, &d)
+	elapsed := time.Since(start)
+
+	if err != ErrTimeout {
+		t.Fatalf("want ErrTimeout, got %v (evs=%v)", err, evs)
+	}
+	if len(evs) != 0 {
+		t.Fatalf("want no events, got %d", len(evs))
+	}
+	if elapsed < d/2 {
+		t.Fatalf("returned too early: %v < %v", elapsed, d/2)
 	}
 }

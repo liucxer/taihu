@@ -23,21 +23,25 @@ func alignedBuf(n int) []byte {
 	return b[start : start+n]
 }
 
-// TestRoundTripODirect 通过 libaio 对 O_DIRECT 文件做对齐读写往返。
+// TestRoundTripODirect 对 O_DIRECT 文件做对齐读写往返，每个后端各跑一遍。
 // 文件系统不支持 O_DIRECT（如 tmpfs）时跳过。
 func TestRoundTripODirect(t *testing.T) {
+	for _, b := range testBackends(t) {
+		t.Run(b.name, func(t *testing.T) { assertRoundTripODirect(t, b.new(t, 8)) })
+	}
+}
+
+// assertRoundTripODirect 是 TestRoundTripODirect 的后端无关断言体。
+func assertRoundTripODirect(t *testing.T, r Ring) {
+	t.Helper()
+	defer r.Close()
+
 	path := filepath.Join(t.TempDir(), "aio-odirect")
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_DIRECT, 0o600)
 	if err != nil {
 		t.Skipf("O_DIRECT unsupported: %v", err)
 	}
 	t.Cleanup(func() { _ = f.Close() })
-
-	r, err := New(8)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer r.Close()
 
 	fd := int(f.Fd())
 	data := pattern(0x3C, testChunk) // 测试文件内 pattern 分配非对齐缓冲，仅校验时用

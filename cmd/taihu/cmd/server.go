@@ -134,7 +134,11 @@ var serverCmd = &cobra.Command{
 		log.Printf("capacity %s: %d bytes = %d segments x %d", serverName, capacity, capacity/segSize, segSize)
 
 		l := layout.ComputeLayout(capacity, segSize)
-		storage, err := taihu.NewStorage(ctx, db, dev, l)
+		aioOpts, err := aioOptions()
+		if err != nil {
+			return err
+		}
+		storage, err := taihu.NewStorage(ctx, db, dev, l, aioOpts...)
 		if err != nil {
 			return fmt.Errorf("NewStorage: %w", err)
 		}

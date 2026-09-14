@@ -3,6 +3,7 @@
 package aio
 
 import (
+	"errors"
 	"io"
 	"os"
 	"sync"
@@ -26,8 +27,8 @@ type op struct {
 	done chan struct{}
 }
 
-// newRing 构建兜底队列。
-func newRing(maxEvents int) (Ring, error) {
+// newLibAIORing 构建兜底队列。非 Linux 平台没有 libaio，落到这里。
+func newLibAIORing(maxEvents int) (Ring, error) {
 	if maxEvents <= 0 {
 		return nil, errInvalidMaxEvents
 	}
@@ -35,6 +36,11 @@ func newRing(maxEvents int) (Ring, error) {
 		inflight: make(map[uint64]*op),
 		wake:     make(chan struct{}, 1),
 	}, nil
+}
+
+// newIOUringRing 非 Linux 平台没有 io_uring。
+func newIOUringRing(int, bool) (Ring, error) {
+	return nil, errors.New("aio: io_uring 仅 Linux 支持")
 }
 
 // SubmitRead 实现 Ring.SubmitRead。

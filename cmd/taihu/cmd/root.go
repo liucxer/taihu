@@ -10,6 +10,9 @@ import (
 	"github.com/pingcap/log"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap/zapcore"
+
+	"github.com/liucxer/taihu/internal/aio"
+	"github.com/liucxer/taihu/pkg/taihu"
 )
 
 // silenceTiKVLog 抑制 tikv client-go（pingcap/log）的 INFO/WARN 刷屏：CLI 输出
@@ -27,7 +30,11 @@ var global = struct {
 	clientName string        // 本客户端标识（标注 LOCAL、客户端清单过滤用）
 	timeout    time.Duration // 单次交互超时
 	json       bool          // 机器可读 JSON 输出
-}{timeout: 5 * time.Second}
+
+	// 磁盘异步 IO 后端（server 与 bench storage 生效，以命令行为准）。
+	ioUring    string // auto|on|off
+	ioUringIO  bool   // io_uring 的 IOPOLL 模式（仅 io_uring 后端生效，默认关）
+}{timeout: 5 * time.Second, ioUring: "auto"}
 
 // rootCmd 根命令：无子命令时打印帮助。
 var rootCmd = &cobra.Command{
@@ -84,6 +91,11 @@ func init() {
 	pf.DurationVar(&global.timeout, "timeout", 5*time.Second, "单次交互超时")
 	pf.BoolVar(&global.json, "json", false, "机器可读 JSON 输出")
 
+	pf.StringVar(&global.ioUring, "io-uring", "auto",
+		"磁盘异步 IO 后端：auto=内核支持 io_uring 则用（其余回退 libaio），on=强制 io_uring（不支持则启动失败），off=强制 libaio")
+	pf.BoolVar(&global.ioUringIO, "io-uring-iopoll", false,
+		"io_uring 启用 IOPOLL 轮询模式（仅 -io-uring 生效；需块设备 /sys/class/block/<dev>/queue/io_poll=1）")
+
 	rootCmd.AddCommand(
 		versionCmd,
 		serverCmd,
@@ -98,4 +110,17 @@ func init() {
 // ctxWithTimeout 返回带 timeout 的上下文（全局 -timeout）。
 func ctxWithTimeout(parent context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parent, global.timeout)
+}
+
+// aioOptions 把全局 -io-uring / -io-uring-iopoll 映射为 NewStorage 的选项。
+// 取值非法（非 auto|on|off）时在此报错，而不是静默按默认值跑。
+func aioOptions() ([]taihu.Option, error) {
+	m, err := aio.ParseMode(global.ioUring)
+	if err != nil {
+		return nil, err
+	}
+	return []taihu.Option{
+		taihu.WithAIOMode(m),
+		taihu.WithAIOIOPoll(global.ioUringIO),
+	}, nil
 }

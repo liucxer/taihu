@@ -65,14 +65,28 @@ type Device struct {
 }
 
 // NewDevice 打开裸设备文件并创建异步 IO 队列。segSize 为单段大小（layout.Layout.SegmentSizeBytes）。
-// 平台差异（O_DIRECT / 普通打开）在 openDevice 中处理。
+// 平台差异（O_DIRECT / 普通打开）在 openDevice 中处理；异步 IO 后端由 opts 选择（默认 auto）。
 // 返回 (*Device, error)，便于暴露打开失败。
-func NewDevice(ctx context.Context, nvmePath string, segSize int64) (*Device, error) {
+func NewDevice(ctx context.Context, nvmePath string, segSize int64, opts ...Option) (*Device, error) {
+	o := defaultOptions()
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	// IOPOLL 前置条件校验：只在确定会走 io_uring 时才校验，否则 auto 回退到
+	// libaio 的场景会被无谓地拦下。
+	if o.aioIOPoll && (o.aioMode == aio.ModeIOUring ||
+		(o.aioMode == aio.ModeAuto && aio.Probe().Supported)) {
+		if err := aio.CheckIOPoll(nvmePath); err != nil {
+			return nil, err
+		}
+	}
+
 	f, err := openDevice(nvmePath)
 	if err != nil {
 		return nil, fmt.Errorf("taihu: open device %q: %w", nvmePath, err)
 	}
-	ring, err := aio.New(aioDepth)
+	ring, err := aio.NewWithOptions(aioDepth, aio.Options{Mode: o.aioMode, IOPoll: o.aioIOPoll})
 	if err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("taihu: create aio ring: %w", err)
