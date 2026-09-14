@@ -4,7 +4,10 @@
 // 与 TCP 服务端（server.go）并存，TCP 路径零改动，本文件为纯增量。
 //
 // shmipc 流天然按请求隔离（双向流，客户端 GetStream/PutBack 复用），无 streamID，
-// 帧格式退化为 [4B len][1B op][payload]：len = 1 + len(payload)（大端）。
+// 帧格式退化为 [4B len][1B op][payload]：len = 1 + len(payload)（大端）；
+// 帧的读/写/提交原语在 shm_frame.go。本文件负责接受连接、按流分发，以及把
+// storage 的读结果按帧直写进共享内存（O_DIRECT 直写 → 客户端 O_DIRECT 直读）。
+//
 // 请求处理逻辑镜像 TCP 路径 handlePut/handleGet/handleDelete/handleStat，
 // 复用 Parse* 纯函数（ByteReader 解耦后 SliceReader 适配共享内存切片）与
 // storage.Put/ReadAt/Delete/Stat；共享内存按帧 Reserve，Flush 后 peer 即可读。
@@ -33,102 +36,6 @@ import (
 // 还是调用 ServeShmWithBatch —— 非 Linux 上 shm 数据面不可用，但 TCP 数据面
 // 照常，故应降级而非启动失败。
 func ShmSupported() bool { return true }
-
-// shm 帧常量：长度前缀 4B + op 1B；负载上限与 TCP 路径 ChunkSize 对齐。
-const (
-	shmLenPrefixLen = 4                             // [4B len]
-	shmOpLen        = 1                             // [1B op]
-	shmMaxFrameSize = shmOpLen + protocol.ChunkSize // 帧负载（op+payload）上限
-)
-
-// errShmBadFrame 畸形 shm 帧。
-var errShmBadFrame = errors.New("taihu: bad shm frame")
-
-// shmReadFrame 从 BufferReader 读一帧 [4B len][1B op][payload]，返回 op 与负载切片。
-// 单切片时负载零拷贝引用共享内存（fast path）；跨切片时 ReadBytes 慢路径汇入一次拷贝。
-// 返回后须由调用方在负载用毕后 ReleasePreviousRead 释放该帧 pin 的共享内存。
-//
-// 数据帧（OpGetData/OpGetDataFinal/OpPutData）在 op 后带 [ShmDataPad-5] 对齐 pad
-// （服务端 O_DIRECT 直读/直写布局），此处跳过 pad 再取负载；控制帧无 pad。
-func shmReadFrame(r shmipc.BufferReader) (op protocol.OpCode, payload []byte, err error) {
-	lb, err := r.ReadBytes(shmLenPrefixLen)
-	if err != nil {
-		return 0, nil, err
-	}
-	n := int(binary.BigEndian.Uint32(lb))
-	if n < shmOpLen || n > shmMaxFrameSize {
-		return 0, nil, errShmBadFrame
-	}
-	b, err := r.ReadBytes(shmOpLen)
-	if err != nil {
-		return 0, nil, err
-	}
-	op = protocol.OpCode(b[0])
-	if op == protocol.OpGetData || op == protocol.OpGetDataFinal || op == protocol.OpPutData {
-		// 数据帧：跳过对齐 pad，payload 从数据区起始（4K 对齐）读 n-1 字节。
-		if _, e := r.ReadBytes(protocol.ShmDataPad - shmLenPrefixLen - shmOpLen); e != nil {
-			return 0, nil, e
-		}
-	}
-	payload, err = r.ReadBytes(n - shmOpLen)
-	return op, payload, err
-}
-
-// shmWriteFrame 向流写一帧并 Flush。数据帧（OpGetData/OpGetDataFinal/OpPutData）统一布局
-// [5B 帧头][4091B pad][数据区]：pad 保证数据区 4K 对齐（服务端 O_DIRECT 直读/直写共享内存），
-// 直读/拷贝两条路径布局一致，对端 shmReadFrame 跳过 pad。控制帧不带 pad。
-// 帧头 + 负载一次 Reserve 进共享内存（数据帧零拷贝直写），Flush 返回后 peer 已可见。
-// 同步累加 statTx* 统计（与 TCP writeFrame 对齐）。客户端（shmipc_client.go）复用。
-func shmWriteFrame(st *shmipc.Stream, op protocol.OpCode, payload []byte) error {
-	statTxFrames.Add(1)
-	statTxBytes.Add(int64(len(payload)))
-	dataOff := 0
-	if op == protocol.OpGetData || op == protocol.OpGetDataFinal || op == protocol.OpPutData {
-		statTxDataFrames.Add(1)
-		statTxDataBytes.Add(int64(len(payload)))
-		if len(payload) == protocol.ChunkSize {
-			statTxData4M.Add(1)
-		}
-		dataOff = protocol.ShmDataPad
-	}
-	// 数据帧 dataOff=ShmDataPad 已含 [5B 帧头 + pad]（payload 从 ShmDataPad 起）；
-	// 控制帧 dataOff=0 需补 [4B len][1B op] 帧头。Reserve 长度必须与对端实际读取量
-	// 一致（帧头+pad+payload），否则对端 size()>0 导致 ReleasePreviousRead 不归还切片。
-	total := dataOff + len(payload)
-	if dataOff == 0 {
-		total += shmLenPrefixLen + shmOpLen
-	}
-	buf, err := st.BufferWriter().Reserve(total)
-	if err != nil {
-		return err
-	}
-	binary.BigEndian.PutUint32(buf[:shmLenPrefixLen], uint32(shmOpLen+len(payload)))
-	buf[shmLenPrefixLen] = byte(op)
-	// payload 起始：数据帧 = ShmDataPad（[0:5] 帧头 + [5:4096] pad 均在前 4096B 内）；
-	// 控制帧 = 帧头后（[5:]）。
-	payloadOff := dataOff
-	if dataOff == 0 {
-		payloadOff = shmLenPrefixLen + shmOpLen
-	}
-	copy(buf[payloadOff:], payload)
-	return st.Flush(false)
-}
-
-// shmCommitFrame 写数据帧帧头 [4B len][1B op] 并 Flush（数据已由调用方直写进
-// reserve 区，不再 copy）。head 为帧首区域 [0:5] 的共享内存引用（客户端零拷贝写
-// 时由 Reserve 返回的整区前 5B 提供）。同步累加 statTx* 统计（与 shmWriteFrame 对齐）。
-func shmCommitFrame(st *shmipc.Stream, head []byte, op protocol.OpCode, size int) error {
-	statTxFrames.Add(1)
-	statTxBytes.Add(int64(size))
-	statTxDataFrames.Add(1)
-	statTxDataBytes.Add(int64(size))
-	if size == protocol.ChunkSize {
-		statTxData4M.Add(1)
-	}
-	binary.BigEndian.PutUint32(head[:shmLenPrefixLen], uint32(shmOpLen+size))
-	head[shmLenPrefixLen] = byte(op)
-	return st.Flush(false)
-}
 
 // shmServer 共享内存 IPC 服务端。
 type shmServer struct {
@@ -305,7 +212,7 @@ func (s *shmServer) acceptLoop() {
 	for {
 		conn, err := s.ln.Accept()
 		if err != nil {
-			return // 监听关闭或异常
+			return
 		}
 		select {
 		case <-s.closed:
@@ -365,7 +272,7 @@ func (s *shmServer) handleStream(st *shmipc.Stream) {
 		default:
 			err = errShmStreamBroken
 		}
-		// 释放本请求帧（及 Put 逐帧消费后遗留）pin 的共享内存。
+
 		r.ReleasePreviousRead()
 		if err != nil {
 			break
@@ -399,7 +306,7 @@ func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, paylo
 		return s.shmRespErr(st, protocol.OpResp, protocol.CodeTooLarge)
 	}
 	if size == 0 {
-		// 消费 PutEnd（客户端恒发），保持流干净可复用。
+
 		op, _, err := shmReadFrame(r)
 		if err != nil {
 			return err
@@ -417,8 +324,6 @@ func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, paylo
 		return shmWriteFrame(st, protocol.OpResp, protocol.EncCode(protocol.CodeOK))
 	}
 
-	// 分段直写：PutHeader 分配段游标，每个 PutData 帧（payload 4K 对齐）直接
-	// O_DIRECT 直写共享内存切片（免 bufpool 汇集拷贝），IO 完成后即时归还本帧切片。
 	seg, off, err := s.storage.PutBegin(context.Background(), key, size)
 	if err != nil {
 		return s.shmRespErr(st, protocol.OpResp, protocol.MapStorageErr(err))
@@ -438,7 +343,7 @@ func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, paylo
 				return s.shmRespErr(st, protocol.OpResp, protocol.MapStorageErr(err))
 			}
 			pos += int64(len(p))
-			// 释放本帧 pin；当前帧为 front 切片，在下次 shmReadFrame 时才移入 pinnedList。
+
 			r.ReleasePreviousRead()
 		case protocol.OpPutEnd:
 			if pos != size {
@@ -479,18 +384,14 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 		return shmWriteFrame(st, protocol.OpGetErr, protocol.EncCode(protocol.CodeInvalidRange))
 	}
 	pos, end := off, off+size
-	// 批读快路径（多 stream 聚合）：请求恰为单个对齐整块（off 4K 对齐且段长==ChunkSize）时，
-	// 送入批协调器与其它 stream 的读合并为一次 io_submit 批量提交，摊薄系统调用。仅此
-	// 场景走批读；多块/尾块/非对齐仍走下方确定性单链/回退路径。
+
 	if s.batched != nil && pos%layout.BlockSize == 0 && end-pos == protocol.ChunkSize {
 		_, rerr := s.shmWriteDataFrameBatch(st, s.batched, key, pos, end-pos, end)
-		// 无论 full read / 短读 EOF / 错误帧，均已整帧发出，读完毕。
+
 		_ = rerr
 		return nil
 	}
-	// 对齐快路径（整请求单链）：当 off 4K 对齐时，把 [pos,end) 内所有整 4MiB 块一次收进
-	// 同一条链并发直读（shmWriteDataFramesChain 整链一次 Flush 保序，多块并行 DMA 提升
-	// 磁盘队列深度）。off 非对齐或段长不足整块的尾块交给下方串行回退路径。
+
 	if off%layout.BlockSize == 0 {
 		var slots []getSlot
 		for q := off; q < end; {
@@ -499,45 +400,42 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 				want = protocol.ChunkSize
 			}
 			if want != protocol.ChunkSize || want%layout.BlockSize != 0 {
-				break // 非整块（尾块）或非对齐，留给下方回退路径
+				break
 			}
 			slots = append(slots, getSlot{pos: q, want: want, dlen: layout.Align4k(want)})
 			q += want
 		}
 		if len(slots) > 0 {
 			done, red, served := shmWriteDataFramesChain(st, s.storage, key, slots, end)
-			// pos 只推进已实际 Reserve 的槽数；未 Reserve 部分（池耗尽截断）留给回退路径
-			// 续读，避免旧循环收集时提前推进 pos 造成整块区间被跳过（客户端缺帧挂死）。
+
 			pos = slots[0].pos + int64(served)*protocol.ChunkSize
 			if red != nil {
-				return nil // 错误帧已整链发出，读完毕
+				return nil
 			}
 			if done {
-				return nil // final 帧已发，读完毕
+				return nil
 			}
 		}
 	}
-	// 串行回退/尾块：off 非对齐，或段末不足整块的尾块（或单链 Reserve 截断后的残留）。
+
 	for pos < end {
 		want := end - pos
 		if want > protocol.ChunkSize {
 			want = protocol.ChunkSize
 		}
-		// 直读快路径：pos 与 want 均 4K 对齐（帧 Reserve 长度 = pad+dlen = pad+want，
-		// 对端读满后 size()==0 归还切片）。尾帧（want 非 4K 对齐）走回退路径（精确
-		// Reserve + 拷贝，dlen 对齐余量会导致对端读不满泄漏切片）。
+
 		if pos%layout.BlockSize == 0 && want%layout.BlockSize == 0 {
 			n, rerr := shmWriteDataFrameDirect(st, s.storage, key, pos, want, end)
 			if rerr != nil {
 				if rerr == io.EOF {
-					return nil // final 帧（含空短读兜底）已发，读完毕
+					return nil
 				}
 				return shmWriteFrame(st, protocol.OpGetErr, protocol.EncCode(protocol.MapStorageErr(rerr)))
 			}
 			pos += n
 			continue
 		}
-		// 回退路径：非对齐 off，bufpool 读 + 拷贝写。
+
 		data, rerr := s.storage.ReadAt(context.Background(), key, pos, want)
 		if len(data) > 0 {
 			op := protocol.OpCode(protocol.OpGetData)
@@ -553,7 +451,7 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 		}
 		if rerr == io.EOF {
 			if len(data) == 0 {
-				// 空短读兜底：发空 final 帧让客户端报 short read，避免客户端挂死。
+
 				_ = shmWriteFrame(st, protocol.OpGetDataFinal, nil)
 			}
 			return nil
@@ -578,15 +476,14 @@ func (s *shmServer) shmWriteDataFrameBatch(st *shmipc.Stream, b *shmBatchReader,
 	if err != nil {
 		return 0, err
 	}
-	// 占位错误帧头 [4B len=5][1B op=OpGetErr][4B 错误码]：批读失败时客户端直接收错误帧，
-	// 不会读到未写帧头的垃圾切片。
+
 	binary.BigEndian.PutUint32(buf[:shmLenPrefixLen], uint32(shmOpLen+4))
 	buf[shmLenPrefixLen] = byte(protocol.OpGetErr)
 	copy(buf[shmLenPrefixLen+shmOpLen:], protocol.EncCode(protocol.CodeInternal))
 
 	n, final, rerr := b.submit(key, pos, want, buf[protocol.ShmDataPad:protocol.ShmDataPad+dlen])
 	if rerr != nil {
-		// 批读失败：更新错误码后 Flush 错误帧。
+
 		copy(buf[shmLenPrefixLen+shmOpLen:], protocol.EncCode(protocol.MapStorageErr(rerr)))
 		statTxFrames.Add(1)
 		statTxBytes.Add(4)
@@ -595,7 +492,7 @@ func (s *shmServer) shmWriteDataFrameBatch(st *shmipc.Stream, b *shmBatchReader,
 		}
 		return 0, rerr
 	}
-	// 成功：更新帧头为数据帧，len = op(1) + payload 字节数；final 帧按批完成判定。
+
 	op := byte(protocol.OpGetData)
 	if final {
 		op = byte(protocol.OpGetDataFinal)
@@ -630,15 +527,14 @@ func shmWriteDataFrameDirect(st *shmipc.Stream, storage *taihu.Storage, key stri
 	if err != nil {
 		return 0, err
 	}
-	// 占位错误帧头 [4B len=5][1B op=OpGetErr][4B 错误码]：直读失败时客户端直接收错误帧，
-	// 不会读到未写帧头的垃圾切片。
+
 	binary.BigEndian.PutUint32(buf[:shmLenPrefixLen], uint32(shmOpLen+4))
 	buf[shmLenPrefixLen] = byte(protocol.OpGetErr)
 	copy(buf[shmLenPrefixLen+shmOpLen:], protocol.EncCode(protocol.CodeInternal))
 	ctx := context.Background()
 	n, rerr := storage.ReadAtInto(ctx, key, pos, want, buf[protocol.ShmDataPad:protocol.ShmDataPad+dlen])
 	if rerr != nil && rerr != io.EOF {
-		// 直读失败：更新错误码后 Flush 错误帧，复用 EOF 收尾语义（错误帧已发）。
+
 		copy(buf[shmLenPrefixLen+shmOpLen:], protocol.EncCode(protocol.MapStorageErr(rerr)))
 		statTxFrames.Add(1)
 		statTxBytes.Add(4)
@@ -647,14 +543,14 @@ func shmWriteDataFrameDirect(st *shmipc.Stream, storage *taihu.Storage, key stri
 		}
 		return 0, io.EOF
 	}
-	// 成功：更新帧头为数据帧，len = op(1) + payload 字节数；final 帧按读完毕判定。
+
 	op := byte(protocol.OpGetData)
 	if pos+n >= end || rerr == io.EOF {
 		op = byte(protocol.OpGetDataFinal)
 	}
 	binary.BigEndian.PutUint32(buf[:shmLenPrefixLen], uint32(shmOpLen+n))
 	buf[shmLenPrefixLen] = op
-	// 同步累加 statTx* 统计（与 shmWriteFrame 对齐）。
+
 	statTxFrames.Add(1)
 	statTxBytes.Add(n)
 	statTxDataFrames.Add(1)
@@ -702,7 +598,7 @@ type getSlot struct {
 // 返回 done（对象已读毕，末槽已发 final）、rerr（首个非 EOF 读错误，错误帧已整链发出）
 // 与 served（实际 Reserve 的槽数，≤ len(slots)）。
 func shmWriteDataFramesChain(st *shmipc.Stream, storage *taihu.Storage, key string, slots []getSlot, end int64) (done bool, rerr error, served int) {
-	// Phase A：串行按序 Reserve + 占位错误帧头。
+
 	for i := range slots {
 		buf, err := st.BufferWriter().Reserve(protocol.ShmDataPad + int(slots[i].dlen))
 		if err != nil {
@@ -715,7 +611,7 @@ func shmWriteDataFramesChain(st *shmipc.Stream, storage *taihu.Storage, key stri
 		served++
 	}
 	if served == 0 {
-		return false, nil, 0 // 未 Reserve 到任何切片，交由调用方回退路径
+		return false, nil, 0
 	}
 	slots = slots[:served]
 
@@ -729,7 +625,7 @@ func shmWriteDataFramesChain(st *shmipc.Stream, storage *taihu.Storage, key stri
 				sl.buf[protocol.ShmDataPad:protocol.ShmDataPad+sl.dlen])
 			sl.n, sl.rerr = n, rerr2
 			if rerr2 != nil && rerr2 != io.EOF {
-				// 直读失败：填错误码，错帧随整链发。
+
 				copy(sl.buf[shmLenPrefixLen+shmOpLen:], protocol.EncCode(protocol.MapStorageErr(rerr2)))
 				statTxFrames.Add(1)
 				statTxBytes.Add(4)
@@ -752,7 +648,6 @@ func shmWriteDataFramesChain(st *shmipc.Stream, storage *taihu.Storage, key stri
 	}
 	wg.Wait()
 
-	// Phase C：单次 Flush 整链。
 	if err := st.Flush(false); err != nil {
 		return false, err, served
 	}

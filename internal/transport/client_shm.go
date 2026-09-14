@@ -1,7 +1,7 @@
 //go:build linux
 
 // 共享内存 IPC 客户端（shmipc-go）：数据面共享内存零拷贝，控制面 unix socket。
-// 与 TCP 客户端（conn.go）并存、接口同构（rpcclient.rpcConn），调用方可无感切换。
+// 与 TCP 客户端（client.go）并存、接口同构（rpcclient.rpcConn），调用方可无感切换。
 //
 // 连接为一个 SessionManager（sessions 条会话：各自独立 unix socket + 共享内存），
 // GetStream/PutBack 流复用。帧协议与服务端一致：[4B len][1B op][payload]。

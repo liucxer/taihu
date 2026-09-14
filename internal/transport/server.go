@@ -8,8 +8,8 @@
 //	streamID 用于连接内多路复用（每次 RPC 独占一个 stream）。
 //
 // 两条数据面共用同一套帧协议，仅承载方式不同：
-//   - TCP：netpoll 连接 + LinkBuffer，多 stream 并发多路复用（conn.go / server.go）。
-//   - shm：shmipc 共享内存，数据帧 4K 对齐供服务端 O_DIRECT 直读（shmipc_*.go）。
+//   - TCP：netpoll 连接 + LinkBuffer，多 stream 并发多路复用（frame.go / client.go / server.go）。
+//   - shm：shmipc 共享内存，数据帧 4K 对齐供服务端 O_DIRECT 直读（shm_frame.go / client_shm.go / server_shm.go）。
 //
 // 零拷贝路径：
 //   - 读：连接读循环 Peek 帧头、Slice 整帧（阻塞至就绪，Slice 生成零拷贝子 Reader），

@@ -26,8 +26,11 @@ conn.go:30:10: undefined: netpoll.SetInputNodeSize
 
 **注意：** 这里的关键在于 `internal/transport` 是通过**匿名接口类型断言**使用 fork 新增 API 的：
 
-- `conn.go:384`：`msg.r.(interface{ TakeTry() ([]byte, []byte, bool) })`
-- `conn.go:404`：`msg.r.(interface{ ReadCopy([]byte) (int, error) })`
+- `internal/transport/client.go:187`：`msg.r.(interface{ TakeTry() ([]byte, []byte, bool) })`
+- `internal/transport/client.go:206`：`msg.r.(interface{ ReadCopy([]byte) (int, error) })`
+
+（写这份文档时这两处在 `conn.go`，该文件此后拆成了 `frame.go` + `client.go`，故路径已更新；
+上面那段消费者报错里的 `conn.go:28` 是当时编译器的原始输出，保留原样。）
 
 断言是**结构性**的——上游 netpoll 的 `*UnsafeLinkBuffer` 没有这两个方法，断言恒为 false，
 零拷贝路径会静默退化成拷贝路径或直接失败。所以「消费者拿到上游版本」不是编译报错那么简单，
