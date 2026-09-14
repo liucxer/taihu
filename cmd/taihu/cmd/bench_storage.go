@@ -106,7 +106,7 @@ var benchStorageCmd = &cobra.Command{
 			stopCPUProfile(cpuFile)
 			return err
 		}
-		s, err := taihu.NewStorage(ctx, c.dbDir, c.devPath, l, aioOpts...)
+		s, err := storage.NewStorage(ctx, c.dbDir, c.devPath, l, aioOpts...)
 		if err != nil {
 			stopCPUProfile(cpuFile)
 			return fmt.Errorf("NewStorage: %w", err)
@@ -233,7 +233,7 @@ func (c *storageBenchConfig) keyFor(seq int) string {
 
 // runWorker 处理区间 [s0,e0)：write 逐个 Put，read 逐个 Get 整对象。
 // randOrder 时 read 在区间内按随机顺序访问 key（每个 key 仍恰好被访问一次）。
-func runWorker(ctx context.Context, s *taihu.Storage, c *storageBenchConfig, s0, e0 int, ops *atomic.Int64, lat *latencyCollector) error {
+func runWorker(ctx context.Context, s *storage.Storage, c *storageBenchConfig, s0, e0 int, ops *atomic.Int64, lat *latencyCollector) error {
 	payload := make([]byte, int(c.size))
 
 	// 随机读：先构造区间内 key 序列并打乱（seq 即 key 序号）。

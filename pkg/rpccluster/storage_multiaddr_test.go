@@ -25,7 +25,7 @@ func multiAddrTestServerPair(t *testing.T) (string, string) {
 	if err := os.WriteFile(devPath, nil, 0o644); err != nil {
 		t.Fatalf("create device: %v", err)
 	}
-	storage, err := taihu.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
+	storage, err := storage.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
 		layout.Layout{SegmentSizeBytes: layout.DefaultSegmentSizeBytes, SegmentCount: 2048})
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
@@ -59,7 +59,7 @@ func multiAddrTestServer(t *testing.T) string {
 	if err := os.WriteFile(devPath, nil, 0o644); err != nil {
 		t.Fatalf("create device: %v", err)
 	}
-	storage, err := taihu.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
+	storage, err := storage.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
 		layout.Layout{SegmentSizeBytes: layout.DefaultSegmentSizeBytes, SegmentCount: 2048})
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)

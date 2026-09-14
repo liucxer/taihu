@@ -1,4 +1,4 @@
-package taihu
+package storage
 
 import "github.com/liucxer/taihu/internal/aio"
 

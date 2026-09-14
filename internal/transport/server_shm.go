@@ -39,7 +39,7 @@ func ShmSupported() bool { return true }
 
 // shmServer 共享内存 IPC 服务端。
 type shmServer struct {
-	storage *taihu.Storage
+	storage *storage.Storage
 	ln      *net.UnixListener
 	conf    *shmipc.Config
 
@@ -52,7 +52,7 @@ type shmServer struct {
 // ServeShm 在 unix socket 路径 uds 上提供 shmipc 服务，返回 io.Closer 关闭服务。
 // 与 TCP 监听（Server.Serve）互不干扰，可同时启用。共享内存由客户端创建并传入
 // （MemFd），服务端仅映射，因此本处配置只须通过 shmipc.VerifyConfig。
-func ServeShm(storage *taihu.Storage, uds string) (io.Closer, error) {
+func ServeShm(storage *storage.Storage, uds string) (io.Closer, error) {
 	return ServeShmWithBatch(storage, uds, 0, 0)
 }
 
@@ -83,7 +83,7 @@ type shmBatchResult struct {
 // 在途持有的切片数与并发在途 Get 相同（不额外占用共享内存池）；只在攒批/批提交窗口
 // 内短暂延后 DMA。批内任一返回错误仍按任务独立回写，不污染后续请求。
 type shmBatchReader struct {
-	storage *taihu.Storage
+	storage *storage.Storage
 	target  int           // 攒满即提交的批量
 	timeout time.Duration // 未攒满时的最大攒批等待
 	workers []chan *shmBatchTask
@@ -92,7 +92,7 @@ type shmBatchReader struct {
 
 // newShmBatchReader 构建批读协调器并启动 worker 池。target<=0 表示不启用。K 为 worker 数
 // （整机在途 ≈ K×target；K*target 过大逼近共享内存池上限时并发流会储备失败）。
-func newShmBatchReader(st *taihu.Storage, target, workers int) *shmBatchReader {
+func newShmBatchReader(st *storage.Storage, target, workers int) *shmBatchReader {
 	if target <= 0 {
 		return nil
 	}
@@ -131,9 +131,9 @@ func (b *shmBatchReader) run(in chan *shmBatchTask) {
 		}
 		batch := drain
 		drain = nil
-		blocks := make([]taihu.BatchReadBlock, len(batch))
+		blocks := make([]storage.BatchReadBlock, len(batch))
 		for i, tk := range batch {
-			blocks[i] = taihu.BatchReadBlock{Key: tk.key, Off: tk.pos, Size: tk.want, Dst: tk.buf}
+			blocks[i] = storage.BatchReadBlock{Key: tk.key, Off: tk.pos, Size: tk.want, Dst: tk.buf}
 		}
 		res, berr := b.storage.BatchRead(context.Background(), blocks)
 		for i, tk := range batch {
@@ -181,7 +181,7 @@ func (b *shmBatchReader) submit(key string, pos, want int64, buf []byte) (int64,
 // 批量提交。batchWorkers 为 worker 池大小（>1 并行批提交，避免单 worker 串行化整机并发）。
 // batchTarget<=0 时退化为常规 ServeShm（每块独立直读）。
 // 返回 io.Closer 关闭服务。共享内存由客户端创建传入（MemFd），服务端仅映射。
-func ServeShmWithBatch(storage *taihu.Storage, uds string, batchTarget, batchWorkers int) (io.Closer, error) {
+func ServeShmWithBatch(storage *storage.Storage, uds string, batchTarget, batchWorkers int) (io.Closer, error) {
 	conf := shmipc.DefaultConfig()
 	_ = os.Remove(uds)
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: uds, Net: "unix"})
@@ -521,7 +521,7 @@ func (s *shmServer) shmWriteDataFrameBatch(st *shmipc.Stream, b *shmBatchReader,
 // 空短读（n==0 && EOF）与直读失败（错误码帧已发）均返回 (0, io.EOF)：前者发空 final
 // 帧（对端报 short read），后者已发 OpGetErr 错误帧；调用方按 EOF 收尾即可，不再追加
 // 错误帧（避免未写帧头的直读切片污染流）。
-func shmWriteDataFrameDirect(st *shmipc.Stream, storage *taihu.Storage, key string, pos, want, end int64) (int64, error) {
+func shmWriteDataFrameDirect(st *shmipc.Stream, storage *storage.Storage, key string, pos, want, end int64) (int64, error) {
 	dlen := layout.Align4k(want)
 	buf, err := st.BufferWriter().Reserve(protocol.ShmDataPad + int(dlen))
 	if err != nil {
@@ -597,7 +597,7 @@ type getSlot struct {
 //
 // 返回 done（对象已读毕，末槽已发 final）、rerr（首个非 EOF 读错误，错误帧已整链发出）
 // 与 served（实际 Reserve 的槽数，≤ len(slots)）。
-func shmWriteDataFramesChain(st *shmipc.Stream, storage *taihu.Storage, key string, slots []getSlot, end int64) (done bool, rerr error, served int) {
+func shmWriteDataFramesChain(st *shmipc.Stream, storage *storage.Storage, key string, slots []getSlot, end int64) (done bool, rerr error, served int) {
 
 	for i := range slots {
 		buf, err := st.BufferWriter().Reserve(protocol.ShmDataPad + int(slots[i].dlen))

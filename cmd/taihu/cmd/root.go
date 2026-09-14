@@ -114,13 +114,13 @@ func ctxWithTimeout(parent context.Context) (context.Context, context.CancelFunc
 
 // aioOptions 把全局 -io-uring / -io-uring-iopoll 映射为 NewStorage 的选项。
 // 取值非法（非 auto|on|off）时在此报错，而不是静默按默认值跑。
-func aioOptions() ([]taihu.Option, error) {
+func aioOptions() ([]storage.Option, error) {
 	m, err := aio.ParseMode(global.ioUring)
 	if err != nil {
 		return nil, err
 	}
-	return []taihu.Option{
-		taihu.WithAIOMode(m),
-		taihu.WithAIOIOPoll(global.ioUringIO),
+	return []storage.Option{
+		storage.WithAIOMode(m),
+		storage.WithAIOIOPoll(global.ioUringIO),
 	}, nil
 }

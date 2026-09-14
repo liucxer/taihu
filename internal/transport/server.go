@@ -37,14 +37,14 @@ import (
 // Serve/GracefulStop/Stop 生命周期）。每连接一个读循环，帧按 streamID 分发给
 // 独立 goroutine 处理器，Put/Get/Delete/Stat 语义与旧 gRPC 服务端一致。
 type Server struct {
-	storage *taihu.Storage
+	storage *storage.Storage
 
 	mu  sync.Mutex
 	els []netpoll.EventLoop // 多 listener 场景：每 Serve 一个 EventLoop，停机时全部 Shutdown
 }
 
 // NewServer 构建服务端。
-func NewServer(storage *taihu.Storage) *Server {
+func NewServer(storage *storage.Storage) *Server {
 	return &Server{storage: storage}
 }
 

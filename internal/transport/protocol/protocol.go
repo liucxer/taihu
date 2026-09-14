@@ -112,13 +112,13 @@ const (
 // MapStorageErr 将库错误映射为错误码（对应旧 gRPC status 映射）。
 func MapStorageErr(err error) ErrCode {
 	switch {
-	case errors.Is(err, taihu.ErrNotFound):
+	case errors.Is(err, storage.ErrNotFound):
 		return CodeNotFound
-	case errors.Is(err, taihu.ErrInvalidRange):
+	case errors.Is(err, storage.ErrInvalidRange):
 		return CodeInvalidRange
-	case errors.Is(err, taihu.ErrTooLarge):
+	case errors.Is(err, storage.ErrTooLarge):
 		return CodeTooLarge
-	case errors.Is(err, taihu.ErrNoSpace):
+	case errors.Is(err, storage.ErrNoSpace):
 		return CodeNoSpace
 	default:
 		return CodeInternal
@@ -131,13 +131,13 @@ func MapCode(c ErrCode) error {
 	case CodeOK:
 		return nil
 	case CodeNotFound:
-		return taihu.ErrNotFound
+		return storage.ErrNotFound
 	case CodeInvalidRange:
-		return taihu.ErrInvalidRange
+		return storage.ErrInvalidRange
 	case CodeTooLarge:
-		return taihu.ErrTooLarge
+		return storage.ErrTooLarge
 	case CodeNoSpace:
-		return taihu.ErrNoSpace
+		return storage.ErrNoSpace
 	case CodeInvalidArgument:
 		return errors.New("taihu: invalid argument")
 	default:

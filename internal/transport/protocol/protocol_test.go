@@ -387,10 +387,10 @@ func TestParseHugeDeclaredKeyLenDoesNotAllocate(t *testing.T) {
 
 func TestMapStorageErrAndMapCodeRoundTrip(t *testing.T) {
 	mapped := []error{
-		taihu.ErrNotFound,
-		taihu.ErrInvalidRange,
-		taihu.ErrTooLarge,
-		taihu.ErrNoSpace,
+		storage.ErrNotFound,
+		storage.ErrInvalidRange,
+		storage.ErrTooLarge,
+		storage.ErrNoSpace,
 	}
 	for _, err := range mapped {
 		code := MapStorageErr(err)

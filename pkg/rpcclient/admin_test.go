@@ -45,7 +45,7 @@ func TestAdminMeta(t *testing.T) {
 	ctx := context.Background()
 
 	// 缺失 key → ErrNotFound。
-	if _, err := s.Meta(ctx, "no-such-key"); err != taihu.ErrNotFound {
+	if _, err := s.Meta(ctx, "no-such-key"); err != storage.ErrNotFound {
 		t.Fatalf("Meta missing: %v, want ErrNotFound", err)
 	}
 
@@ -53,7 +53,7 @@ func TestAdminMeta(t *testing.T) {
 	if err := s.Put(ctx, "m1", size, make([]byte, size)); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	var m taihu.ObjectMeta
+	var m storage.ObjectMeta
 	m, err = s.Meta(ctx, "m1")
 	if err != nil {
 		t.Fatalf("Meta: %v", err)
@@ -82,8 +82,8 @@ func TestAdminSegments(t *testing.T) {
 	}
 
 	// 新实例初始无 Free 段（段状态表随首次写入创建）；至少应有 Active 段。
-	var sum taihu.SegmentSummary
-	var entries []taihu.SegmentEntry
+	var sum storage.SegmentSummary
+	var entries []storage.SegmentEntry
 	sum, entries, err = s.Segments(ctx)
 	if err != nil {
 		t.Fatalf("Segments: %v", err)

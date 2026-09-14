@@ -22,11 +22,11 @@ var instanceCmd = &cobra.Command{
 
 // segResult JSON 形态的单实例段汇总+明细。
 type segResult struct {
-	Name     string               `json:"name"`
-	Addr     string               `json:"addr"`
-	Summary  taihu.SegmentSummary `json:"summary"`
-	Segments []taihu.SegmentEntry `json:"segments,omitempty"`
-	Error    string               `json:"error,omitempty"`
+	Name     string                 `json:"name"`
+	Addr     string                 `json:"addr"`
+	Summary  storage.SegmentSummary `json:"summary"`
+	Segments []storage.SegmentEntry `json:"segments,omitempty"`
+	Error    string                 `json:"error,omitempty"`
 }
 
 // instanceSegmentsCmd 查询每个实例的 segment 信息（汇总 + -detail 明细）。

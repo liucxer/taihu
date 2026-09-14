@@ -22,7 +22,7 @@ var (
 )
 
 // Storage 集群对象存储：写=本地优先选实例（首写锚定），读=本地实例直查 →
-// 索引定位远端 → 回源重建。实现 taihu.ObjectStore + Get/Stat/Close。
+// 索引定位远端 → 回源重建。实现 storage.ObjectStore + Get/Stat/Close。
 // 数据面复用 rpcclient.Storage（netpoll 零拷贝），定位层不进数据面热路径。
 //
 // 约束（设计文档）：key 不可变（无覆盖写）；更新语义=Delete 后重建；
@@ -45,7 +45,7 @@ type Storage struct {
 	clientID     string
 }
 
-var _ taihu.ObjectStore = (*Storage)(nil)
+var _ storage.ObjectStore = (*Storage)(nil)
 
 // NewCluster 构建集群客户端并启动发现/索引后台任务。
 func NewCluster(cfg ClusterConfig) (*Storage, error) {
@@ -200,7 +200,7 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in []byte) er
 func (s *Storage) Get(ctx context.Context, key string, off, size int64) ([]byte, func(), error) {
 	// 1) 路由缓存优先（写路径已记录 key→实例名），2) 未命中查 TiKV 索引
 	if inst, ok := s.lookup(ctx, key); ok {
-		if data, rel, err := s.getFrom(ctx, key, off, size, []cluster.InstanceInfo{inst}); err != taihu.ErrNotFound {
+		if data, rel, err := s.getFrom(ctx, key, off, size, []cluster.InstanceInfo{inst}); err != storage.ErrNotFound {
 			return data, rel, err
 		}
 	}
@@ -246,11 +246,11 @@ func (s *Storage) getFrom(ctx context.Context, key string, off, size int64, inst
 		if err == nil {
 			return data, rel, nil
 		}
-		if err != taihu.ErrNotFound {
+		if err != storage.ErrNotFound {
 			return nil, nil, err
 		}
 	}
-	return nil, nil, taihu.ErrNotFound
+	return nil, nil, storage.ErrNotFound
 }
 
 // lookup 路由缓存 → 索引，解析为活跃实例。
@@ -283,7 +283,7 @@ func (s *Storage) getFromSource(ctx context.Context, key string, off, size int64
 	}
 	n := int64(len(data))
 	if off < 0 || off > n {
-		return nil, nil, taihu.ErrInvalidRange
+		return nil, nil, storage.ErrInvalidRange
 	}
 	if size < 0 || off+size > n {
 		size = n - off
@@ -297,14 +297,14 @@ func (s *Storage) getFromSource(ctx context.Context, key string, off, size int64
 func (s *Storage) Delete(ctx context.Context, key string) error {
 	if inst, ok := s.lookup(ctx, key); ok {
 		if c, err := s.clientFor(inst); err == nil {
-			if err := c.Delete(ctx, key); err != nil && err != taihu.ErrNotFound {
+			if err := c.Delete(ctx, key); err != nil && err != storage.ErrNotFound {
 				return err
 			}
 		}
 	} else {
 		for _, inst := range s.registry.Snapshot().local {
 			if c, err := s.clientFor(inst); err == nil {
-				if err := c.Delete(ctx, key); err != nil && err != taihu.ErrNotFound {
+				if err := c.Delete(ctx, key); err != nil && err != storage.ErrNotFound {
 					return err
 				}
 			}
@@ -321,7 +321,7 @@ func (s *Storage) Stat(ctx context.Context, key string) (int64, error) {
 		if c, err := s.clientFor(inst); err == nil {
 			if n, err := c.Stat(ctx, key); err == nil {
 				return n, nil
-			} else if err != taihu.ErrNotFound {
+			} else if err != storage.ErrNotFound {
 				return 0, err
 			}
 		}
@@ -331,7 +331,7 @@ func (s *Storage) Stat(ctx context.Context, key string) (int64, error) {
 			return c.Stat(ctx, key)
 		}
 	}
-	return 0, taihu.ErrNotFound
+	return 0, storage.ErrNotFound
 }
 
 // Close 停止后台任务并关闭全部数据面连接；SDK 客户端保活同时注销注册记录。

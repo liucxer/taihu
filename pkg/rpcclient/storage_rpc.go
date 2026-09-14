@@ -18,7 +18,7 @@ type rpcConn interface {
 }
 
 // Storage 远程对象存储实现（设计文档_v3 §5.1，整对象 []byte 语义）。
-// Put/Delete/Stat 与本地 taihu.Storage 同签名；读路径本地为 ReadAt（返回池化缓冲，
+// Put/Delete/Stat 与本地 storage.Storage 同签名；读路径本地为 ReadAt（返回池化缓冲，
 // 须 bufpool.Put 归还），远端 Get 返回 (data, release, err)——data 为整块数据，
 // 调用方用毕调用 release()（幂等）归还（内部经 bufpool）。内部可持有 1..n 条
 // 连接（DialPool：netpoll TCP；DialShmPool：shmipc 共享内存），RPC 按 round-robin
@@ -32,7 +32,7 @@ type Storage struct {
 	rr    uint64 // round-robin 分发计数器（原子）
 }
 
-var _ taihu.ObjectStore = (*Storage)(nil)
+var _ storage.ObjectStore = (*Storage)(nil)
 
 // Close 关闭全部底层连接。
 func (s *Storage) Close() error {

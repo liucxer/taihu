@@ -29,29 +29,29 @@ func (s *Storage) Ping(ctx context.Context) (rtt time.Duration, serverTime int64
 }
 
 // Meta 返回对象落盘元数据（segment/offset/size）；key 不存在返回 ErrNotFound。
-func (s *Storage) Meta(ctx context.Context, key string) (taihu.ObjectMeta, error) {
+func (s *Storage) Meta(ctx context.Context, key string) (storage.ObjectMeta, error) {
 	conn, err := s.adminConn()
 	if err != nil {
-		return taihu.ObjectMeta{}, err
+		return storage.ObjectMeta{}, err
 	}
 	segID, off, size, err := conn.Meta(ctx, key)
 	if err != nil {
-		return taihu.ObjectMeta{}, err
+		return storage.ObjectMeta{}, err
 	}
-	return taihu.ObjectMeta{SegmentID: segID, Offset: off, Size: size}, nil
+	return storage.ObjectMeta{SegmentID: segID, Offset: off, Size: size}, nil
 }
 
 // Segments 返回段汇总与全部段明细。
-func (s *Storage) Segments(ctx context.Context) (taihu.SegmentSummary, []taihu.SegmentEntry, error) {
+func (s *Storage) Segments(ctx context.Context) (storage.SegmentSummary, []storage.SegmentEntry, error) {
 	conn, err := s.adminConn()
 	if err != nil {
-		return taihu.SegmentSummary{}, nil, err
+		return storage.SegmentSummary{}, nil, err
 	}
 	sum, entries, err := conn.Segments(ctx)
 	if err != nil {
-		return taihu.SegmentSummary{}, nil, err
+		return storage.SegmentSummary{}, nil, err
 	}
-	tsum := taihu.SegmentSummary{
+	tsum := storage.SegmentSummary{
 		Total:       sum.Total,
 		Free:        sum.Free,
 		Active:      sum.Active,
@@ -62,9 +62,9 @@ func (s *Storage) Segments(ctx context.Context) (taihu.SegmentSummary, []taihu.S
 		SegSize:     sum.SegSize,
 		ObjectCount: sum.ObjectCount,
 	}
-	tentries := make([]taihu.SegmentEntry, 0, len(entries))
+	tentries := make([]storage.SegmentEntry, 0, len(entries))
 	for _, e := range entries {
-		tentries = append(tentries, taihu.SegmentEntry{
+		tentries = append(tentries, storage.SegmentEntry{
 			SegmentID:  e.SegmentID,
 			State:      metastoreSegmentState(e.State),
 			AliveCount: e.AliveCount,

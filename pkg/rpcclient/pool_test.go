@@ -27,7 +27,7 @@ func newTestServer(t *testing.T) (string, func()) {
 	}
 	_ = f.Close()
 
-	storage, err := taihu.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
+	storage, err := storage.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
 		layout.Layout{SegmentSizeBytes: layout.DefaultSegmentSizeBytes, SegmentCount: 2048})
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
@@ -148,7 +148,7 @@ func newTestServerMultiAddr(t *testing.T) (string, string, func()) {
 	}
 	_ = f.Close()
 
-	storage, err := taihu.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
+	storage, err := storage.NewStorage(context.Background(), filepath.Join(dir, "meta"), devPath,
 		layout.Layout{SegmentSizeBytes: layout.DefaultSegmentSizeBytes, SegmentCount: 2048})
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)

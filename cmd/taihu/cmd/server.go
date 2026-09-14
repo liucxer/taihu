@@ -137,15 +137,15 @@ var serverCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		storage, err := taihu.NewStorage(ctx, db, dev, l, aioOpts...)
+		st, err := storage.NewStorage(ctx, db, dev, l, aioOpts...)
 		if err != nil {
 			return fmt.Errorf("NewStorage: %w", err)
 		}
-		defer storage.Close()
+		defer st.Close()
 
 		// 后台段压缩（compaction）：低频搬移高空洞 Full 段存活对象，配合 segment 级 GC 释放空间。
 		// 默认配置（60s 周期 / 空洞 80% / 全局水位 80% 触发），随进程生命周期启停。
-		compactor := taihu.NewCompactor(storage, taihu.DefaultCompactorConfig())
+		compactor := storage.NewCompactor(st, storage.DefaultCompactorConfig())
 		compactor.Start()
 		defer compactor.Stop()
 
@@ -172,7 +172,7 @@ var serverCmd = &cobra.Command{
 		// 心跳刷新动态字段（容量/可用/已用），StartTime 保持注册时刻。
 		refresh := func() *cluster.InstanceInfo {
 			n := *info
-			cap, avail, used, err := storage.GetDiskCapacity()
+			cap, avail, used, err := st.GetDiskCapacity()
 			if err != nil {
 				log.Printf("GetDiskCapacity: %v", err)
 			} else {
@@ -190,7 +190,7 @@ var serverCmd = &cobra.Command{
 		go cluster.RunHeartbeat(hctx, kv, refresh, time.Second)
 		log.Printf("cluster registered name=%s node=%s hostname=%s addr=%s kv=%T", serverName, hostname, hostname, advAddr, kv)
 
-		gs := transport.NewServer(storage)
+		gs := transport.NewServer(st)
 
 		// 同机共享内存 IPC（shmipc）：unix socket 固定 /dev/<server-name>，与 TCP 监听并行（默认开启）。
 		// -batch>0 时启用"多 stream 多 worker"批读（对齐整块 4MiB 直读聚合 io_submit）。
@@ -199,7 +199,7 @@ var serverCmd = &cobra.Command{
 		batchTarget, _ := cmd.Flags().GetInt("batch")
 		batchWorkers, _ := cmd.Flags().GetInt("batch-workers")
 		if transport.ShmSupported() {
-			shmCloser, err := transport.ServeShmWithBatch(storage, shmPath, batchTarget, batchWorkers)
+			shmCloser, err := transport.ServeShmWithBatch(st, shmPath, batchTarget, batchWorkers)
 			if err != nil {
 				return fmt.Errorf("serve shm %s: %w", shmPath, err)
 			}
@@ -221,13 +221,13 @@ var serverCmd = &cobra.Command{
 			t := time.NewTicker(5 * time.Second)
 			defer t.Stop()
 			for range t.C {
-				io4M, ioOther, b4M, bOther := storage.IOStats()
+				io4M, ioOther, b4M, bOther := st.IOStats()
 				log.Printf("[stat] disk-io 4MiB=%d other=%d bytes4MiB=%d bytesOther=%d", io4M, ioOther, b4M, bOther)
 				log.Printf("[stat] segments free=%d active=%d full=%d reclaiming=%d",
-					storage.SegmentStats()[metastore.SegmentStateFree],
-					storage.SegmentStats()[metastore.SegmentStateActive],
-					storage.SegmentStats()[metastore.SegmentStateFull],
-					storage.SegmentStats()[metastore.SegmentStateReclaiming])
+					st.SegmentStats()[metastore.SegmentStateFree],
+					st.SegmentStats()[metastore.SegmentStateActive],
+					st.SegmentStats()[metastore.SegmentStateFull],
+					st.SegmentStats()[metastore.SegmentStateReclaiming])
 				log.Printf("[stat] %s", transport.StatsString())
 			}
 		}()
