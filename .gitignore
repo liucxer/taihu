@@ -3,4 +3,6 @@
 *.img
 dist/
 bin/
-taihu
+# 仅忽略根目录的构建产物：不能写成无锚点的 taihu，否则会连带忽略 pkg/taihu/、
+# cmd/taihu/ 与 internal/taihu/ —— 其下新增文件会被静默排除在版本库外。
+/taihu
