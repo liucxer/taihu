@@ -1,4 +1,4 @@
-// Sub-command taihu bench cluster 是 rpccluster 集群端到端压测工具（设计文档_v3 §8）。
+// Sub-command taihu bench cluster 是 taihuclient 集群端到端压测工具（设计文档_v3 §8）。
 // 与单机版 taihu bench single 同语义：key 集合 <prefix>/<seq>，读模式区间切分保证每 key 全进程只读一次。
 // 集群模式：SDK 查 TiKV（-pd）定位实例后选路；-transport 控制数据面传输
 // ——auto（默认，同机走 shm、跨节点走 TCP）/ rpc（强制 TCP，含同机）/ shm（强制共享内存）。
@@ -17,14 +17,14 @@ import (
 	"github.com/liucxer/taihu/internal/benchkit"
 	"github.com/liucxer/taihu/internal/cluster"
 	"github.com/liucxer/taihu/internal/transport"
-	"github.com/liucxer/taihu/pkg/rpccluster"
+	"github.com/liucxer/taihu/pkg/taihu-client"
 )
 
 // benchClusterCmd 集群端到端压测（走 TiKV 定位实例）。
 var benchClusterCmd = &cobra.Command{
 	Use:   "cluster",
-	Short: "集群端到端压测（走 TiKV 定位实例，rpccluster）",
-	Long: `taihu bench cluster：rpccluster 集群端到端压测。
+	Short: "集群端到端压测（走 TiKV 定位实例，taihuclient）",
+	Long: `taihu bench cluster：taihuclient 集群端到端压测。
 
 必传参数：
   -mode write|read|delete        测试模式
@@ -76,7 +76,7 @@ var benchClusterCmd = &cobra.Command{
 			return fmt.Errorf("cpuprofile: %w", err)
 		}
 
-		// 集群模式：先查 TiKV 定位实例（rpccluster；-transport 控制数据面传输方式）。
+		// 集群模式：先查 TiKV 定位实例（taihuclient；-transport 控制数据面传输方式）。
 		kv, kerr := cluster.NewTiKVKV(ctx, strings.Split(c.tikvPD, ","), cluster.TLSConfig{
 			CA: c.tikvCA, Cert: c.tikvCert, Key: c.tikvKey,
 		})
@@ -85,7 +85,7 @@ var benchClusterCmd = &cobra.Command{
 			return fmt.Errorf("tikv %s: %w", c.tikvPD, kerr)
 		}
 		defer kv.Close()
-		s, err := rpccluster.NewCluster(rpccluster.ClusterConfig{
+		s, err := taihuclient.NewCluster(taihuclient.ClusterConfig{
 			KV:         kv,
 			ClientName: c.clientName,
 			// 每地址连接数：同机实例 shm 会话数、跨节点每 TCP 地址连接数（-conns；多 IP 实例总连接数=地址数×conns）。
@@ -145,7 +145,7 @@ type clusterBenchConfig struct {
 
 func init() {
 	f := benchClusterCmd.Flags()
-	f.String("transport", rpccluster.TransportAuto, "data-plane transport: auto (shm same-host / rpc cross-host) | rpc (force TCP, incl. same-host) | shm (force shared memory, same-host only)")
+	f.String("transport", taihuclient.TransportAuto, "data-plane transport: auto (shm same-host / rpc cross-host) | rpc (force TCP, incl. same-host) | shm (force shared memory, same-host only)")
 	f.String("write-routing", "", "write routing algorithm: local (default, prefer local instance) | round-robin (all instances)")
 	f.Int("conns", 4, "connections per TCP address (shmipc SessionNum for shm / local: per address, multi-IP instance builds addrs x conns, round-robin)")
 	f.Bool("preload", false, "read: preload RouteCache before timing")
@@ -161,10 +161,10 @@ func init() {
 
 func (c *clusterBenchConfig) validate() error {
 	switch c.transport {
-	case rpccluster.TransportAuto, rpccluster.TransportRPC, rpccluster.TransportShm:
+	case taihuclient.TransportAuto, taihuclient.TransportRPC, taihuclient.TransportShm:
 	default:
 		return fmt.Errorf("invalid -transport %q: must be %s, %s or %s",
-			c.transport, rpccluster.TransportAuto, rpccluster.TransportRPC, rpccluster.TransportShm)
+			c.transport, taihuclient.TransportAuto, taihuclient.TransportRPC, taihuclient.TransportShm)
 	}
 	if c.clientName == "" {
 		return fmt.Errorf("-client-name is required")

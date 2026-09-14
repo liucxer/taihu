@@ -16,7 +16,7 @@ import (
 // TestSegmentWireParity 断言 wire 结构与领域态结构的字段平齐。
 //
 // 为什么需要：这两处结构各有定义（本包的 wire 态、internal/metastore 的领域态），
-// 靠 server_admin.go 与 pkg/rpcclient/admin.go 逐字段手工转换。**任一侧加字段编译器
+// 靠 server_admin.go 与 internal/rpcclient/admin.go 逐字段手工转换。**任一侧加字段编译器
 // 不会报错** —— EncodeSegSum 固定写 9 个 int64、ParseSegSum 固定读 9 个，多出来的字段
 // 会静默丢值过网。本测试把「两侧字段名/顺序/类型一致」变成可执行的断言。
 //

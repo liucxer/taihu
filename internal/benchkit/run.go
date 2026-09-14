@@ -1,6 +1,6 @@
 // Package benchkit 提供 taihu 压测工具（taihu bench cluster / taihu bench single）的
 // 公共压测骨架：数据面接口、公共参数、区间切分、执行循环与结果汇总。
-// 各 bench 工具只负责构建数据面（集群 rpccluster.Storage 或直连 rpcclient.Storage），
+// 各 bench 工具只负责构建数据面（集群 taihuclient.Storage 或直连 rpcclient.Storage），
 // 压测语义统一：key 集合 <prefix>/<seq>，读模式区间切分保证每 key 全进程只读一次。
 package benchkit
 
@@ -33,7 +33,7 @@ type Config struct {
 	Pipeline int
 }
 
-// Store 压测数据面抽象：集群 rpccluster.Storage 与直连 rpcclient.Storage
+// Store 压测数据面抽象：集群 taihuclient.Storage 与直连 rpcclient.Storage
 // 实现同一套 Put/Get/Delete 签名，压测逻辑不关心底层是 shm 还是 TCP。
 type Store interface {
 	Put(ctx context.Context, key string, size int64, in []byte) error

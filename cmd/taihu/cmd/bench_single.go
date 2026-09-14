@@ -14,8 +14,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/liucxer/taihu/internal/benchkit"
+	"github.com/liucxer/taihu/internal/rpcclient"
 	"github.com/liucxer/taihu/internal/transport"
-	"github.com/liucxer/taihu/pkg/rpcclient"
 )
 
 // benchSingleCmd 单机直通压测（不走 TiKV，直连 taihu-server）。

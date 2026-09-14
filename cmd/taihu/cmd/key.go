@@ -9,8 +9,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/liucxer/taihu/internal/cluster"
-	"github.com/liucxer/taihu/pkg/rpcclient"
-	"github.com/liucxer/taihu/pkg/rpccluster"
+	"github.com/liucxer/taihu/internal/rpcclient"
+	"github.com/liucxer/taihu/pkg/taihu-client"
 )
 
 // keyCmd key 操作父节点。
@@ -55,15 +55,15 @@ func resolveKeyTarget(ctx context.Context, addr, instName string, kv cluster.KV,
 		}
 		return c, &keyTarget{inst: &inst}, nil
 	}
-	// 集群路由模式（rpccluster）：put 选实例、get/delete/stat 按索引定位。
-	store, err := rpccluster.NewCluster(rpccluster.ClusterConfig{KV: kv, ClientName: global.clientName})
+	// 集群路由模式（taihuclient）：put 选实例、get/delete/stat 按索引定位。
+	store, err := taihuclient.NewCluster(taihuclient.ClusterConfig{KV: kv, ClientName: global.clientName})
 	if err != nil {
 		return nil, nil, err
 	}
 	return store, nil, nil
 }
 
-// objectStore 数据面统一接口（rpcclient.Storage / rpccluster.Storage 均满足）。
+// objectStore 数据面统一接口（rpcclient.Storage / taihuclient.Storage 均满足）。
 type objectStore interface {
 	Put(ctx context.Context, key string, size int64, in []byte) error
 	Get(ctx context.Context, key string, off, size int64) ([]byte, func(), error)

@@ -1,6 +1,6 @@
 # taihu — 高性能对象存储引擎
 
-`taihu` 是一个面向裸盘（NVMe）的高性能对象存储系统：服务端（`taihu server`）把本机裸盘组织为对象存储，客户端以**直连单实例**（`pkg/rpcclient`）或**经 TiKV 集群路由**（`pkg/rpccluster`）两种方式访问。数据以对象（key → 任意大小字节序列）组织，单对象上限等于段大小（8 GiB）。
+`taihu` 是一个面向裸盘（NVMe）的高性能对象存储系统：服务端（`taihu server`）把本机裸盘组织为对象存储，业务通过唯一 SDK **taihu-client**（`pkg/taihu-client`）访问——**必须经 TiKV 集群路由**定位实例，不支持绕过集群直连。数据以对象（key → 任意大小字节序列）组织，单对象上限等于段大小（8 GiB）。
 
 核心设计取向：**O_DIRECT 裸盘直写直读 + 异步 IO + 全程零拷贝**，配合纯 Go 元数据层（Pebble）与共享内存（shmipc）同机加速，追求极致的端到端读写带宽。
 
@@ -28,8 +28,8 @@
 
 ```
 ┌───────────────────────────── 应用/SDK 层 ─────────────────────────────┐
-│   taihu CLI (cobra)                  pkg/rpcclient (直连)            │
-│   bench storage|single|cluster       pkg/rpccluster (集群路由)       │
+│   taihu CLI (cobra)                  pkg/taihu-client (唯一 SDK)      │
+│   bench storage|single|cluster       集群模式经 TiKV 路由            │
 └───────────────┬──────────────────────────────┬──────────────────────┘
                 │ 本机: shmipc 共享内存           │ 跨节点: netpoll 自定义帧协议
                 ▼                              ▼
@@ -74,21 +74,26 @@ internal/
   ├── ierr/           库错误原始定义
   ├── layout/         物理布局参数：段大小（8GiB）、4K 对齐工具
   ├── metastore/      Pebble 元数据层：mapping/state、1GiB LRU 缓存、段状态机与 GC、游标分配、CAS 搬移
+  ├── rpcclient/      直连客户端：rpcConn 抽象（TCP netpoll / shmipc 共享内存，round-robin 分发）；SDK 数据面与 cmd 运维/压测的内部依赖，不对外
   ├── storage/        对象存储引擎（Storage：Put/ReadAt/BatchRead、Compactor、裸盘直写直读）
   ├── transport/      netpoll 帧协议（收发循环 / 流式多路复用）+ shmipc 服务端/客户端
   └── version/        版本信息
-pkg/                  只放客户端 SDK（外部调用方唯一入口）
-  ├── rpcclient/      直连客户端（rpcConn 抽象：TCP netpoll / shmipc 共享内存，round-robin 分发）
-  └── rpccluster/     集群客户端：实例发现、本地优先选路、TiKV 索引、路由缓存、回源
+pkg/taihu-client/     对外唯一 SDK（集群模式：实例发现、TiKV 索引、本地优先选路、回源重建；数据面复用 internal/rpcclient）
 third_party/          两份 fork 并入主模块（无嵌套 go.mod），改动清单与运维约束见 third_party/README.md
   ├── netpoll/        cloudwego/netpoll v0.7.5 fork（对齐节点分配器 + TakeTry 零拷贝移交）
   └── shmipc-go/      cloudwego/shmipc-go v0.2.0 fork（数据区 4K 对齐，O_DIRECT 直读共享内存）
+scripts/              通用运维脚本：proxy agent（scripts/proxy.py / scripts/proxy_client.py）
+configs/              部署参数模板（见 configs/taihu-server.example.sh）
 doc/                  README.md 是全目录索引；下分 设计文档 / 性能测试报告 / 部署记录
 ```
 
-对外公共接口（[pkg/rpcclient/objectstore.go](pkg/rpcclient/objectstore.go)）：`ObjectStore` 定义 `Put / Get / Delete / Stat / Close`，由两个客户端实现 —— `rpcclient.Storage`（直连）与 `rpccluster.Storage`（集群路由），调用方持该接口即可在两种客户端形态间切换（断言见 `pkg/rpccluster/storage.go`）。
+目录骨架对齐 [golang-standards/project-layout](https://github.com/golang-standards/project-layout)
+（`cmd/`、`internal/`、`pkg/`、`third_party/`、`scripts/`、`configs/`、`Makefile`）。
+文档目录采用 `doc/` 而非标准的 `docs/`，属有意取舍：57 篇文档互相引用相对链接，改名会造成全量断链。
 
-**分层约定**：`pkg/` 只放客户端 SDK，非客户端调用的接口一律在 `internal/`（引擎 `internal/storage`、传输 `internal/transport`、元数据 `internal/metastore`）。`internal/**` 不得 import `pkg/**`，由 `make check` 的 `check-layering` / `check-sdk-only` 两条门禁守着。**代价**：本地引擎不再对外可嵌入 —— 外部调用方只能通过客户端访问。
+对外公共接口（[pkg/taihu-client/reexport.go](pkg/taihu-client/reexport.go)）：`ObjectStore` 类型（type alias，定义见 [internal/rpcclient/objectstore.go](internal/rpcclient/objectstore.go)）声明 `Put / Get / Delete / Stat / Close`，唯一实现是本包 `Storage`（集群路由）；调用方持该接口即可泛化访问 taihu 集群。
+
+**分层约定**：`pkg/` 只放对外唯一 SDK 包 `taihu-client`；引擎（`internal/storage`）、传输（`internal/transport`）、元数据（`internal/metastore`）与直连客户端（`internal/rpcclient`）均在 `internal/`，对外不可见。业务访问**必须**走 `taihu-client`（TiKV 集群路由）；直连客户端仅供服务端与命令行内部使用。`internal/**` 不得 import `pkg/**`、SDK 不得直接依赖存储引擎，由 `make check` 的 `check-layering` / `check-sdk-only` 两条门禁守着。
 
 ---
 
@@ -110,11 +115,11 @@ Go 1.25+。第三方依赖（netpoll、shmipc-go）使用本仓库 `third_party/
 
 ```bash
 taihu server \
-  -listen 10.0.0.1,10.0.0.2 \    # 监听 IP（逗号分隔，多网卡；RPC 端口在 [50000,51000] 自动分配）
-  -db /mnt/db \                   # Pebble 元数据目录（必填）
-  -dev /dev/nvme0n1 \             # 裸设备路径（必填）
-  -server-name TAIHU-0 \          # 实例唯一标识（必填）
-  -pd 10.0.0.10:2379              # TiKV PD 地址（集群注册/容量记录，必填）
+  --listen 10.0.0.1,10.0.0.2 \   # 监听 IP（逗号分隔，多网卡；RPC 端口在 [50000,51000] 自动分配）
+  --db /mnt/db \                 # Pebble 元数据目录（必填）
+  --dev /dev/nvme0n1 \           # 裸设备路径（必填）
+  --server-name TAIHU-0 \        # 实例唯一标识（必填）
+  --pd 10.0.0.10:2379            # TiKV PD 地址（集群注册/容量记录，必填）
 ```
 
 启动后自动完成：设备容量读取并写入 TiKV 容量记录（换盘/容量变化拒绝启动）→ 集群注册 + 1s 心跳 → 端口自动分配（RPC / pprof / shmipc unix socket `/dev/<server-name>`）→ 后台 Compaction 启动。
@@ -122,15 +127,15 @@ taihu server \
 ### 对象读写
 
 ```bash
-# 集群路由模式（-pd 定位实例）：写/读/删
-echo hello | taihu --pd 10.0.0.10:2379 key put -key hello
-taihu --pd 10.0.0.10:2379 key get -key hello
-taihu --pd 10.0.0.10:2379 key delete -key hello
+# 集群路由模式（--pd 定位实例）：写/读/删
+echo hello | taihu --pd 10.0.0.10:2379 key put --key hello
+taihu --pd 10.0.0.10:2379 key get --key hello
+taihu --pd 10.0.0.10:2379 key delete --key hello
 
-# 直连实例（TCP / 区间读 / 落盘元数据）
-echo hi | taihu key put -key k1 -addr 10.0.0.1:50051
-taihu key get -key k1 -off 0 -size 2 -addr 10.0.0.1:50051
-taihu key meta -key k1 -addr 10.0.0.1:50051
+# （内部命令行的直连模式——业务请走上方集群模式；示例 TCP / 区间读 / 落盘元数据）
+echo hi | taihu key put --key k1 --addr 10.0.0.1:50051
+taihu key get --key k1 --off 0 --size 2 --addr 10.0.0.1:50051
+taihu key meta --key k1 --addr 10.0.0.1:50051
 ```
 
 ### 集群健康
@@ -138,7 +143,7 @@ taihu key meta -key k1 -addr 10.0.0.1:50051
 ```bash
 taihu --pd 10.0.0.10:2379 cluster list       # 实例列表（含心跳超时的僵尸）
 taihu --pd 10.0.0.10:2379 cluster status     # 逐实例连通性 RTT / 段汇总 / 水位
-taihu --pd 10.0.0.10:2379 instance segments -instance TAIHU-0 -detail   # 段明细
+taihu --pd 10.0.0.10:2379 instance segments --instance TAIHU-0 --detail   # 段明细
 ```
 
 ---
@@ -149,7 +154,7 @@ taihu --pd 10.0.0.10:2379 instance segments -instance TAIHU-0 -detail   # 段明
 |------|------|
 | `taihu server` | 启动对象服务端（daemon），暴露 Put/Get/Delete/Stat RPC + shmipc + pprof |
 | `taihu bench storage` | 本地裸盘 Storage 层压测（不走网络，`-db/-dev` 直连） |
-| `taihu bench cluster` | 集群端到端压测（走 TiKV 定位实例，`rpccluster`） |
+| `taihu bench cluster` | 集群端到端压测（走 TiKV 定位实例，`taihuclient`） |
 | `taihu bench single` | 单机直通压测（不走 TiKV，`-transport rpc\|shm` 直连 server） |
 | `taihu cluster list` | 列出注册区全部实例 |
 | `taihu cluster status` | 逐实例连通性/段汇总/水位体检 |
@@ -178,7 +183,7 @@ taihu --pd 10.0.0.10:2379 instance segments -instance TAIHU-0 -detail   # 段明
 - 数据帧布局 `[5B 帧头][4091B pad][4K 对齐数据区]`，数据区 4K 对齐供服务端 O_DIRECT **直接读入共享内存**（读路径免 bufpool→shm memcpy）。
 - 客户端 `PutWriter/NewPut`（Linux）经 `Reserve` 在共享内存数据区内直接生成 payload，`-zero-copy-write` 全程零拷贝写。
 
-### 集群（internal/cluster + pkg/rpccluster）
+### 集群（internal/cluster + pkg/taihu-client）
 
 - 注册区（TiKV）：实例注册/心跳（1s，超时判定离线）、容量记录（换盘拒绝启动）、SDK 客户端注册保活。
 - 路由：写=本地优先选实例（Picker）；读=路由缓存 → TiKV key→实例索引 → 回源重建；同机（Hostname 一致）自动走 shm，跨节点走 TCP（多地址均分建连）。
