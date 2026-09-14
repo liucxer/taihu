@@ -4,7 +4,8 @@
 
 核心设计取向：**O_DIRECT 裸盘直写直读 + 异步 IO + 全程零拷贝**，配合纯 Go 元数据层（Pebble）与共享内存（shmipc）同机加速，追求极致的端到端读写带宽。
 
-> 设计迭代详见 [doc/](doc/)：`设计文档_v1/v2/v3` 与 segment 级 GC、Compaction、集群支持等专项设计，以及大量读写性能测试报告。
+> 设计迭代详见 **[doc/README.md](doc/README.md)**（57 篇文档的索引，逐篇标注【现行】/【历史存档】）：
+> `设计文档_v1/v2/v3` 与 segment 级 GC、Compaction、集群支持等专项设计，以及 46 篇读写性能测试报告。
 
 ---
 
@@ -82,7 +83,7 @@ pkg/
 third_party/          两份 fork 并入主模块（无嵌套 go.mod），改动清单与运维约束见 third_party/README.md
   ├── netpoll/        cloudwego/netpoll v0.7.5 fork（对齐节点分配器 + TakeTry 零拷贝移交）
   └── shmipc-go/      cloudwego/shmipc-go v0.2.0 fork（数据区 4K 对齐，O_DIRECT 直读共享内存）
-doc/                  设计文档（v1~v3、GC/Compaction/集群）与读写性能测试报告
+doc/                  README.md 是全目录索引；下分 设计文档 / 性能测试报告 / 部署记录
 ```
 
 对外公共接口（[pkg/taihu/objectstore.go](pkg/taihu/objectstore.go)）：`ObjectStore` 定义 `Put / Delete`；本地 `Storage` 另暴露 `Get/Stat/ReadAt/ReadAtInto/BatchRead`，远程 `rpcclient.Storage` 与 `rpccluster.Storage` 与之方法级一致，调用方可无感切换本地/远程/集群。
@@ -200,7 +201,15 @@ taihu --pd 10.0.0.10:2379 instance segments -instance TAIHU-0 -detail   # 段明
 
 ## 相关文档
 
-- [设计文档 v1 / v2 / v3](doc/设计文档/202609091720_设计文档_v3.md)：架构迭代、v3 远程访问层（Server/Client/RPC Bench）
-- [segment 级 Compaction 设计方案](doc/设计文档/20260911_segment级Compaction数据迁移设计方案.md)、[segment 级 GC 设计](doc/设计文档/20260911_segment级GC设计文档.md)
-- [taihu 集群支持设计文档](doc/设计文档/20260911_taihu集群支持设计文档.md)
-- `doc/性能测试报告/` 下数十份读写性能测试报告（本地裸盘 / 单机直通 shm·rpc / 三盘并发 / 集群端到端等），`doc/部署记录/` 下部署运维记录
+- **[doc/README.md](doc/README.md) —— 全部 57 篇文档的索引与状态标注**：10 篇设计文档 +
+  46 篇性能测试报告（按主题分了系列，每系列标明「现行结论看哪一篇」）+ 1 篇部署记录。
+  逐篇标注【现行】/【部分被取代】/【历史存档】，并注明标注所依据的原文。
+
+先看这几篇就够：
+
+- [taihu 项目架构设计文档](doc/设计文档/20260914_taihu项目架构设计文档.md) —— 【现行·总纲】当前实现的总体架构
+- [设计文档 v2](doc/设计文档/202609091204_设计文档_v2.md) —— 【现行·存储核心】存储层设计（v3 及后续均沿用；权威版本）
+- [结构评审与优化建议](doc/设计文档/20260914_结构评审与优化建议.md) —— 结构评审 8 项及落实记录（§6）
+
+历史存档：`设计文档 v1`（35 行原始需求草稿）、`设计文档 v3`（远程访问层已由 netpoll 取代 gRPC，见架构文档）、
+`20260911_6c5297e_segment级GC设计与测试方案`（GC 引入时的方案，现行版见 `segment级GC设计文档`）。
