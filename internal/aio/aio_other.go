@@ -4,11 +4,11 @@ package aio
 
 import (
 	"errors"
-	"io"
-	"os"
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // ring 非 Linux 平台（macOS 开发/自测）兜底实现：每个提交起一个 goroutine
@@ -81,16 +81,19 @@ func (r *ring) submit(fd int, buf []byte, off int64, read bool) (uint64, error) 
 	r.mu.Unlock()
 
 	go func() {
-		// 用 os.File 的带偏移读写替代 syscall.Pread/Pwrite（后者仅 Linux 存在）。
-		// 注意：不能 Close 该包装句柄——它会关闭调用方持有的底层 fd/句柄，
-		// 导致后续提交 EBADF。os.File 对象无 finalizer 关闭句柄，随 GC 释放即可。
-		f := os.NewFile(uintptr(fd), "aio")
+		// 用 x/sys/unix 的带偏移读写（darwin/linux 都有）。
+		//
+		// 绝不要用 os.NewFile(fd) 包装后再丢：os.NewFile 会给 *os.File 挂 finalizer
+		// （os/file_unix.go: runtime.SetFinalizer(f.file, (*file).close)），包装对象一旦
+		// 成为垃圾，GC 就会 close 掉**调用方持有的同一个 fd**——轻则后续 IO 随机 EBADF，
+		// 重则 kevent 对该 fd 报 EBADF 触发 runtime fatal（netpoll failed）整进程退出。
+		// 这是 macOS 侧测试随机「bad file descriptor」的根因。
 		var res int64
 		if read {
-			n, err := f.ReadAt(buf, off)
+			n, err := unix.Pread(fd, buf, off)
 			res = result(n, err)
 		} else {
-			n, err := f.WriteAt(buf, off)
+			n, err := unix.Pwrite(fd, buf, off)
 			res = result(n, err)
 		}
 		o.ev = Event{Data: seq, Res: res}
@@ -104,21 +107,18 @@ func (r *ring) submit(fd int, buf []byte, off int64, read bool) (uint64, error) 
 }
 
 // result 归一化结果：>=0 字节数；<0 -errno。
+// unix.Pread/Pwrite 读到文件末尾时返回 (0, nil)、部分读返回 (n, nil)，与 Linux
+// pread(2) 语义一致，所以无需再特判 EOF。旧实现走 os.File.ReadAt，它在部分读时
+// 返回 (n, io.EOF) 并被一律折算成 0，会丢掉已读到的字节 —— 换掉后顺带修正。
 func result(n int, err error) int64 {
-	if err != nil {
-		// 越界读到 EOF：与 Linux pread 语义一致，返回 0 字节（非错误）。
-		if err == io.EOF {
-			return 0
-		}
-		if pe, ok := err.(*os.PathError); ok {
-			err = pe.Err
-		}
-		if errno, ok := err.(syscall.Errno); ok {
-			return -int64(errno)
-		}
-		return -1
+	if err == nil {
+		return int64(n)
 	}
-	return int64(n)
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return -int64(errno)
+	}
+	return -1
 }
 
 // Wait 实现 Ring.Wait：收集已完成事件，不足 min 时等待唤醒或超时。

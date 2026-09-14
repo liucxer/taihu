@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -238,5 +239,60 @@ func assertWaitTimeoutExpires(t *testing.T, r Ring) {
 	}
 	if elapsed < d/2 {
 		t.Fatalf("returned too early: %v < %v", elapsed, d/2)
+	}
+}
+
+// TestFdSurvivesGC 回归：后端不得持有「用完即丢、却会关闭调用方 fd」的包装对象。
+//
+// macOS 兜底后端曾把 fd 包成 os.NewFile 做带偏移读写、用完即丢。而 os.NewFile 会给
+// *os.File 挂 finalizer（os/file_unix.go: runtime.SetFinalizer(f.file, (*file).close)），
+// 包装对象一旦成为垃圾，GC 就会 close 掉**调用方持有的同一个 fd**：轻则后续 IO 随机
+// EBADF（表现为「随机用例、随机文件报 bad file descriptor」），重则 kevent 对该 fd
+// 报 EBADF 触发 runtime fatal（runtime: netpoll failed）导致整个测试进程退出。
+func TestFdSurvivesGC(t *testing.T) {
+	for _, b := range testBackends(t) {
+		t.Run(b.name, func(t *testing.T) { assertFdSurvivesGC(t, b.new(t, 8)) })
+	}
+}
+
+// assertFdSurvivesGC 提交若干次制造包装对象垃圾，强制 GC 后再验证同一个 fd 仍可用。
+func assertFdSurvivesGC(t *testing.T, r Ring) {
+	t.Helper()
+	defer r.Close()
+
+	f := newTestFile(t, testChunk*2)
+	fd := int(f.Fd())
+	data := pattern(0x33, testChunk)
+
+	// roundTrip 在同一个 fd 上做一次写后读回。
+	roundTrip := func() {
+		t.Helper()
+		if _, err := r.SubmitWrite(fd, data, 0); err != nil {
+			t.Fatalf("SubmitWrite: %v", err)
+		}
+		if _, err := r.Wait(1, 1, nil); err != nil {
+			t.Fatalf("Wait write: %v", err)
+		}
+		out := make([]byte, testChunk)
+		if _, err := r.SubmitRead(fd, out, 0); err != nil {
+			t.Fatalf("SubmitRead: %v", err)
+		}
+		if _, err := r.Wait(1, 1, nil); err != nil {
+			t.Fatalf("Wait read: %v", err)
+		}
+		if !bytes.Equal(out, data) {
+			t.Fatalf("round-trip mismatch")
+		}
+	}
+
+	roundTrip()
+	for i := 0; i < 3; i++ {
+		runtime.GC()
+	}
+	roundTrip() // fd 必须仍然有效
+
+	// 直接查原症状：fd 被别人的 finalizer 关掉时，这里会报 EBADF。
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close after GC: %v（fd 被包装对象的 finalizer 关闭了？）", err)
 	}
 }

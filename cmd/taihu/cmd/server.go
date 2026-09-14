@@ -194,13 +194,19 @@ var serverCmd = &cobra.Command{
 
 		// 同机共享内存 IPC（shmipc）：unix socket 固定 /dev/<server-name>，与 TCP 监听并行（默认开启）。
 		// -batch>0 时启用"多 stream 多 worker"批读（对齐整块 4MiB 直读聚合 io_submit）。
+		// 非 Linux 平台 shmipc 不可用（且 /dev 不可写），跳过该数据面而非启动失败 ——
+		// TCP 服务照常，使服务端能在 macOS 上跑起来做本机联调。
 		batchTarget, _ := cmd.Flags().GetInt("batch")
 		batchWorkers, _ := cmd.Flags().GetInt("batch-workers")
-		shmCloser, err := transport.ServeShmWithBatch(storage, shmPath, batchTarget, batchWorkers)
-		if err != nil {
-			return fmt.Errorf("serve shm %s: %w", shmPath, err)
+		if transport.ShmSupported() {
+			shmCloser, err := transport.ServeShmWithBatch(storage, shmPath, batchTarget, batchWorkers)
+			if err != nil {
+				return fmt.Errorf("serve shm %s: %w", shmPath, err)
+			}
+			defer shmCloser.Close()
+		} else {
+			log.Printf("taihu: shmipc 仅 Linux 支持，本平台跳过（%s 未创建）；仅提供 TCP 服务", shmPath)
 		}
-		defer shmCloser.Close()
 
 		// pprof 端点：监听所有 IP（0.0.0.0），端口自动分配（[50000,51000] 内未使用端口）；
 		// 附带 5s 一次的链路尺寸统计日志。

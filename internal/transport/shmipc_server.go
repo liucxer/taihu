@@ -28,10 +28,15 @@ import (
 	"github.com/liucxer/taihu/pkg/taihu"
 )
 
+// ShmSupported 报告本平台是否支持 shmipc 共享内存 IPC。调用方据此决定是跳过
+// 还是调用 ServeShmWithBatch —— 非 Linux 上 shm 数据面不可用，但 TCP 数据面
+// 照常，故应降级而非启动失败。
+func ShmSupported() bool { return true }
+
 // shm 帧常量：长度前缀 4B + op 1B；负载上限与 TCP 路径 chunkSize 对齐。
 const (
-	shmLenPrefixLen = 4               // [4B len]
-	shmOpLen        = 1               // [1B op]
+	shmLenPrefixLen = 4                    // [4B len]
+	shmOpLen        = 1                    // [1B op]
 	shmMaxFrameSize = shmOpLen + chunkSize // 帧负载（op+payload）上限
 )
 
