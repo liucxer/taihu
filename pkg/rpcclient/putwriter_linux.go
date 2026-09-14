@@ -1,7 +1,7 @@
 //go:build linux
 
 // 共享内存零拷贝写（linux，shmipc 支持）：newShmPut 断言连接为 transport.ShmConn
-// 并调用其 PutBegin（发 opPutHeader），返回包装后的 PutWriter。
+// 并调用其 PutBegin（发 OpPutHeader），返回包装后的 PutWriter。
 package rpcclient
 
 import (

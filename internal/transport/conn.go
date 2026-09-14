@@ -12,6 +12,7 @@ import (
 	"github.com/liucxer/taihu/third_party/netpoll"
 
 	"github.com/liucxer/taihu/internal/bufpool"
+	"github.com/liucxer/taihu/internal/transport/protocol"
 	"github.com/liucxer/taihu/pkg/taihu"
 )
 
@@ -21,13 +22,13 @@ const dialTimeout = 10 * time.Second
 // init 使 netpoll 接收缓冲改用 bufpool 对齐分配：收流帧载荷落在单个对齐节点内时，
 // 客户端 Get 可直接移交该缓冲给调用方（零拷贝），并经由 bufpool.Put 安全归还。
 //
-// 收流节点进一步改为精确尺寸对齐分配（容量=单帧线上总长 inputNodeSize）：
+// 收流节点进一步改为精确尺寸对齐分配（容量=单帧线上总长 InputNodeSize）：
 // 每帧独占一个节点，读满一帧后 book 剩余容量为 0、节点不再被复用——这是
 // TakeTry 零拷贝移交（一帧一缓冲、移交后不被 netpoll 再写入）的前置条件。
 func init() {
 	netpoll.SetAlignedAllocator(bufpool.Get, bufpool.Put)
 	netpoll.SetInputAlignedAllocator(bufpool.GetExact, bufpool.PutExact)
-	netpoll.SetInputNodeSize(inputNodeSize)
+	netpoll.SetInputNodeSize(protocol.InputNodeSize)
 }
 
 // streamInCap 每流投递缓冲上限：读循环背压到流处理器消费速度。
@@ -38,7 +39,7 @@ var errConnClosed = errors.New("taihu: connection closed")
 // frameMsg 读循环投递给流处理器的一帧：op 已解析，r 为零拷贝子 Reader（定位在
 // payload 起点，Len() 即负载长度；无负载帧 Len()==0）。用毕必须 r.Release()。
 type frameMsg struct {
-	op OpCode
+	op protocol.OpCode
 	r  netpoll.Reader
 }
 
@@ -70,7 +71,7 @@ const (
 
 // dispatch 由 Conn 创建方注入：处理一帧（含新建流与启动处理器）。返回 deliverFatal
 // 时读循环退出；sub 的所有权随调用转移（函数内负责 Release）。
-type dispatch func(c *Conn, sid uint32, op OpCode, sub netpoll.Reader) deliverResult
+type dispatch func(c *Conn, sid uint32, op protocol.OpCode, sub netpoll.Reader) deliverResult
 
 // Conn 一个 netpoll 连接的传输封装（客户端/服务端共用）。
 // 读循环是连接 Reader 的唯一消费者：Peek 帧头、Slice 整帧零拷贝子 Reader、按 streamID 分发。
@@ -132,7 +133,7 @@ func (c *Conn) readLoop() {
 			return
 		}
 		lenField := binary.BigEndian.Uint32(p4)
-		if lenField < frameHeaderLen || lenField > maxFrameTotal {
+		if lenField < protocol.FrameHeaderLen || lenField > protocol.MaxFrameTotal {
 			return // 协议错误：帧长越界
 		}
 		sub, err := c.c.Reader().Slice(4 + int(lenField))
@@ -161,7 +162,7 @@ func (c *Conn) readLoop() {
 			_ = sub.Release()
 			return
 		}
-		if c.dispatch(c, binary.BigEndian.Uint32(sidB), OpCode(op), sub) == deliverFatal {
+		if c.dispatch(c, binary.BigEndian.Uint32(sidB), protocol.OpCode(op), sub) == deliverFatal {
 			return
 		}
 	}
@@ -212,20 +213,20 @@ func (c *Conn) await(ctx context.Context, st *stream) (frameMsg, error) {
 
 // writeFrame 串行写一帧。payload > 4K 时 WriteBinary 零拷贝引用原缓冲，
 // Flush 阻塞至输出排空（waitFlush），返回后调用方即可安全复用/归还 payload。
-func (c *Conn) writeFrame(sid uint32, op OpCode, payload []byte) error {
+func (c *Conn) writeFrame(sid uint32, op protocol.OpCode, payload []byte) error {
 	statTxFrames.Add(1)
 	statTxBytes.Add(int64(len(payload)))
-	if op == opGetData || op == opGetDataFinal {
+	if op == protocol.OpGetData || op == protocol.OpGetDataFinal {
 		statTxDataFrames.Add(1)
 		statTxDataBytes.Add(int64(len(payload)))
-		if len(payload) == chunkSize {
+		if len(payload) == protocol.ChunkSize {
 			statTxData4M.Add(1)
 		}
 	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
-	var hdr [4 + frameHeaderLen]byte // len(4)+sid(4)+op(1)
-	binary.BigEndian.PutUint32(hdr[0:4], uint32(frameHeaderLen+len(payload)))
+	var hdr [4 + protocol.FrameHeaderLen]byte // len(4)+sid(4)+op(1)
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(protocol.FrameHeaderLen+len(payload)))
 	binary.BigEndian.PutUint32(hdr[4:8], sid)
 	hdr[8] = byte(op)
 	if _, err := c.c.Writer().WriteBinary(hdr[:]); err != nil {
@@ -241,7 +242,7 @@ func (c *Conn) writeFrame(sid uint32, op OpCode, payload []byte) error {
 
 // clientDispatch 客户端侧分发：按 streamID 路由到对应流；未知流/已结束流
 // （RPC 完成或取消）直接丢弃该帧，不中断连接。
-func clientDispatch(c *Conn, sid uint32, op OpCode, sub netpoll.Reader) deliverResult {
+func clientDispatch(c *Conn, sid uint32, op protocol.OpCode, sub netpoll.Reader) deliverResult {
 	c.mu.Lock()
 	st := c.streams[sid]
 	c.mu.Unlock()
@@ -262,28 +263,28 @@ func clientDispatch(c *Conn, sid uint32, op OpCode, sub netpoll.Reader) deliverR
 }
 
 // Put 上传对象（与本地 taihu.Storage.Put 同语义）。首帧发 key+size，随后按
-// chunkSize 分帧零拷贝发送（in 在返回前不会被引用），opPutEnd 后等待 opResp。
+// ChunkSize 分帧零拷贝发送（in 在返回前不会被引用），OpPutEnd 后等待 OpResp。
 func (c *Conn) Put(ctx context.Context, key string, size int64, in []byte) error {
 	if int64(len(in)) < size {
 		return taihu.ErrShortWrite
 	}
 	st := c.newStream()
 	defer c.removeStream(st)
-	if err := c.writeFrame(st.id, opPutHeader, encodePutHeader(key, size)); err != nil {
+	if err := c.writeFrame(st.id, protocol.OpPutHeader, protocol.EncodePutHeader(key, size)); err != nil {
 		return err
 	}
 	var off int64
 	for off < size {
-		end := off + chunkSize
+		end := off + protocol.ChunkSize
 		if end > size {
 			end = size
 		}
-		if err := c.writeFrame(st.id, opPutData, in[off:end]); err != nil {
+		if err := c.writeFrame(st.id, protocol.OpPutData, in[off:end]); err != nil {
 			return err
 		}
 		off = end
 	}
-	if err := c.writeFrame(st.id, opPutEnd, nil); err != nil {
+	if err := c.writeFrame(st.id, protocol.OpPutEnd, nil); err != nil {
 		return err
 	}
 	msg, err := c.await(ctx, st)
@@ -291,14 +292,14 @@ func (c *Conn) Put(ctx context.Context, key string, size int64, in []byte) error
 		return err
 	}
 	defer msg.r.Release()
-	if msg.op != opResp {
+	if msg.op != protocol.OpResp {
 		return fmt.Errorf("taihu: unexpected put response op %d", msg.op)
 	}
-	code, err := readU32(msg.r)
+	code, err := protocol.ReadU32(msg.r)
 	if err != nil {
 		return err
 	}
-	return mapCode(errCode(code))
+	return protocol.MapCode(protocol.ErrCode(code))
 }
 
 // Get 读取对象内 [off, off+size) 子区间并返回整块数据（size=-1 读至结尾）。
@@ -329,7 +330,7 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 	}
 	st := c.newStream()
 	defer c.removeStream(st)
-	if err := c.writeFrame(st.id, opGetReq, encodeGetReq(key, off, size)); err != nil {
+	if err := c.writeFrame(st.id, protocol.OpGetReq, protocol.EncodeGetReq(key, off, size)); err != nil {
 		return nil, nil, err
 	}
 
@@ -363,12 +364,12 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 			return nil, nil, err
 		}
 		switch msg.op {
-		case opGetData, opGetDataFinal:
-			final := msg.op == opGetDataFinal
+		case protocol.OpGetData, protocol.OpGetDataFinal:
+			final := msg.op == protocol.OpGetDataFinal
 			rem := int64(msg.r.Len())
 			statRxFrames.Add(1)
 			statRxBytes.Add(rem)
-			if rem == chunkSize {
+			if rem == protocol.ChunkSize {
 				statRxData4M.Add(1)
 			}
 			if rem > size-pos {
@@ -422,29 +423,29 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 			}
 			msg.r.Release()
 			if final {
-				// final 帧：数据流收尾。缺帧（短读）在此报错，等价旧 opGetEnd 校验。
+				// final 帧：数据流收尾。缺帧（短读）在此报错，等价旧 OpGetEnd 校验。
 				if pos != size {
 					dispose()
 					return nil, nil, fmt.Errorf("taihu: get short read: got %d want %d", pos, size)
 				}
 				return out, dispose, nil
 			}
-		case opGetEnd:
+		case protocol.OpGetEnd:
 			msg.r.Release()
 			if pos != size {
 				dispose()
 				return nil, nil, fmt.Errorf("taihu: get short read: got %d want %d", pos, size)
 			}
 			return out, dispose, nil
-		case opGetErr:
-			code, err := readU32(msg.r)
+		case protocol.OpGetErr:
+			code, err := protocol.ReadU32(msg.r)
 			msg.r.Release()
 			if err != nil {
 				dispose()
 				return nil, nil, err
 			}
 			dispose()
-			return nil, nil, mapCode(errCode(code))
+			return nil, nil, protocol.MapCode(protocol.ErrCode(code))
 		default:
 			msg.r.Release()
 			dispose()
@@ -457,7 +458,7 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 func (c *Conn) Delete(ctx context.Context, key string) error {
 	st := c.newStream()
 	defer c.removeStream(st)
-	if err := c.writeFrame(st.id, opDelReq, encodeKeyReq(key)); err != nil {
+	if err := c.writeFrame(st.id, protocol.OpDelReq, protocol.EncodeKeyReq(key)); err != nil {
 		return err
 	}
 	msg, err := c.await(ctx, st)
@@ -465,21 +466,21 @@ func (c *Conn) Delete(ctx context.Context, key string) error {
 		return err
 	}
 	defer msg.r.Release()
-	if msg.op != opResp {
+	if msg.op != protocol.OpResp {
 		return fmt.Errorf("taihu: unexpected delete response op %d", msg.op)
 	}
-	code, err := readU32(msg.r)
+	code, err := protocol.ReadU32(msg.r)
 	if err != nil {
 		return err
 	}
-	return mapCode(errCode(code))
+	return protocol.MapCode(protocol.ErrCode(code))
 }
 
 // Stat 返回对象逻辑大小（key 不存在返回 ErrNotFound）。
 func (c *Conn) Stat(ctx context.Context, key string) (int64, error) {
 	st := c.newStream()
 	defer c.removeStream(st)
-	if err := c.writeFrame(st.id, opStatReq, encodeKeyReq(key)); err != nil {
+	if err := c.writeFrame(st.id, protocol.OpStatReq, protocol.EncodeKeyReq(key)); err != nil {
 		return 0, err
 	}
 	msg, err := c.await(ctx, st)
@@ -488,18 +489,18 @@ func (c *Conn) Stat(ctx context.Context, key string) (int64, error) {
 	}
 	defer msg.r.Release()
 	switch msg.op {
-	case opStatResp:
-		sz, err := readU64(msg.r)
+	case protocol.OpStatResp:
+		sz, err := protocol.ReadU64(msg.r)
 		if err != nil {
 			return 0, err
 		}
 		return int64(sz), nil
-	case opResp:
-		code, err := readU32(msg.r)
+	case protocol.OpResp:
+		code, err := protocol.ReadU32(msg.r)
 		if err != nil {
 			return 0, err
 		}
-		return 0, mapCode(errCode(code))
+		return 0, protocol.MapCode(protocol.ErrCode(code))
 	default:
 		return 0, fmt.Errorf("taihu: unexpected stat response op %d", msg.op)
 	}

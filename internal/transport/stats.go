@@ -5,6 +5,8 @@ import (
 	"io"
 	"strings"
 	"sync/atomic"
+
+	"github.com/liucxer/taihu/internal/transport/protocol"
 )
 
 // 链路帧尺寸统计（压测/验证用，原子计数，热路径仅一次 Add，开销可忽略）。
@@ -13,7 +15,7 @@ var (
 	// 服务端发送（conn.writeFrame 全量统计）。
 	statTxFrames     atomic.Int64 // 已发送帧总次数
 	statTxBytes      atomic.Int64 // 已发送帧负载总字节
-	statTxDataFrames atomic.Int64 // 其中数据帧（opGetData）次数
+	statTxDataFrames atomic.Int64 // 其中数据帧（OpGetData）次数
 	statTxDataBytes  atomic.Int64 // 其中数据帧负载总字节
 	statTxData4M     atomic.Int64 // 其中负载恰为 4MiB 的整帧数
 
@@ -30,7 +32,7 @@ var (
 func recordRxDataFrame(rem int, zeroCopy bool) {
 	statRxFrames.Add(1)
 	statRxBytes.Add(int64(rem))
-	if rem == chunkSize {
+	if rem == protocol.ChunkSize {
 		statRxData4M.Add(1)
 	}
 	if zeroCopy {

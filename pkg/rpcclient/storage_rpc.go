@@ -49,7 +49,7 @@ func (s *Storage) Close() error {
 }
 
 // Put 上传对象。与本地库同语义：in 不足 size 字节时报 ErrShortWrite。
-// transport.Conn 内部按 chunkSize(4MiB) 分帧零拷贝发送。
+// transport.Conn 内部按 ChunkSize(4MiB) 分帧零拷贝发送。
 func (s *Storage) Put(ctx context.Context, key string, size int64, in []byte) error {
 	return s.pick().Put(ctx, key, size, in)
 }

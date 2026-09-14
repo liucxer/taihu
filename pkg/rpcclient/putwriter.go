@@ -25,7 +25,7 @@ type PutWriter struct {
 // Reserve 返回 n 字节共享内存可写区（零拷贝直写，4K 对齐）。
 func (w *PutWriter) Reserve(n int) ([]byte, error) { return w.w.Reserve(n) }
 
-// Commit 结束写入（发 opPutEnd 收响应）。
+// Commit 结束写入（发 OpPutEnd 收响应）。
 func (w *PutWriter) Commit() error { return w.w.Commit() }
 
 // NewPut 开始零拷贝写对象（仅 shm 连接支持；TCP/非 linux 返回 ErrShmOnly）。

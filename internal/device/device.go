@@ -36,7 +36,7 @@ const (
 	pumpTimeout = 200 * time.Millisecond
 	// submitRetry 提交队列满（ErrFull）时的重试间隔。
 	submitRetry = 100 * time.Microsecond
-	// chunk4MiB 典型整块 IO 尺寸（与传输层 chunkSize 一致），用于大小统计分档。
+	// chunk4MiB 典型整块 IO 尺寸（与传输层 ChunkSize 一致），用于大小统计分档。
 	chunk4MiB = 1 << 22
 )
 

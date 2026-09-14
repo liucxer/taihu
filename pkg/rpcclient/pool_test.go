@@ -92,7 +92,7 @@ func TestDialPoolRoundTrip(t *testing.T) {
 }
 
 // TestDialPoolMultiFrame 验证 >4MiB（多帧）对象的 Get 拷贝路径能正确跨帧汇并。
-// chunkSize=4MiB，对象取 4MiB+1 与 ~10MiB 两种尺寸，覆盖跨 2 帧及多帧场景，并做
+// ChunkSize=4MiB，对象取 4MiB+1 与 ~10MiB 两种尺寸，覆盖跨 2 帧及多帧场景，并做
 // SHA256 校验确保帧间拼接无遗漏/错位。
 func TestDialPoolMultiFrame(t *testing.T) {
 	addr, cleanup := newTestServer(t)
