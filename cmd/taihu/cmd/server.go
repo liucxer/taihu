@@ -2,7 +2,7 @@
 //
 // 单 Storage 实例（-db pebble 目录 + -dev 裸设备），对外暴露 4 个 RPC：
 // Put（client 流式上传）、Get（server 流式下发，支持 off/size 区间）、Delete、Stat。
-// 具体 RPC 实现见 internal/rpcserver；本文件只做参数解析、资源初始化和生命周期管理。
+// 具体 RPC 实现见 internal/transport；本文件只做参数解析、资源初始化和生命周期管理。
 package cmd
 
 import (
@@ -26,7 +26,6 @@ import (
 	"github.com/liucxer/taihu/internal/device"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
-	"github.com/liucxer/taihu/internal/rpcserver"
 	"github.com/liucxer/taihu/internal/transport"
 	"github.com/liucxer/taihu/pkg/taihu"
 )
@@ -191,7 +190,7 @@ var serverCmd = &cobra.Command{
 		go cluster.RunHeartbeat(hctx, kv, refresh, time.Second)
 		log.Printf("cluster registered name=%s node=%s hostname=%s addr=%s kv=%T", serverName, hostname, hostname, advAddr, kv)
 
-		gs := rpcserver.New(storage)
+		gs := transport.NewServer(storage)
 
 		// 同机共享内存 IPC（shmipc）：unix socket 固定 /dev/<server-name>，与 TCP 监听并行（默认开启）。
 		// -batch>0 时启用"多 stream 多 worker"批读（对齐整块 4MiB 直读聚合 io_submit）。

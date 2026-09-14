@@ -1,6 +1,6 @@
 // Package cluster 提供 taihu 集群支持的基础组件：注册中心 KV 接口、
 // 实例注册/心跳/注销、实例信息模型。注册/索引后端可替换（内存 / TiKV TxnKV），
-// 调用方通过 KV 接口注入，数据面（internal/rpcserver、pkg/taihu）不感知集群细节。
+// 调用方通过 KV 接口注入，数据面（internal/transport、pkg/taihu）不感知集群细节。
 package cluster
 
 import "context"

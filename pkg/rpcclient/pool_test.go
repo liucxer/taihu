@@ -11,7 +11,7 @@ import (
 	"testing"
 
 	"github.com/liucxer/taihu/internal/layout"
-	"github.com/liucxer/taihu/internal/rpcserver"
+	"github.com/liucxer/taihu/internal/transport"
 	"github.com/liucxer/taihu/pkg/taihu"
 )
 
@@ -32,7 +32,7 @@ func newTestServer(t *testing.T) (string, func()) {
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
 	}
-	gs := rpcserver.New(storage)
+	gs := transport.NewServer(storage)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -153,7 +153,7 @@ func newTestServerMultiAddr(t *testing.T) (string, string, func()) {
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
 	}
-	gs := rpcserver.New(storage)
+	gs := transport.NewServer(storage)
 	lnA, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen A: %v", err)

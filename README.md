@@ -32,7 +32,7 @@
 └───────────────┬──────────────────────────────┬──────────────────────┘
                 │ 本机: shmipc 共享内存           │ 跨节点: netpoll 自定义帧协议
                 ▼                              ▼
-        ┌─────────────────────  taihu server (internal/rpcserver/transport)
+        ┌─────────────────────  taihu server (internal/transport)
         │  Put / Get / Delete / Stat (4 个 RPC) + admin RPC
         └──────────────────────────────┬──────────────────────┐
                                        ▼                      ▼
@@ -73,7 +73,6 @@ internal/
   ├── ierr/           库错误原始定义
   ├── layout/         物理布局参数：段大小（8GiB）、4K 对齐工具
   ├── metastore/      Pebble 元数据层：mapping/state、1GiB LRU 缓存、段状态机与 GC、游标分配、CAS 搬移
-  ├── rpcserver/      transport.Server 薄封装（Serve / GracefulStop）
   ├── transport/      netpoll 帧协议（收发循环 / 流式多路复用）+ shmipc 服务端/客户端
   └── version/        版本信息
 pkg/
