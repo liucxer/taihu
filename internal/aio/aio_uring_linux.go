@@ -96,7 +96,7 @@ type ioUringSQE struct {
 // ioUringCQE 完成队列项（struct io_uring_cqe，16 字节）。
 type ioUringCQE struct {
 	UserData uint64
-	Res      int32  // >=0 字节数；<0 为 -errno
+	Res      int32 // >=0 字节数；<0 为 -errno
 	Flags    uint32
 }
 

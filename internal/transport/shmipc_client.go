@@ -29,10 +29,10 @@ import (
 // 到 unix socket 拷贝（带宽断崖 + 熔断）。故大切片档占比拉到 95%（控制帧仅占
 // 5% 小巧致密），2GiB 池 ≈ 480 个 4MiB 切片，覆盖 128+ 并发读。
 const (
-	shmSmallSlice   = 16 * 1024         // 控制帧切片数据容量
-	shmBufferCap    = 2 << 30           // 每会话共享内存容量 2GiB
-	shmMaxStreamNum = 256               // 流池上限（超过 GetStream 阻塞等待 PutBack）
-	shmInitTimeout  = 30 * time.Second  // 会话初始化（建 memfd + 握手）超时
+	shmSmallSlice   = 16 * 1024        // 控制帧切片数据容量
+	shmBufferCap    = 2 << 30          // 每会话共享内存容量 2GiB
+	shmMaxStreamNum = 256              // 流池上限（超过 GetStream 阻塞等待 PutBack）
+	shmInitTimeout  = 30 * time.Second // 会话初始化（建 memfd + 握手）超时
 )
 
 // ShmConn 一条 shmipc 共享内存客户端连接（rpcclient.rpcConn 语义，方法见下）。
@@ -162,9 +162,9 @@ func (c *ShmConn) Get(ctx context.Context, key string, off, size int64) ([]byte,
 
 	r := st.BufferReader()
 	var (
-		pos int64
-		buf []byte // 汇集缓冲（多帧路径），out = buf[:size]
-		out []byte // 返回缓冲
+		pos  int64
+		buf  []byte // 汇集缓冲（多帧路径），out = buf[:size]
+		out  []byte // 返回缓冲
 		once sync.Once
 	)
 	// release 幂等归还：汇集路径归还 bufpool 缓冲；零拷贝路径保持 pin 直至归还；
@@ -261,13 +261,13 @@ func (c *ShmConn) PutBegin(ctx context.Context, key string, size int64) (*ShmPut
 // Reserve 返回共享内存数据区直接引用（4K 对齐），调用方直接写入（零拷贝），
 // 写满 chunkSize 自动切帧；Commit 发 opPutEnd 并收响应。
 type ShmPutWriter struct {
-	c        *ShmConn
-	st       *shmipc.Stream
-	size     int64
-	written  int64
-	curLen   int    // 当前帧已写 payload 字节
+	c         *ShmConn
+	st        *shmipc.Stream
+	size      int64
+	written   int64
+	curLen    int    // 当前帧已写 payload 字节
 	frameHead []byte // 当前帧首区域 [0:5] 帧头引用（共享内存）
-	err      error
+	err       error
 }
 
 // Reserve 返回 n 字节共享内存可写区（零拷贝直写）。单次 n 不得超过 chunkSize

@@ -106,10 +106,10 @@ const (
 	OpStatResp     OpCode = opStatResp
 	OpGetDataFinal OpCode = opGetDataFinal
 
-	OpPing     OpCode = opPing
-	OpSegReq   OpCode = opSegReq
-	OpMetaReq  OpCode = opMetaReq
-	OpKeysReq  OpCode = opKeysReq
+	OpPing    OpCode = opPing
+	OpSegReq  OpCode = opSegReq
+	OpMetaReq OpCode = opMetaReq
+	OpKeysReq OpCode = opKeysReq
 )
 
 // errCode 错误码（wire 上 4 字节大端），与库错误一一映射。

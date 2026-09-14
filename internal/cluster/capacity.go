@@ -11,11 +11,11 @@ const CapacityKeyPrefix = "/taihu/capacity/"
 
 // CapacityRecord 实例容量记录（JSON 序列化后存于 KV）。
 type CapacityRecord struct {
-	CapacityBytes    int64  `json:"capacity_bytes"`    // 启动时读取的 nvme 容量（字节）
+	CapacityBytes    int64  `json:"capacity_bytes"`     // 启动时读取的 nvme 容量（字节）
 	SegmentSizeBytes int64  `json:"segment_size_bytes"` // 布局段大小
-	SegmentCount     int64  `json:"segment_count"`     // 布局段数 = capacity/segmentSize
-	ListenAddr       string `json:"listen_addr"`       // 实例监听地址（审计/查询用）
-	UpdateTime       int64  `json:"update_time"`       // 记录写入时间（unix 秒）
+	SegmentCount     int64  `json:"segment_count"`      // 布局段数 = capacity/segmentSize
+	ListenAddr       string `json:"listen_addr"`        // 实例监听地址（审计/查询用）
+	UpdateTime       int64  `json:"update_time"`        // 记录写入时间（unix 秒）
 }
 
 // CapacityKey 返回实例容量记录 key。

@@ -32,8 +32,8 @@ var global = struct {
 	json       bool          // 机器可读 JSON 输出
 
 	// 磁盘异步 IO 后端（server 与 bench storage 生效，以命令行为准）。
-	ioUring    string // auto|on|off
-	ioUringIO  bool   // io_uring 的 IOPOLL 模式（仅 io_uring 后端生效，默认关）
+	ioUring   string // auto|on|off
+	ioUringIO bool   // io_uring 的 IOPOLL 模式（仅 io_uring 后端生效，默认关）
 }{timeout: 5 * time.Second, ioUring: "auto"}
 
 // rootCmd 根命令：无子命令时打印帮助。

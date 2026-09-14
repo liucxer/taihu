@@ -23,11 +23,11 @@ type TiKVOptions struct {
 	WriteRouting     string        // 写路由算法：RouteLocal（默认）或 RouteRoundRobin
 	Conns            int           // 每地址数据面连接数（<=0 默认 1）
 
-	Source       SourceGetter        // 回源回调（可选）
-	ClientName   string              // 客户端标识（仅标注/客户端注册用）
-	ClientID     string              // SDK 客户端注册 ID（可选，自动心跳续约）
-	ClientAddr   string              // SDK 数据面地址（随心跳上报）
-	ClientLabels map[string]string   // 客户端自定义标签
+	Source       SourceGetter      // 回源回调（可选）
+	ClientName   string            // 客户端标识（仅标注/客户端注册用）
+	ClientID     string            // SDK 客户端注册 ID（可选，自动心跳续约）
+	ClientAddr   string            // SDK 数据面地址（随心跳上报）
+	ClientLabels map[string]string // 客户端自定义标签
 }
 
 // NewFromTiKV 连接 TiKV TxnKV 并构建集群客户端（Storage）。

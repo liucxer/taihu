@@ -34,9 +34,9 @@ func TestClientKeepalive(t *testing.T) {
 	defer kv.Close()
 
 	s, err := NewCluster(ClusterConfig{
-		KV:          kv,
-		ClientName:  "test-node",
-		ClientID:    "cache-svc-01",
+		KV:           kv,
+		ClientName:   "test-node",
+		ClientID:     "cache-svc-01",
 		ClientLabels: map[string]string{"app": "cache", "env": "test"},
 	})
 	if err != nil {

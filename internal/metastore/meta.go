@@ -12,8 +12,8 @@ import (
 
 const (
 	metaVersion    = byte(0)
-	objectMetaLen  = 1 + 8*3    // version + SegmentID + Offset + Size
-	writeCursorLen = 1 + 8*2    // version + SegmentID + Offset
+	objectMetaLen  = 1 + 8*3     // version + SegmentID + Offset + Size
+	writeCursorLen = 1 + 8*2     // version + SegmentID + Offset
 	segmentMetaLen = 1 + 1 + 8*2 // version + State + AliveCount + ReclaimSeq
 )
 
@@ -74,11 +74,11 @@ func decodeWriteCursor(b []byte) (WriteCursor, error) {
 type SegmentState uint8
 
 const (
-	SegmentStateFree        SegmentState = iota // 空闲，可分配
-	SegmentStateActive                          // 正在顺序写入
-	SegmentStateFull                            // 已写满，仅读
-	SegmentStateReclaiming                      // 待回收（计数归零）
-	SegmentStateCompacting                      // 搬移中（高空洞段存活对象搬迁，禁止分配/回收）
+	SegmentStateFree       SegmentState = iota // 空闲，可分配
+	SegmentStateActive                         // 正在顺序写入
+	SegmentStateFull                           // 已写满，仅读
+	SegmentStateReclaiming                     // 待回收（计数归零）
+	SegmentStateCompacting                     // 搬移中（高空洞段存活对象搬迁，禁止分配/回收）
 )
 
 // SegmentMeta 存放在 state 列族，key = "seg/<segmentID>"。
@@ -111,7 +111,7 @@ func decodeSegmentMeta(b []byte) (SegmentMeta, error) {
 
 // state 列族中关键字。
 const (
-	kvCursorKey    = "cursor"
+	kvCursorKey     = "cursor"
 	kvSegmentPrefix = "seg/"
 )
 
