@@ -38,6 +38,13 @@ type ReadSpec struct {
 	Off int64
 }
 
+// WriteSpec 批写的一个提交项：把 Buf 的前 len(Buf) 字节写到 off 处。同一批共享同一 fd。
+// buf 在 Submit 后、对应完成事件被 Wait 取回前必须保持存活且不被改写（与 ReadSpec 同约束）。
+type WriteSpec struct {
+	Buf []byte
+	Off int64
+}
+
 // Event 一次已完成的异步 IO 结果。
 type Event struct {
 	// Data 提交时写入的用户数据（本封装固定为自增序号 seq，用于关联请求）。
@@ -61,6 +68,12 @@ type Ring interface {
 
 	// SubmitWrite 异步写 buf 到 fd 上 off 处，返回关联序号。语义同 SubmitRead。
 	SubmitWrite(fd int, buf []byte, off int64) (uint64, error)
+
+	// SubmitWriteBatch 一次 io_submit 批量提交多条异步写（同一 fd，摊薄 syscall）。
+	// 返回首个关联序号 firstSeq（第 i 项序号 = firstSeq+i，i∈[0,submitted)）与成功排队
+	// 条数 submitted。submitted 可能 < len(specs)（内核提交队列截断），调用方须把未排队
+	// 部分追加提交；队列满且一条未排入时返回 ErrFull。各 buf 须存活到完成事件被取回。
+	SubmitWriteBatch(fd int, specs []WriteSpec) (firstSeq uint64, submitted int, err error)
 
 	// Wait 取回完成事件：阻塞至至少 min 个事件完成或 timeout 到期（timeout 为 nil 表示无限等待）。
 	// 返回最多 max 个事件；超时时返回已取回的部分事件（可能少于 min，error 为 ErrTimeout）。

@@ -68,6 +68,21 @@ func (r *ring) SubmitWrite(fd int, buf []byte, off int64) (uint64, error) {
 	return r.submit(fd, buf, off, false)
 }
 
+// SubmitWriteBatch 实现 Ring.SubmitWriteBatch：非 Linux 兜底逐条 submit（编号连续）。
+func (r *ring) SubmitWriteBatch(fd int, specs []WriteSpec) (uint64, int, error) {
+	var first uint64
+	for i := range specs {
+		seq, err := r.submit(fd, specs[i].Buf, specs[i].Off, false)
+		if err != nil {
+			return first, i, err
+		}
+		if i == 0 {
+			first = seq
+		}
+	}
+	return first, len(specs), nil
+}
+
 func (r *ring) submit(fd int, buf []byte, off int64, read bool) (uint64, error) {
 	r.mu.Lock()
 	if r.closed {

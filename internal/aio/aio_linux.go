@@ -70,15 +70,35 @@ func (r *ring) SubmitRead(fd int, buf []byte, off int64) (uint64, error) {
 	return r.submit(fd, buf, off, opcodePread)
 }
 
+// batchSpec 批量提交的内部统一项（读写同构，仅 op 不同）。
+type batchSpec struct {
+	buf []byte
+	off int64
+}
+
 // SubmitReadBatch 实现 Ring.SubmitReadBatch：一次 io_submit 批量提交多条读。
 // 返回首个序号与成功排队条数（submitted<len(specs) 表示部分截断）。
 func (r *ring) SubmitReadBatch(fd int, specs []ReadSpec) (uint64, int, error) {
-	return r.submitBatch(fd, specs, opcodePread)
+	bs := make([]batchSpec, len(specs))
+	for i := range specs {
+		bs[i] = batchSpec{buf: specs[i].Buf, off: specs[i].Off}
+	}
+	return r.submitBatch(fd, bs, opcodePread)
 }
 
 // SubmitWrite 实现 Ring.SubmitWrite。
 func (r *ring) SubmitWrite(fd int, buf []byte, off int64) (uint64, error) {
 	return r.submit(fd, buf, off, opcodePwrite)
+}
+
+// SubmitWriteBatch 实现 Ring.SubmitWriteBatch：一次 io_submit 批量提交多条写。
+// 返回首个序号与成功排队条数（submitted<len(specs) 表示部分截断）。
+func (r *ring) SubmitWriteBatch(fd int, specs []WriteSpec) (uint64, int, error) {
+	bs := make([]batchSpec, len(specs))
+	for i := range specs {
+		bs[i] = batchSpec{buf: specs[i].Buf, off: specs[i].Off}
+	}
+	return r.submitBatch(fd, bs, opcodePwrite)
 }
 
 // submit 填充 iocb 并 io_submit。内核在 io_submit 内深拷贝 iocb，返回后 iocb 可复用。
@@ -113,7 +133,7 @@ func (r *ring) submit(fd int, buf []byte, off int64, op uint16) (uint64, error) 
 // 内深拷贝 iocb，返回后可复用。成功时返回 count（排队条数），随后以首序号 firstSeq
 // 关联（第 i 项序号 = firstSeq+i）；EAGAIN 返回 ErrFull。seq 递增只在已排队条数上推进，
 // 未排队部分由调用方追加提交，序号不重叠。
-func (r *ring) submitBatch(fd int, specs []ReadSpec, op uint16) (uint64, int, error) {
+func (r *ring) submitBatch(fd int, specs []batchSpec, op uint16) (uint64, int, error) {
 	n := len(specs)
 	if n == 0 {
 		return 0, 0, nil
@@ -128,10 +148,10 @@ func (r *ring) submitBatch(fd int, specs []ReadSpec, op uint16) (uint64, int, er
 		cb.Data = base + uint64(i+1)
 		cb.LioOp = op
 		cb.Fildes = uint32(fd)
-		cb.Nbytes = uint64(len(sp.Buf))
-		cb.Offset = sp.Off
-		if len(sp.Buf) > 0 {
-			cb.Buf = uint64(uintptr(unsafe.Pointer(&sp.Buf[0])))
+		cb.Nbytes = uint64(len(sp.buf))
+		cb.Offset = sp.off
+		if len(sp.buf) > 0 {
+			cb.Buf = uint64(uintptr(unsafe.Pointer(&sp.buf[0])))
 		}
 		ptrs[i] = cb
 	}

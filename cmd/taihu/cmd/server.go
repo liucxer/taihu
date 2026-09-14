@@ -56,10 +56,14 @@ var serverCmd = &cobra.Command{
 	Example: `  # 启动单实例服务端（双网卡监听，端口自动分配）
   taihu server -listen 10.0.0.1,10.0.0.2 -db /mnt/db -dev /dev/nvme0n1 -server-name TAIHU-0 -pd 100.71.128.11:2379`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		listen, _ := cmd.Flags().GetString("listen")
-		db, _ := cmd.Flags().GetString("db")
-		dev, _ := cmd.Flags().GetString("dev")
-		serverName, _ := cmd.Flags().GetString("server-name")
+			listen, _ := cmd.Flags().GetString("listen")
+			db, _ := cmd.Flags().GetString("db")
+			dev, _ := cmd.Flags().GetString("dev")
+			serverName, _ := cmd.Flags().GetString("server-name")
+			writeBatch, _ := cmd.Flags().GetInt("write-batch")
+			writeWorkers, _ := cmd.Flags().GetInt("write-workers")
+			delBatch, _ := cmd.Flags().GetInt("del-batch")
+			delWorkers, _ := cmd.Flags().GetInt("del-workers")
 
 		if db == "" || dev == "" {
 			return fmt.Errorf("-db and -dev are required")
@@ -190,16 +194,30 @@ var serverCmd = &cobra.Command{
 		go cluster.RunHeartbeat(hctx, kv, refresh, time.Second)
 		log.Printf("cluster registered name=%s node=%s hostname=%s addr=%s kv=%T", serverName, hostname, hostname, advAddr, kv)
 
-		gs := transport.NewServer(st)
+		gs := transport.NewServerWithOptions(st, transport.PipelineConfig{
+			WriteBatch:    writeBatch,
+			WriteWorkers:  writeWorkers,
+			DeleteBatch:   delBatch,
+			DeleteWorkers: delWorkers,
+		})
 
 		// 同机共享内存 IPC（shmipc）：unix socket 固定 /dev/<server-name>，与 TCP 监听并行（默认开启）。
-		// -batch>0 时启用"多 stream 多 worker"批读（对齐整块 4MiB 直读聚合 io_submit）。
+		// -batch>0 时启用"多 stream 多 worker"批读（对齐整块 4MiB 直读聚合 io_submit）；
+		// -write-batch>0 时启用整对象攒批写（一次 AppendBatch + BatchPutCommit）；
+		// -del-batch>0 时启用批量删（一次 BatchDelete）。
 		// 非 Linux 平台 shmipc 不可用（且 /dev 不可写），跳过该数据面而非启动失败 ——
 		// TCP 服务照常，使服务端能在 macOS 上跑起来做本机联调。
 		batchTarget, _ := cmd.Flags().GetInt("batch")
 		batchWorkers, _ := cmd.Flags().GetInt("batch-workers")
 		if transport.ShmSupported() {
-			shmCloser, err := transport.ServeShmWithBatch(st, shmPath, batchTarget, batchWorkers)
+			shmCloser, err := transport.ServeShmWithConfig(st, shmPath, transport.PipelineConfig{
+				ReadBatch:     batchTarget,
+				ReadWorkers:   batchWorkers,
+				WriteBatch:    writeBatch,
+				WriteWorkers:  writeWorkers,
+				DeleteBatch:   delBatch,
+				DeleteWorkers: delWorkers,
+			})
 			if err != nil {
 				return fmt.Errorf("serve shm %s: %w", shmPath, err)
 			}
@@ -270,6 +288,10 @@ func init() {
 	f.String("server-name", "", "unique server name, e.g. TAIHU-0 (required)")
 	f.Int("batch", 0, "shm 批读批量：>0 启用\"多 stream 多 worker\"聚合批读（一次 io_submit 提交多个任务）；0 关闭")
 	f.Int("batch-workers", 8, "shm 批读 worker 池大小（并行批提交，K×batch 即整机在途批读数）")
+	f.Int("write-batch", 0, "写流水线批量：>0 启用整对象攒批写（一次 AppendBatch 排空 + 一次 BatchPutCommit）；0 关闭（逐请求串行）")
+	f.Int("write-workers", 4, "写流水线 worker 池大小（并行批提交;K×batch 即整机在途写对象数）")
+	f.Int("del-batch", 0, "删流水线批量：>0 启用批量删（一次 BatchDelete,per-key 结果独立）；0 关闭（逐请求串行）")
+	f.Int("del-workers", 2, "删流水线 worker 池大小")
 }
 
 // listenMultiPort 在 -listen 指定的一批 IP 上抢占同一未使用 TCP 端口（[50000,51000]），

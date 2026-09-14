@@ -4,12 +4,38 @@ package metastore
 
 import "context"
 
+// PutMappingItem 批量写映射的一个条目。
+type PutMappingItem struct {
+	Key  string
+	Meta ObjectMeta
+}
+
+// AllocResult 批量分配的一个结果。
+type AllocResult struct {
+	SegmentID int64
+	Offset    int64
+}
+
 // Store 是元数据存储接口，供 Storage 层调用。
 type Store interface {
 	GetMapping(ctx context.Context, key string) (ObjectMeta, error) // 不存在返回 ErrNotFound
 	PutMapping(ctx context.Context, key string, m ObjectMeta) error
 	DeleteMapping(ctx context.Context, key string) error
 	IterMapping(ctx context.Context, fn func(key string, m ObjectMeta) error) error // 遍历全部分映射
+
+	// BatchGetMapping 一次读取多个 key 的对象映射（等价于多次 GetMapping，
+	// 但未命中走单快照 + 单迭代有序 Seek，摊薄 N 次独立 pebble Get）。
+	// 结果按入参 key 顺序返回；任一 key 缺失整体返回 ierr.ErrNotFound。
+	BatchGetMapping(ctx context.Context, keys []string) ([]ObjectMeta, error)
+
+	// BatchPutMapping 批量写对象映射：单个 Pebble Batch 原子提交（含段存活计数
+	// 批量更新）。覆盖写只在缓存命中时减旧段计数（对象存储以写一次为主）。
+	BatchPutMapping(ctx context.Context, items []PutMappingItem) error
+
+	// BatchDeleteMapping 批量删对象映射：单个 Pebble Batch 原子提交（含段存活计数
+	// 批量减量）。返回 per-key 错误（缺失 key 为 ierr.ErrNotFound，其余为 nil）；
+	// 整体存储错误经第二个返回值暴露。
+	BatchDeleteMapping(ctx context.Context, keys []string) ([]error, error)
 
 	// LoadCache 预热加速缓存：全量扫描 mapping 命名空间载入内存缓存，消除后续 GetMapping 回查。
 	LoadCache(ctx context.Context) error
@@ -18,6 +44,9 @@ type Store interface {
 	// 段写满自动滚动，返回的偏移恒 4K 对齐、单调不重叠，可并发调用。
 	// 用户写路径：滚动上限保留 ≥reserveSegs 个缓冲段（见 kv_pebble.go），不触碰预留区。
 	AllocateSegment(size int64) (segmentID int64, offset int64, err error)
+	// AllocateSegmentBatch 批量申请连续空间：与多次 AllocateSegment 语义等价，
+	// 但游标持久化合并为一次（摊薄 N 次 sync 写），适合写流水线批量分配。
+	AllocateSegmentBatch(sizes []int64) ([]AllocResult, error)
 	// AllocateSegmentReserve 搬移专用分配：可动用预留缓冲段（用户路径不可用），
 	// 保证 compaction 在用户写入占满时仍有落点，避免搬移死锁。
 	AllocateSegmentReserve(size int64) (segmentID int64, offset int64, err error)

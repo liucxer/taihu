@@ -122,6 +122,89 @@ func (s *Storage) PutCommit(ctx context.Context, key string, segmentID, off, siz
 	return s.db.PutMapping(ctx, key, meta)
 }
 
+// PutItem 批量写的一个条目：把 Data 的前 Size 字节写入 Key。
+type PutItem struct {
+	Key  string
+	Size int64
+	Data []byte
+}
+
+// BatchPut 批量写对象（等价于多次 Put 的批量版，供写流水线并发排空）：
+// 先批量申请写位置（单次游标持久化）→ 一次设备批量写（单次 io_submit）→
+// 一次 Pebble Batch 提交全部映射。任一项校验失败或设备写失败时整体返回错误
+// （与 Put 语义一致：有数据落盘但无映射的孤儿块由 segment GC 兜底回收）。
+func (s *Storage) BatchPut(ctx context.Context, items []PutItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	sizes := make([]int64, len(items))
+	for i := range items {
+		it := &items[i]
+		if it.Size < 0 {
+			return ierr.ErrInvalidRange
+		}
+		if it.Size > s.layout.SegmentSizeBytes {
+			return ierr.ErrTooLarge
+		}
+		if int64(len(it.Data)) < it.Size {
+			return ierr.ErrShortWrite
+		}
+		sizes[i] = it.Size
+	}
+
+	res, err := s.db.AllocateSegmentBatch(sizes)
+	if err != nil {
+		return err
+	}
+	jobs := make([]device.WriteJob, 0, len(items))
+	for i := range items {
+		if items[i].Size == 0 {
+			continue
+		}
+		jobs = append(jobs, device.WriteJob{
+			SegmentID: res[i].SegmentID,
+			Off:       res[i].Offset,
+			Data:      items[i].Data[:items[i].Size],
+			Size:      items[i].Size,
+		})
+	}
+	if len(jobs) > 0 {
+		if err := s.dev.AppendBatch(ctx, jobs); err != nil {
+			return err
+		}
+	}
+	comm := make([]metastore.PutMappingItem, len(items))
+	for i := range items {
+		comm[i] = metastore.PutMappingItem{
+			Key: items[i].Key,
+			Meta: metastore.ObjectMeta{
+				SegmentID: res[i].SegmentID,
+				Offset:    res[i].Offset,
+				Size:      items[i].Size,
+			},
+		}
+	}
+	return s.db.BatchPutMapping(ctx, comm)
+}
+
+// BatchAppend 批量设备写：Data[:Size] 写段内 Off 处（4K 对齐，末尾补零）。
+// 供 shm 写流水线按帧批量排空数据段（不涉及分配/元数据）。
+func (s *Storage) BatchAppend(ctx context.Context, jobs []device.WriteJob) error {
+	return s.dev.AppendBatch(ctx, jobs)
+}
+
+// BatchPutCommit 批量建立 key→(segmentID,off,size) 映射（单个 Pebble Batch 原子提交）。
+// 「先写设备数据、再写元数据」的顺序由调用方保证（本方法只做元数据批量提交）。
+func (s *Storage) BatchPutCommit(ctx context.Context, items []metastore.PutMappingItem) error {
+	return s.db.BatchPutMapping(ctx, items)
+}
+
+// BatchDelete 批量删除对象映射。返回 per-key 错误（key 不存在为 ierr.ErrNotFound）
+// 与整体存储错误；物理空间回收留待 segment 级 GC。
+func (s *Storage) BatchDelete(ctx context.Context, keys []string) ([]error, error) {
+	return s.db.BatchDeleteMapping(ctx, keys)
+}
+
 // ReadAt 读取对象内 [off, off+size) 区间的数据并返回（返回值为从 bufpool 取出的池化
 // 缓冲或 nil；调用方用毕必须 bufpool.Put(返回值) 归还，否则造成池泄漏）。
 //
@@ -253,16 +336,22 @@ func (s *Storage) BatchRead(ctx context.Context, blocks []BatchReadBlock) ([]Bat
 	if len(blocks) == 0 {
 		return res, nil
 	}
-	// Phase 1：逐块解析对象映射 → 段内物理区间，构建 device.ReadJob；持段读引用。
+	// Phase 1：批量查对象映射（单快照 + 单迭代，摊薄 N 次 pebble Get）→
+	// 段内物理区间，构建 device.ReadJob；持段读引用。
+	keys := make([]string, len(blocks))
+	for i := range blocks {
+		keys[i] = blocks[i].Key
+	}
+	metas, err := s.db.BatchGetMapping(ctx, keys)
+	if err != nil {
+		return res, err
+	}
 	devJobs := make([]device.ReadJob, len(blocks))
 	refed := make([]bool, len(blocks))
 	wants := make([]int64, len(blocks))
 	for i := range blocks {
 		b := &blocks[i]
-		meta, err := s.db.GetMapping(ctx, b.Key)
-		if err != nil {
-			return res, err
-		}
+		meta := metas[i]
 		if b.Off < 0 || b.Off > meta.Size || b.Off%layout.BlockSize != 0 {
 			return res, ierr.ErrInvalidRange
 		}

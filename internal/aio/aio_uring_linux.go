@@ -469,6 +469,16 @@ func (r *uringRing) SubmitWrite(fd int, buf []byte, off int64) (uint64, error) {
 	return seq, nil
 }
 
+// SubmitWriteBatch 实现 Ring.SubmitWriteBatch：一次 enter 批量提交，允许部分提交。
+// 读写 spec 形状一致，复用 submit 的 SQE 填充逻辑。
+func (r *uringRing) SubmitWriteBatch(fd int, specs []WriteSpec) (uint64, int, error) {
+	rs := make([]ReadSpec, len(specs))
+	for i := range specs {
+		rs[i] = ReadSpec{Buf: specs[i].Buf, Off: specs[i].Off}
+	}
+	return r.submit(fd, rs, ioringOpWrite)
+}
+
 // submit 填 SQE 并一次 io_uring_enter 提交（flags=0，只提交不等待）。
 // 返回首个关联序号与成功排队条数；未排队部分的 SQE 已从 ring 撤销发布，
 // 调用方追加提交时会拿到同一批序号，序号不重叠。

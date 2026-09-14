@@ -1,8 +1,10 @@
 package metastore
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/cockroachdb/pebble"
@@ -81,6 +83,13 @@ func keyState(inner []byte) []byte {
 	return b
 }
 
+// appendUpper 返回前缀的独占上界（末字节 +1），用于迭代区间 [prefix, upper)。
+func appendUpper(prefix []byte) []byte {
+	u := append([]byte{}, prefix...)
+	u[len(u)-1]++
+	return u
+}
+
 // get 通用读：返回值字节、是否存在。
 func (s *pebbleStore) get(key []byte) ([]byte, bool, error) {
 	v, closer, err := s.db.Get(key)
@@ -150,6 +159,131 @@ func (s *pebbleStore) DeleteMapping(ctx context.Context, key string) error {
 	}
 	s.cache.del(key)
 	return nil
+}
+
+// BatchGetMapping 一次读取多个 key 的对象映射：缓存命中直接取缓存；未命中 key 排序
+// 去重后走单个迭代器有序 Seek（摊薄 N 次独立 Get 的 pebble 往返），结果按入参顺序
+// 返回并回填缓存。任一 key 缺失时整体返回 ierr.ErrNotFound（与逐条 GetMapping 一致）。
+func (s *pebbleStore) BatchGetMapping(ctx context.Context, keys []string) ([]ObjectMeta, error) {
+	metas := make([]ObjectMeta, len(keys))
+	filled := make([]bool, len(keys))
+	missed := make([]string, 0, len(keys))
+	idxByKey := make(map[string]int, len(keys))
+	for i, key := range keys {
+		if m, ok := s.cache.get(key); ok {
+			metas[i] = m
+			filled[i] = true
+			continue
+		}
+		if _, dup := idxByKey[key]; !dup {
+			idxByKey[key] = i
+			missed = append(missed, key)
+		}
+	}
+	if len(missed) == 0 {
+		return metas, nil
+	}
+
+	sort.Strings(missed)
+	prefix := []byte(kvPrefixMapping)
+	it, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: appendUpper(prefix)})
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	found := make(map[string]ObjectMeta, len(missed))
+	for _, key := range missed {
+		it.SeekGE(keyMapping(key))
+		if !it.Valid() || !bytes.Equal(it.Key()[len(prefix):], []byte(key)) {
+			return nil, ierr.ErrNotFound
+		}
+		m, err := decodeObjectMeta(it.Value())
+		if err != nil {
+			return nil, err
+		}
+		found[key] = m
+	}
+	for key, m := range found {
+		s.cache.put(key, m)
+	}
+	for i, key := range keys {
+		if !filled[i] {
+			metas[i] = found[key]
+		}
+	}
+	return metas, nil
+}
+
+// BatchPutMapping 批量写对象映射：单次持段锁、单个 Pebble Batch 原子提交
+// （含各段存活计数批量更新），成功后批量回填缓存。覆盖写只在缓存命中时减旧段计数
+// （对象存储以写一次为主；未命中覆盖视为新 key，不额外回查 pebble）。
+func (s *pebbleStore) BatchPutMapping(ctx context.Context, items []PutMappingItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	b := s.db.NewBatch()
+	defer b.Close()
+
+	s.segs.mu.Lock()
+	for i := range items {
+		var old *ObjectMeta
+		if om, ok := s.cache.get(items[i].Key); ok {
+			old = &om
+		}
+		s.segs.putObjectLocked(b, items[i].Key, items[i].Meta, old)
+	}
+	s.segs.mu.Unlock()
+
+	if err := s.db.Apply(b, syncWO); err != nil {
+		return err
+	}
+	for i := range items {
+		s.cache.put(items[i].Key, items[i].Meta)
+	}
+	return nil
+}
+
+// BatchDeleteMapping 批量删对象映射：逐 key 查映射（缓存命中直取，缺失记 per-key
+// ErrNotFound），存在的 key 单次持段锁、单个 Pebble Batch 原子提交删除与段计数减量。
+// 返回 per-key 错误切片（与入参 keys 对齐）与整体存储错误。
+func (s *pebbleStore) BatchDeleteMapping(ctx context.Context, keys []string) ([]error, error) {
+	errs := make([]error, len(keys))
+	type del struct {
+		i    int
+		key  string
+		meta ObjectMeta
+	}
+	var dels []del
+	for i, key := range keys {
+		m, err := s.GetMapping(ctx, key)
+		if err != nil {
+			if err == ierr.ErrNotFound {
+				errs[i] = ierr.ErrNotFound
+				continue
+			}
+			return nil, err
+		}
+		dels = append(dels, del{i: i, key: key, meta: m})
+	}
+	if len(dels) == 0 {
+		return errs, nil
+	}
+
+	b := s.db.NewBatch()
+	defer b.Close()
+	s.segs.mu.Lock()
+	for _, d := range dels {
+		s.segs.delObjectLocked(b, d.key, d.meta)
+	}
+	s.segs.mu.Unlock()
+
+	if err := s.db.Apply(b, syncWO); err != nil {
+		return nil, err
+	}
+	for _, d := range dels {
+		s.cache.del(d.key)
+	}
+	return errs, nil
 }
 
 // RefSegment 记录一次段内读引用（读开始前调用）。
@@ -233,32 +367,24 @@ func (a *allocator) loadCursor(s *pebbleStore) error {
 	return nil
 }
 
-// allocate 原子申请 layout.Align4k(size) 的连续空间，返回 (segmentID, 段内 4K 对齐偏移)；
-// useReserve=true 时可滚动进入预留缓冲段（compaction 搬移专用）。
-// 首次调用时懒加载持久化游标；段放不下则滚动到下一段并持久化新游标；分配后推进并持久化游标。
-//
-// 段滚动策略（保持磁盘顺序写）：
-//   - 下一段未使用或处于 Free：顺序滚动（正常路径，行为与 v1 一致）；
-//     用户路径滚动上限为 SegmentCount−reserveSegs（预留缓冲段不参与）；
-//   - 下一段已被占用（Active/Full/Reclaiming）或游标到顶：从空闲池取 Free 段复用（游标回跳）；
-//   - 空闲池为空：ErrNoSpace。
-//
-// 切换段时旧段标记 Full（不再写入），新段激活（Free→Active 或创建记录）。
-func (s *pebbleStore) allocate(ctx context.Context, size int64, useReserve bool) (int64, int64, error) {
-	a := s.alloc
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
+// ensureLoaded 懒加载 pebble 句柄与持久化游标（首次分配时）。调用方须持有 a.mu。
+func (a *allocator) ensureLoaded(s *pebbleStore) error {
 	if a.db == nil {
 		a.db = s.db
 	}
 	if !a.cursorLoaded {
 		if err := a.loadCursor(s); err != nil {
-			return 0, 0, err
+			return err
 		}
 		a.cursorLoaded = true
 	}
+	return nil
+}
 
+// allocOneLocked 按 allocate 的滚动/复用逻辑分配一段 Align4k(size) 的连续空间
+// （内存态推进游标，不持久化）。调用方须持有 a.mu；批量分配后统一持久化游标一次。
+// 段滚动/复用逻辑与 allocate 完全一致（含预留段上限约束 useReserve）。
+func (a *allocator) allocOneLocked(ctx context.Context, size int64, useReserve bool) (int64, int64, error) {
 	aligned := layout.Align4k(size)
 	if a.curOff+aligned > a.segSize {
 		if a.curOff > 0 {
@@ -276,23 +402,44 @@ func (s *pebbleStore) allocate(ctx context.Context, size int64, useReserve bool)
 			if err := a.segs.activate(ctx, a.curSeg); err != nil {
 				return 0, 0, err
 			}
-			if err := a.persist(ctx, a.curSeg, a.curOff); err != nil {
-				return 0, 0, err
-			}
 		} else {
 			seg, ok := a.segs.popFree(ctx)
 			if !ok {
 				return 0, 0, ierr.ErrNoSpace
 			}
 			a.curSeg, a.curOff = seg, 0
-			if err := a.persist(ctx, a.curSeg, a.curOff); err != nil {
-				return 0, 0, err
-			}
 		}
 	}
 
 	seg, off := a.curSeg, a.curOff
 	a.curOff += aligned
+	return seg, off, nil
+}
+
+// allocate 原子申请 layout.Align4k(size) 的连续空间，返回 (segmentID, 段内 4K 对齐偏移)；
+// useReserve=true 时可滚动进入预留缓冲段（compaction 搬移专用）。
+// 首次调用时懒加载持久化游标；段放不下则滚动到下一段并持久化新游标；分配后推进并持久化游标。
+//
+// 段滚动策略（保持磁盘顺序写）：
+//   - 下一段未使用或处于 Free：顺序滚动（正常路径，行为与 v1 一致）；
+//     用户路径滚动上限为 SegmentCount−reserveSegs（预留缓冲段不参与）；
+//   - 下一段已被占用（Active/Full/Reclaiming）或游标到顶：从空闲池取 Free 段复用（游标回跳）；
+//   - 空闲池为空：ErrNoSpace。
+//
+// 切换段时旧段标记 Full（不再写入），新段激活（Free→Active 或创建记录）。
+func (s *pebbleStore) allocate(ctx context.Context, size int64, useReserve bool) (int64, int64, error) {
+	a := s.alloc
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if err := a.ensureLoaded(s); err != nil {
+		return 0, 0, err
+	}
+
+	seg, off, err := a.allocOneLocked(ctx, size, useReserve)
+	if err != nil {
+		return 0, 0, err
+	}
 	if err := a.persist(ctx, seg, a.curOff); err != nil {
 		return 0, 0, err
 	}
@@ -302,6 +449,33 @@ func (s *pebbleStore) allocate(ctx context.Context, size int64, useReserve bool)
 // AllocateSegment 用户写路径分配（预留缓冲段不可用）。
 func (s *pebbleStore) AllocateSegment(size int64) (int64, int64, error) {
 	return s.allocate(context.Background(), size, false)
+}
+
+// AllocateSegmentBatch 批量分配：一次锁定分配器，逐项 allocOneLocked 推进游标，
+// 全程只做一次游标持久化（摊薄 N 次 sync 写）。语义与多次 AllocateSegment 等价：
+// 返回与 sizes 一一对应的分配结果，偏移恒 4K 对齐、单调不重叠。
+func (s *pebbleStore) AllocateSegmentBatch(sizes []int64) ([]AllocResult, error) {
+	a := s.alloc
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if err := a.ensureLoaded(s); err != nil {
+		return nil, err
+	}
+	res := make([]AllocResult, len(sizes))
+	for i, size := range sizes {
+		seg, off, err := a.allocOneLocked(context.Background(), size, false)
+		if err != nil {
+			return nil, err
+		}
+		res[i] = AllocResult{SegmentID: seg, Offset: off}
+	}
+	if len(res) > 0 {
+		if err := a.persist(context.Background(), a.curSeg, a.curOff); err != nil {
+			return nil, err
+		}
+	}
+	return res, nil
 }
 
 // AllocateSegmentReserve 搬移专用分配：可动用预留缓冲段，保证 compaction 有落点。

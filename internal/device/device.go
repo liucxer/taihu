@@ -339,6 +339,140 @@ func (d *Device) Append(ctx context.Context, segmentID, off, size int64, data []
 	return nil
 }
 
+// WriteJob 设备级批写项：把 Data 的前 Size 字节写到 segmentID 段内 off 处
+// （末尾不足 4K 补零，语义与 Append 逐项一致）。批内各项独立、可并发提交。
+type WriteJob struct {
+	SegmentID int64
+	Off       int64
+	Data      []byte
+	Size      int64
+}
+
+// AppendBatch 一次 io_submit 批量提交多条段内写（同一 ring、共用设备 fd），
+// 全部完成后返回。逐项语义与 Append 完全等价：
+//   - off 须 4K 对齐，off+Align4k(Size) ≤ 段大小；
+//   - 首地址 4K 对齐的项主体直写调用方缓冲，仅尾块分配 4K 临时缓冲补零（零拷贝主体）；
+//   - 首地址不对齐的项整体拷入对齐缓冲后写出；
+//   - 各项 size==0 时无写 IO。
+//
+// 批内任意项的缓冲必须由调用方持有到本函数返回（submit 同步等待全部完成）。
+func (d *Device) AppendBatch(ctx context.Context, jobs []WriteJob) error {
+	type pspec struct {
+		buf []byte
+		off int64
+	}
+	var specs []pspec
+	var tmps [][]byte // 补零/对齐临时缓冲，须存活到全部事件取回
+	defer func() {
+		for _, t := range tmps {
+			bufpool.Put(t)
+		}
+	}()
+
+	for i := range jobs {
+		j := &jobs[i]
+		if j.Off < 0 || j.Off%layout.BlockSize != 0 {
+			return fmt.Errorf("taihu: append offset %d not 4K aligned", j.Off)
+		}
+		size := j.Size
+		if int64(len(j.Data)) < size {
+			return fmt.Errorf("taihu: append short data: size=%d have=%d", size, len(j.Data))
+		}
+		aligned := layout.Align4k(size)
+		if j.Off+aligned > d.segSize {
+			return ierr.ErrTooLarge
+		}
+		if aligned == 0 {
+			continue // size == 0：无数据可写
+		}
+
+		pos := d.segmentBase(j.SegmentID) + j.Off
+		bulkEnd := size &^ (layout.BlockSize - 1) // 4K 倍数的主体逻辑长度
+		tailLen := size - bulkEnd                 // 尾部不足一格的字节数 [0, 4096)
+
+		if bufAligned(j.Data) {
+			if bulkEnd > 0 {
+				specs = append(specs, pspec{buf: j.Data[:bulkEnd], off: pos})
+			}
+			if tailLen > 0 {
+				tmp := bufpool.Get(int(layout.BlockSize))
+				n := copy(tmp, j.Data[bulkEnd:size])
+				clear(tmp[n:])
+				tmps = append(tmps, tmp)
+				specs = append(specs, pspec{buf: tmp, off: pos + bulkEnd})
+			}
+			continue
+		}
+
+		// 首地址不对齐兜底：整体拷入对齐缓冲后写出。
+		buf := bufpool.Get(int(aligned))
+		copy(buf, j.Data[:size])
+		clear(buf[size:aligned])
+		tmps = append(tmps, buf)
+		if bulkEnd > 0 {
+			specs = append(specs, pspec{buf: buf[:bulkEnd], off: pos})
+		}
+		if tailLen > 0 {
+			specs = append(specs, pspec{buf: buf[bulkEnd:aligned], off: pos + bulkEnd})
+		}
+	}
+	if len(specs) == 0 {
+		return nil
+	}
+
+	fd := int(d.f.Fd())
+	var firstErr error
+	remaining := specs
+	for len(remaining) > 0 {
+		chunk := remaining
+		d.mu.Lock()
+		if d.closed {
+			d.mu.Unlock()
+			return errDeviceClosed
+		}
+		d.inSubmit += len(chunk)
+		d.mu.Unlock()
+
+		rs := make([]aio.WriteSpec, len(chunk))
+		for i := range chunk {
+			rs[i] = aio.WriteSpec{Buf: chunk[i].buf, Off: chunk[i].off}
+		}
+		first, n, err := d.ring.SubmitWriteBatch(fd, rs)
+		if err == aio.ErrFull || n == 0 {
+			// 队列满且一条未排入：让出后重试整块（未推进 seq，不丢 IO）。
+			d.mu.Lock()
+			d.inSubmit -= len(chunk)
+			d.mu.Unlock()
+			time.Sleep(submitRetry)
+			continue
+		}
+		if err != nil {
+			d.mu.Lock()
+			d.inSubmit -= len(chunk)
+			d.mu.Unlock()
+			return err
+		}
+
+		evs, werr := d.batchWait(first, n)
+		d.mu.Lock()
+		d.inSubmit -= len(chunk)
+		d.mu.Unlock()
+		if werr != nil {
+			return werr
+		}
+		for i := 0; i < n; i++ {
+			d.recordIO(int64(len(chunk[i].buf)))
+			if firstErr == nil {
+				if e := checkWrite(evs[i], int64(len(chunk[i].buf))); e != nil {
+					firstErr = e
+				}
+			}
+		}
+		remaining = chunk[n:]
+	}
+	return firstErr
+}
+
 // ReadAt 读取段内 off 起 size 字节，经异步 IO 直接读入池化对齐缓冲并返回数据切片。
 //
 // 要求 off 与 size 均为 4K 对齐（O_DIRECT 约束，由上层 Storage.ReadAt 负责对齐）。

@@ -215,14 +215,10 @@ func (m *segmentManager) putObject(ctx context.Context, key string, meta ObjectM
 	return m.db.Apply(b, syncWO)
 }
 
-// delObject 删除对象映射并原子更新段存活计数。
-// 计数归零的段立即转 Reclaiming，等待 GC 确认无在途读者后回收。
-func (m *segmentManager) delObject(ctx context.Context, key string, meta ObjectMeta) error {
-	b := m.db.NewBatch()
-	defer b.Close()
+// delObjectLocked 将对象映射删除与相关段的存活计数减量写入 batch（不 Apply）。
+// 调用方须持有 m.mu；batch 由调用方原子提交。计数归零的段立即转 Reclaiming。
+func (m *segmentManager) delObjectLocked(b *pebble.Batch, key string, meta ObjectMeta) {
 	b.Delete(keyMapping(key), nil)
-
-	m.mu.Lock()
 	if e := m.segs[meta.SegmentID]; e != nil {
 		e.meta.AliveCount--
 		if e.meta.AliveCount <= 0 {
@@ -231,6 +227,16 @@ func (m *segmentManager) delObject(ctx context.Context, key string, meta ObjectM
 		}
 		b.Set(keyState(segmentKey(meta.SegmentID)), e.meta.encode(), nil)
 	}
+}
+
+// delObject 删除对象映射并原子更新段存活计数。
+// 计数归零的段立即转 Reclaiming，等待 GC 确认无在途读者后回收。
+func (m *segmentManager) delObject(ctx context.Context, key string, meta ObjectMeta) error {
+	b := m.db.NewBatch()
+	defer b.Close()
+
+	m.mu.Lock()
+	m.delObjectLocked(b, key, meta)
 	m.mu.Unlock()
 
 	return m.db.Apply(b, syncWO)

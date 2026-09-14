@@ -25,6 +25,12 @@ var (
 	statRxData4M atomic.Int64 // 其中负载恰为 4MiB 的帧数
 	statRxTake   atomic.Int64 // TakeTry 零拷贝移交命中帧数
 	statRxCopy   atomic.Int64 // ReadCopy/Next 回退拷贝帧数
+
+	// 写/删流水线批量统计（batchWriter / batchDeleter worker 产批计数）。
+	statWriteBatches atomic.Int64 // 写 worker 已处理的批次数
+	statWriteItems   atomic.Int64 // 写流水线已处理的任务数（对象数）
+	statDeleteBatches atomic.Int64 // 删 worker 已处理的批次数
+	statDeleteItems   atomic.Int64 // 删流水线已处理的任务数（key 数）
 )
 
 // recordRxDataFrame 记录客户端收到的一个数据帧（shmipc 客户端复用；TCP 路径由
@@ -48,6 +54,8 @@ func DumpStats(w io.Writer) {
 		statTxFrames.Load(), statTxBytes.Load(), statTxDataFrames.Load(), statTxDataBytes.Load(), statTxData4M.Load())
 	fmt.Fprintf(w, "transport-rx dataFrames=%d dataBytes=%d data4MiB=%d take=%d copy=%d\n",
 		statRxFrames.Load(), statRxBytes.Load(), statRxData4M.Load(), statRxTake.Load(), statRxCopy.Load())
+	fmt.Fprintf(w, "transport-pipeline writeBatches=%d writeItems=%d delBatches=%d delItems=%d\n",
+		statWriteBatches.Load(), statWriteItems.Load(), statDeleteBatches.Load(), statDeleteItems.Load())
 }
 
 // StatsString 返回链路帧尺寸统计的多行文本（供日志单行拼接）。

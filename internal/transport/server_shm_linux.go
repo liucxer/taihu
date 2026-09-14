@@ -25,6 +25,7 @@ import (
 	"github.com/liucxer/taihu/third_party/shmipc-go"
 
 	"github.com/liucxer/taihu/internal/bufpool"
+	"github.com/liucxer/taihu/internal/device"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/storage"
 	"github.com/liucxer/taihu/internal/transport/protocol"
@@ -45,6 +46,8 @@ type shmServer struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 	batched   *shmBatchReader // 非 nil 时启用"多 stream 一 worker"批读（4MiB 整块聚合 io_submit）
+	writer    *batchWriter    // 非 nil 时启用整对象攒批写（一次 AppendBatch + BatchPutCommit）
+	deleter   *batchDeleter   // 非 nil 时启用批量删（一次 BatchDelete）
 }
 
 // ServeShm 在 unix socket 路径 uds 上提供 shmipc 服务，返回 io.Closer 关闭服务。
@@ -180,6 +183,20 @@ func (b *shmBatchReader) submit(key string, pos, want int64, buf []byte) (int64,
 // batchTarget<=0 时退化为常规 ServeShm（每块独立直读）。
 // 返回 io.Closer 关闭服务。共享内存由客户端创建传入（MemFd），服务端仅映射。
 func ServeShmWithBatch(storage *storage.Storage, uds string, batchTarget, batchWorkers int) (io.Closer, error) {
+	return ServeShmWithConfig(storage, uds, PipelineConfig{
+		ReadBatch: batchTarget, ReadWorkers: batchWorkers,
+	})
+}
+
+// ServeShmWithConfig 在 unix socket 路径 uds 上提供 shmipc 服务，并按 cfg 启用批处理流水线：
+//   - 读（ReadBatch>0）：多 stream 多 worker 聚合批读（Storage.BatchRead 一次 io_submit）；
+//   - 写（WriteBatch>0）：整对象攒批写（流 goroutine PutBegin 串行分配 → worker 一次
+//     AppendBatch + BatchPutCommit，数据帧直引共享内存零拷贝，submit 完成后统一归还）；
+//   - 删（DeleteBatch>0）：批量删（一次 BatchDelete，per-key 结果独立）。
+//
+// 各批 ≤0 时对应流水线关闭，退化为逐请求串行处理（保持旧行为）。返回 io.Closer 关闭服务；
+// 共享内存由客户端创建传入（MemFd），服务端仅映射。
+func ServeShmWithConfig(storage *storage.Storage, uds string, cfg PipelineConfig) (io.Closer, error) {
 	conf := shmipc.DefaultConfig()
 	_ = os.Remove(uds)
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: uds, Net: "unix"})
@@ -191,7 +208,9 @@ func ServeShmWithBatch(storage *storage.Storage, uds string, batchTarget, batchW
 		ln:      ln,
 		conf:    conf,
 		closed:  make(chan struct{}),
-		batched: newShmBatchReader(storage, batchTarget, batchWorkers),
+		batched: newShmBatchReader(storage, cfg.ReadBatch, cfg.ReadWorkers),
+		writer:  newBatchWriter(storage, cfg.WriteWorkers, cfg.WriteBatch),
+		deleter: newBatchDeleter(storage, cfg.DeleteWorkers, cfg.DeleteBatch),
 	}
 	go s.acceptLoop()
 	return s, nil
@@ -291,7 +310,12 @@ func (s *shmServer) shmRespErr(st *shmipc.Stream, op protocol.OpCode, code proto
 }
 
 // handleShmPut 处理 Put 请求流：PutHeader → PutData* → PutEnd，语义镜像 TCP handlePut。
-// 每个 PutData 帧消费后即 ReleasePreviousRead（共享内存环形复用，避免长对象堆积 pin）。
+//
+// 写流水线路径（s.writer != nil）：PutBegin 在 PutHeader 后立即串行分配段内位置（游标连续），
+// 各 PutData 帧的共享内存切片直引攒入 jobs（不逐帧放回共享内存），PutEnd 后把整对象投递到
+// 写队列，由 worker 一次 AppendBatch 排空数据帧 + 一次 BatchPutCommit 批量建映射；
+// submit 同步等磁盘写回，返回后 handleStream 统一 ReleasePreviousRead 归还全部 pin 切片。
+// 旧路径（writer == nil）：逐帧 PutAppend 直写 + PutEnd 时 PutCommit（保持原行为）。
 func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, payload []byte) error {
 	key, size, err := protocol.ParsePutHeader(protocol.NewSliceReader(payload))
 	if err != nil {
@@ -303,8 +327,12 @@ func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, paylo
 	if size > s.storage.MaxObjectSize() {
 		return s.shmRespErr(st, protocol.OpResp, protocol.CodeTooLarge)
 	}
-	if size == 0 {
 
+	seg, off, err := s.storage.PutBegin(context.Background(), key, size)
+	if err != nil {
+		return s.shmRespErr(st, protocol.OpResp, protocol.MapStorageErr(err))
+	}
+	if size == 0 {
 		op, _, err := shmReadFrame(r)
 		if err != nil {
 			return err
@@ -312,20 +340,15 @@ func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, paylo
 		if op != protocol.OpPutEnd {
 			return s.shmRespErr(st, protocol.OpResp, protocol.CodeInvalidArgument)
 		}
-		seg, off, err := s.storage.PutBegin(context.Background(), key, 0)
-		if err != nil {
-			return s.shmRespErr(st, protocol.OpResp, protocol.MapStorageErr(err))
-		}
 		if err := s.storage.PutCommit(context.Background(), key, seg, off, 0); err != nil {
 			return s.shmRespErr(st, protocol.OpResp, protocol.MapStorageErr(err))
 		}
 		return shmWriteFrame(st, protocol.OpResp, protocol.EncCode(protocol.CodeOK))
 	}
 
-	seg, off, err := s.storage.PutBegin(context.Background(), key, size)
-	if err != nil {
-		return s.shmRespErr(st, protocol.OpResp, protocol.MapStorageErr(err))
-	}
+	// 攒整对象的数据帧：Data 直引共享内存（4K 对齐零拷贝），先不 release，
+	// 待提交完成由 handleStream 统一 ReleasePreviousRead 归还共享内存。
+	var jobs []device.WriteJob
 	var pos int64
 	for {
 		op, p, err := shmReadFrame(r)
@@ -337,18 +360,26 @@ func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, paylo
 			if pos+int64(len(p)) > size {
 				return s.shmRespErr(st, protocol.OpResp, protocol.CodeInvalidArgument)
 			}
-			if err := s.storage.PutAppend(context.Background(), seg, off+pos, int64(len(p)), p); err != nil {
-				return s.shmRespErr(st, protocol.OpResp, protocol.MapStorageErr(err))
-			}
+			jobs = append(jobs, device.WriteJob{SegmentID: seg, Off: off + pos, Data: p, Size: int64(len(p))})
 			pos += int64(len(p))
-
-			r.ReleasePreviousRead()
 		case protocol.OpPutEnd:
 			if pos != size {
 				return s.shmRespErr(st, protocol.OpResp, protocol.CodeInvalidArgument)
 			}
-			if err := s.storage.PutCommit(context.Background(), key, seg, off, size); err != nil {
-				return s.shmRespErr(st, protocol.OpResp, protocol.MapStorageErr(err))
+			if s.writer != nil {
+				wt := &writeTask{key: key, seg: seg, off: off, size: size, jobs: jobs, done: make(chan error, 1)}
+				if err := s.writer.submit(wt); err != nil {
+					return shmWriteFrame(st, protocol.OpResp, protocol.EncCode(protocol.MapStorageErr(err)))
+				}
+			} else {
+				for _, j := range jobs {
+					if err := s.storage.PutAppend(context.Background(), j.SegmentID, j.Off, j.Size, j.Data); err != nil {
+						return shmWriteFrame(st, protocol.OpResp, protocol.EncCode(protocol.MapStorageErr(err)))
+					}
+				}
+				if err := s.storage.PutCommit(context.Background(), key, seg, off, size); err != nil {
+					return shmWriteFrame(st, protocol.OpResp, protocol.EncCode(protocol.MapStorageErr(err)))
+				}
 			}
 			return shmWriteFrame(st, protocol.OpResp, protocol.EncCode(protocol.CodeOK))
 		default:
@@ -662,13 +693,20 @@ func shmWriteDataFramesChain(st *shmipc.Stream, storage *storage.Storage, key st
 }
 
 // handleShmDelete 处理 Delete 请求（一元），语义镜像 TCP handleDelete。
+// 启用删流水线时整 key 投批删除，否则逐条 Delete。
 func (s *shmServer) handleShmDelete(st *shmipc.Stream, payload []byte) error {
 	key, err := protocol.ParseKeyReq(protocol.NewSliceReader(payload))
 	if err != nil {
 		return shmWriteFrame(st, protocol.OpResp, protocol.EncCode(protocol.CodeInvalidArgument))
 	}
-	if err := s.storage.Delete(context.Background(), key); err != nil {
-		return shmWriteFrame(st, protocol.OpResp, protocol.EncCode(protocol.MapStorageErr(err)))
+	var delErr error
+	if s.deleter != nil {
+		delErr = s.deleter.submit(key)
+	} else {
+		delErr = s.storage.Delete(context.Background(), key)
+	}
+	if delErr != nil {
+		return shmWriteFrame(st, protocol.OpResp, protocol.EncCode(protocol.MapStorageErr(delErr)))
 	}
 	return shmWriteFrame(st, protocol.OpResp, protocol.EncCode(protocol.CodeOK))
 }

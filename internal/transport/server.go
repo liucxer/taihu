@@ -29,6 +29,7 @@ import (
 	"github.com/liucxer/taihu/third_party/netpoll"
 
 	"github.com/liucxer/taihu/internal/bufpool"
+	"github.com/liucxer/taihu/internal/device"
 	"github.com/liucxer/taihu/internal/storage"
 	"github.com/liucxer/taihu/internal/transport/protocol"
 )
@@ -39,13 +40,21 @@ import (
 type Server struct {
 	storage *storage.Storage
 
+	pipeline *pipeline // 写/删批处理流水线（nil 时逐请求串行，保持旧行为）
+
 	mu  sync.Mutex
 	els []netpoll.EventLoop // 多 listener 场景：每 Serve 一个 EventLoop，停机时全部 Shutdown
 }
 
-// NewServer 构建服务端。
+// NewServer 构建服务端（默认不启用写/删流水线）。
 func NewServer(storage *storage.Storage) *Server {
-	return &Server{storage: storage}
+	return NewServerWithOptions(storage, PipelineConfig{})
+}
+
+// NewServerWithOptions 构建服务端并按 cfg 启用写/删批处理流水线
+// （-write-batch / -del-batch >0 时生效，沿用 drain 取批 + 多 worker 并发提交）。
+func NewServerWithOptions(storage *storage.Storage, cfg PipelineConfig) *Server {
+	return &Server{storage: storage, pipeline: newPipeline(storage, cfg)}
 }
 
 // Serve 在 listener 上提供服务（阻塞直至 Shutdown/异常）。可对多个 listener 并发调用：
@@ -153,8 +162,10 @@ func (c *Conn) endStream(st *stream) {
 	c.removeStream(st)
 }
 
-// handlePut 处理 Put 流：首帧 PutHeader{key,size}，随后 PutData 帧汇入 bufpool 缓冲，
-// PutEnd 后整块交给 Storage.Put（device 内部拷贝进 O_DIRECT 对齐缓冲落盘）。
+// handlePut 处理 Put 流：首帧 PutHeader{key,size}，PutHeader 后立即 PutBegin 串行分配
+// 段内位置（游标连续，保序分配）；随后 PutData 帧汇入 bufpool 缓冲，PutEnd 后整对象
+// 交给写流水线（AppendBatch 一次 io_submit 排空 + BatchPutCommit 批量建映射；流水线
+// 关闭时退化为 Storage.Put 单条路径）。设备写位于分配锁之外，并发 Put 可写不同偏移。
 func (s *Server) handlePut(c *Conn, st *stream) {
 	defer c.endStream(st)
 
@@ -182,6 +193,12 @@ func (s *Server) handlePut(c *Conn, st *stream) {
 			return
 		}
 		_ = c.writeFrame(st.id, protocol.OpResp, protocol.EncCode(protocol.CodeOK))
+		return
+	}
+
+	seg, off, err := s.storage.PutBegin(context.Background(), key, size)
+	if err != nil {
+		_ = c.writeFrame(st.id, protocol.OpResp, protocol.EncCode(protocol.MapStorageErr(err)))
 		return
 	}
 
@@ -215,7 +232,14 @@ func (s *Server) handlePut(c *Conn, st *stream) {
 				_ = c.writeFrame(st.id, protocol.OpResp, protocol.EncCode(protocol.CodeInvalidArgument))
 				return
 			}
-			if err := s.storage.Put(context.Background(), key, size, buf); err != nil {
+			if s.pipeline != nil && s.pipeline.w != nil {
+				job := device.WriteJob{SegmentID: seg, Off: off, Data: buf[:size], Size: size}
+				wt := &writeTask{key: key, seg: seg, off: off, size: size, jobs: []device.WriteJob{job}, done: make(chan error, 1)}
+				if err := s.pipeline.w.submit(wt); err != nil {
+					_ = c.writeFrame(st.id, protocol.OpResp, protocol.EncCode(protocol.MapStorageErr(err)))
+					return
+				}
+			} else if err := s.storage.Put(context.Background(), key, size, buf); err != nil {
 				_ = c.writeFrame(st.id, protocol.OpResp, protocol.EncCode(protocol.MapStorageErr(err)))
 				return
 			}
@@ -293,7 +317,7 @@ func (s *Server) handleGet(c *Conn, st *stream) {
 	}
 }
 
-// handleDelete 处理 Delete 请求（一元）。
+// handleDelete 处理 Delete 请求（一元）。启用删流水线时整 key 投批删除，否则逐条 Delete。
 func (s *Server) handleDelete(c *Conn, st *stream) {
 	defer c.endStream(st)
 
@@ -307,8 +331,14 @@ func (s *Server) handleDelete(c *Conn, st *stream) {
 		_ = c.writeFrame(st.id, protocol.OpResp, protocol.EncCode(protocol.CodeInvalidArgument))
 		return
 	}
-	if err := s.storage.Delete(context.Background(), key); err != nil {
-		_ = c.writeFrame(st.id, protocol.OpResp, protocol.EncCode(protocol.MapStorageErr(err)))
+	var delErr error
+	if s.pipeline != nil && s.pipeline.d != nil {
+		delErr = s.pipeline.d.submit(key)
+	} else {
+		delErr = s.storage.Delete(context.Background(), key)
+	}
+	if delErr != nil {
+		_ = c.writeFrame(st.id, protocol.OpResp, protocol.EncCode(protocol.MapStorageErr(delErr)))
 		return
 	}
 	_ = c.writeFrame(st.id, protocol.OpResp, protocol.EncCode(protocol.CodeOK))
