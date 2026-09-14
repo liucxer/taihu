@@ -25,7 +25,7 @@ keywords: proxy,nefs,exec,命令执行,文件传输,upload,download,端口转发
 ## 用法
 
 ```bash
-PY=.trae/skills/nefs-proxy/proxy_client.py   # 相对 taihu 工程根目录
+PY=scripts/proxy_client.py   # 相对 taihu 工程根目录
 
 # 执行命令
 python3 $PY --node 194 exec --cmd "ceph -s" --timeout 60
@@ -58,7 +58,7 @@ python3 $PY --node 100.71.128.12 proxy delete --name test-fwd
 
 ## Agent (proxy.py) 部署与已知修复
 
-节点端 agent 代码已归档在本 skill 目录 `proxy.py`（**修复版，2026-09-01**）。部署：
+节点端 agent 代码已归档在工程 `scripts/proxy.py`（**修复版，2026-09-01**）。部署：
 ```bash
 # 上传 proxy.py 到节点 /tmp/ 后后台启动（root=/tmp）
 cd /tmp && setsid nohup python3 /tmp/proxy.py server > /tmp/proxy_server.log 2>&1 &

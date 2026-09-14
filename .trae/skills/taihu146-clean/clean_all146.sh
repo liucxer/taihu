@@ -2,7 +2,7 @@
 # 6 节点并发清理编排：上传 clean146.sh 到全部节点，并发执行，收集结果。
 # 依赖 nodef: 只要本机能运行 python 并连到代理（nefs-proxy），PROXY_PY 指向 proxy_client.py。
 # 用法:
-#   export PROXY_PY="/path/to/nefs-proxy/proxy_client.py"
+#   export PROXY_PY="/path/to/taihu/scripts/proxy_client.py"
 #   bash clean_all146.sh [--full] [--force] [--dry-run]
 set -u
 NODES=(146 147 148 149 150 152)

@@ -49,7 +49,7 @@ go build -trimpath -ldflags "-X github.com/liucxer/taihu/internal/version.Commit
 ```powershell
 # 方式 1：nefs-proxy
 $PY="C:\Users\USER484887\AppData\Roaming\uv\python\cpython-3.12.14-windows-x86_64-none\python.exe"
-$P="d:\workspace\taihu\.trae\skills\nefs-proxy\proxy_client.py"
+$P="d:\workspace\taihu\scripts\proxy_client.py"
 & $PY $P --node 128 upload --local "d:\workspace\taihu\dist\build\taihu-cli" --remote /tmp/taihu-cli
 & $PY $P --node 128 exec --cmd "chmod +x /tmp/taihu-cli && echo OK"
 

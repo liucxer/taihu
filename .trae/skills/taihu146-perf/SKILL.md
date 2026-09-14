@@ -35,13 +35,13 @@ go build -trimpath -ldflags "-X github.com/liucxer/taihu/internal/version.Commit
 go build -trimpath -ldflags "<同上>" -o dist/build/taihu-rpc-bench.50ebbe4 ./cmd/taihu-rpc-bench
 ```
 
-2. **上传到 6 节点并 chmod**（用 nefs-proxy，python 命令用 `.trae/skills/nefs-proxy/proxy_client.py`；Windows 下用 `py -0p` 找到真实 python 路径后调用）：
+2. **上传到 6 节点并 chmod**（用 nefs-proxy，python 命令用 `scripts/proxy_client.py`；Windows 下用 `py -0p` 找到真实 python 路径后调用）：
 
 ```bash
 PY="C:\Users\USER484887\AppData\Roaming\uv\python\cpython-3.12.14-windows-x86_64-none\python.exe"
 foreach($n in 146,147,148,149,150,152){
-  & $PY .trae/skills/nefs-proxy/proxy_client.py --node $n upload --local dist\build\taihu-server.50ebbe4 --remote /tmp/taihu-server.50ebbe4
-  & $PY .trae/skills/nefs-proxy/proxy_client.py --node $n upload --local dist\build\taihu-rpc-bench.50ebbe4 --remote /tmp/taihu-rpc-bench.50ebbe4
+  & $PY scripts/proxy_client.py --node $n upload --local dist\build\taihu-server.50ebbe4 --remote /tmp/taihu-server.50ebbe4
+  & $PY scripts/proxy_client.py --node $n upload --local dist\build\taihu-rpc-bench.50ebbe4 --remote /tmp/taihu-rpc-bench.50ebbe4
 }
 ```
 
