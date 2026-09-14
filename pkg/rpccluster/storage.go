@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/liucxer/taihu/internal/cluster"
+	"github.com/liucxer/taihu/internal/storage"
 	"github.com/liucxer/taihu/internal/version"
 	"github.com/liucxer/taihu/pkg/rpcclient"
-	"github.com/liucxer/taihu/pkg/taihu"
 )
 
 var (

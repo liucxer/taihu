@@ -9,7 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/liucxer/taihu/internal/cluster"
-	"github.com/liucxer/taihu/pkg/taihu"
+	"github.com/liucxer/taihu/internal/storage"
 )
 
 // clusterCmd 集群命令父节点。

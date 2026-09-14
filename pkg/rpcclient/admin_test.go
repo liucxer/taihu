@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/liucxer/taihu/internal/metastore"
-	"github.com/liucxer/taihu/pkg/taihu"
+	"github.com/liucxer/taihu/internal/storage"
 )
 
 // admin RPC 往返测试（taihu-cli 设计文档 §4）：Ping / Meta / Segments / ListKeys。

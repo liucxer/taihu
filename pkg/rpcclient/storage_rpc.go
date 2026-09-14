@@ -3,7 +3,7 @@ package rpcclient
 import (
 	"context"
 
-	"github.com/liucxer/taihu/pkg/taihu"
+	"github.com/liucxer/taihu/internal/storage"
 )
 
 // rpcConn 一条底层传输连接的统一接口：TCP（transport.Conn，netpoll 帧协议）或

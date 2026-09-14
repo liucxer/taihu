@@ -23,7 +23,7 @@ import (
 
 	"github.com/liucxer/taihu/third_party/netpoll"
 
-	"github.com/liucxer/taihu/pkg/taihu"
+	"github.com/liucxer/taihu/internal/storage"
 )
 
 // ChunkSize 单条数据帧负载上限（4MiB），与旧 gRPC 方案一致。

@@ -12,7 +12,7 @@ import (
 	"go.uber.org/zap/zapcore"
 
 	"github.com/liucxer/taihu/internal/aio"
-	"github.com/liucxer/taihu/pkg/taihu"
+	"github.com/liucxer/taihu/internal/storage"
 )
 
 // silenceTiKVLog 抑制 tikv client-go（pingcap/log）的 INFO/WARN 刷屏：CLI 输出

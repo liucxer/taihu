@@ -11,8 +11,8 @@ import (
 
 	"github.com/liucxer/taihu/internal/cluster"
 	"github.com/liucxer/taihu/internal/layout"
+	"github.com/liucxer/taihu/internal/storage"
 	"github.com/liucxer/taihu/internal/transport"
-	"github.com/liucxer/taihu/pkg/taihu"
 )
 
 // multiAddrTestServerPair 起一个跑在本机 TCP 上的 taihu-server（同一 storage），通过

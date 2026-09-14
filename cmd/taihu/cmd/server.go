@@ -26,8 +26,8 @@ import (
 	"github.com/liucxer/taihu/internal/device"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
+	"github.com/liucxer/taihu/internal/storage"
 	"github.com/liucxer/taihu/internal/transport"
-	"github.com/liucxer/taihu/pkg/taihu"
 )
 
 // 端口自动分配区间：RPC 与 pprof 均在此区间内抢占未使用端口（互不相同）。

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liucxer/taihu/pkg/taihu"
+	"github.com/liucxer/taihu/internal/storage"
 )
 
 // assertMappedErr 断言 parse 失败时返回的错误与 MapCode 的映射结果等价。

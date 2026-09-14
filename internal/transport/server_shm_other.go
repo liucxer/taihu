@@ -8,7 +8,7 @@ import (
 	"errors"
 	"io"
 
-	"github.com/liucxer/taihu/pkg/taihu"
+	"github.com/liucxer/taihu/internal/storage"
 )
 
 // errShmUnsupported shmipc 仅支持 Linux。

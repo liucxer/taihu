@@ -11,8 +11,8 @@ import (
 	"testing"
 
 	"github.com/liucxer/taihu/internal/layout"
+	"github.com/liucxer/taihu/internal/storage"
 	"github.com/liucxer/taihu/internal/transport"
-	"github.com/liucxer/taihu/pkg/taihu"
 )
 
 // newTestServer 起一个跑在本机 TCP 上的 taihu-server（netpoll EventLoop），

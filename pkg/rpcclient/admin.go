@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/liucxer/taihu/internal/metastore"
+	"github.com/liucxer/taihu/internal/storage"
 	"github.com/liucxer/taihu/internal/transport"
-	"github.com/liucxer/taihu/pkg/taihu"
 )
 
 // 管理类 RPC（taihu-cli 设计文档 §4）。首版仅 TCP 路径支持：Storage 内部连接中

@@ -28,8 +28,8 @@ import (
 
 	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/layout"
+	"github.com/liucxer/taihu/internal/storage"
 	"github.com/liucxer/taihu/internal/transport/protocol"
-	"github.com/liucxer/taihu/pkg/taihu"
 )
 
 // ShmSupported 报告本平台是否支持 shmipc 共享内存 IPC。调用方据此决定是跳过

@@ -9,7 +9,7 @@ import (
 
 	"github.com/liucxer/taihu/internal/cluster"
 	"github.com/liucxer/taihu/internal/metastore"
-	"github.com/liucxer/taihu/pkg/taihu"
+	"github.com/liucxer/taihu/internal/storage"
 )
 
 // instanceCmd instance 命令父节点。
