@@ -18,7 +18,7 @@ import (
 	"errors"
 	"io"
 
-	"github.com/cloudwego/netpoll"
+	"github.com/liucxer/taihu/third_party/netpoll"
 
 	"github.com/liucxer/taihu/pkg/taihu"
 )

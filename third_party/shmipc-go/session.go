@@ -112,7 +112,9 @@ func newSession(config *Config, conn net.Conn, isClient bool) (*Session, error) 
 	}
 
 	if err := VerifyConfig(config); err != nil {
-		return nil, fmt.Errorf("VerifyConfig failed:" + err.Error())
+		// 拼接改用 %s 占位：vet 的 printf 检查在 go >= 1.24 语言版本下会把
+		// 非常量格式串判为错误。消息文本与原来逐字节一致（冒号后不补空格）。
+		return nil, fmt.Errorf("VerifyConfig failed:%s", err)
 	}
 
 	if config.MemMapType == MemMapTypeMemFd {
@@ -123,7 +125,7 @@ func newSession(config *Config, conn net.Conn, isClient bool) (*Session, error) 
 
 	fd, err := getConnDupFd(conn)
 	if err != nil {
-		return nil, fmt.Errorf("could get fd from conn,reason=" + err.Error())
+		return nil, fmt.Errorf("could get fd from conn,reason=%s", err)
 	}
 	// had dup fd, we manage the dup fd in internal's event loop
 	defer conn.Close()

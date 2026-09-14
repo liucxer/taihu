@@ -25,7 +25,7 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/cloudwego/netpoll/internal/runner"
+	"github.com/liucxer/taihu/third_party/netpoll/internal/runner"
 )
 
 var (

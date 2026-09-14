@@ -3,31 +3,33 @@ module github.com/liucxer/taihu
 go 1.25.0
 
 require (
-	github.com/cloudwego/netpoll v0.7.5
-	github.com/cloudwego/shmipc-go v0.2.0
+	github.com/bytedance/gopkg v0.1.1
+	github.com/cloudwego/gopkg v0.1.4
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/pingcap/log v1.1.1-0.20221110025148-ca232912c9f3
+	github.com/shirou/gopsutil/v3 v3.22.1
 	github.com/spf13/cobra v1.9.1
 	github.com/tikv/client-go/v2 v2.0.7
 	go.uber.org/zap v1.24.0
 	golang.org/x/sys v0.30.0
 )
 
-// netpoll fork 落地 third_party：可插拔对齐节点分配器 + 单节点所有权移交 TakeBytes，
-// 供 taihu transport 客户端 Get 零拷贝直返调用方。不 import 本项目，避免模块环。
-replace github.com/cloudwego/netpoll => ./third_party/netpoll
-
-// shmipc fork 落地 third_party：共享内存 buffer data 区 4K 对齐（O_DIRECT 直读共享内存，
-// 服务端读路径免 memcpy）。不 import 本项目，避免模块环。
-replace github.com/cloudwego/shmipc-go => ./third_party/shmipc-go
+// 两份 fork（third_party/netpoll、third_party/shmipc-go）曾经是独立的嵌套子模块，
+// 由上面的 replace 以相对路径挂进来。该做法有个对外致命的性质：Go 的 replace
+// **只在主模块生效、不会传递给消费者**，于是任何外部模块 import 本仓库的 pkg/
+// 都会拿到上游 netpoll/shmipc-go，因缺少 fork 新增的 API 而构建失败
+// （实测：undefined: netpoll.SetAlignedAllocator）。
+//
+// 现在把 fork 直接并入主模块（目录下不再有 go.mod，import 路径为
+// github.com/liucxer/taihu/third_party/...），既彻底消除这个对外阻碍，
+// 也让构建不再依赖本地路径与网络。fork 的上游基线、本地改动清单与
+// 许可证义务见 third_party/README.md。
 
 require (
 	github.com/DataDog/zstd v1.4.5 // indirect
 	github.com/benbjohnson/clock v1.3.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/bytedance/gopkg v0.1.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/cloudwego/gopkg v0.1.4 // indirect
 	github.com/cockroachdb/errors v1.11.3 // indirect
 	github.com/cockroachdb/fifo v0.0.0-20240606204812-0bbfbd93a7ce // indirect
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b // indirect
@@ -63,7 +65,6 @@ require (
 	github.com/prometheus/procfs v0.9.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20200410134404-eec4a21b6bb0 // indirect
 	github.com/rogpeppe/go-internal v1.9.0 // indirect
-	github.com/shirou/gopsutil/v3 v3.22.1 // indirect
 	github.com/spf13/pflag v1.0.6 // indirect
 	github.com/tiancaiamao/gp v0.0.0-20221230034425-4025bc8a4d4a // indirect
 	github.com/tikv/pd/client v0.0.0-20230329114254-1948c247c2b1 // indirect

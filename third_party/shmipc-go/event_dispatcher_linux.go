@@ -344,7 +344,11 @@ func (d *epollDispatcher) runLoop() error {
 			d.lock.Unlock()
 			d.runLambda()
 		}
-		runtime.KeepAlive(d)
+		// 原先此处有一行 runtime.KeepAlive(d)：上面的 for 是死循环（唯一出口是
+		// 前面 epollWait 出错时的 return），所以那行永远执行不到，vet 的
+		// unreachable 检查会报错。它本来也没有任何效果——d 被 goroutine 闭包捕获、
+		// 且循环体内一直在用（d.epollFd / d.runLambda 等），生命周期本就有保障。
+		// 同理，把死循环改成可 break 只为让这行可达反而更绕，故直接删除。
 	}()
 	return nil
 }

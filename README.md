@@ -79,9 +79,9 @@ pkg/
   ├── taihu/          Storage 对象存储库（ObjectStore 接口、Put/ReadAt/BatchRead、Compactor）
   ├── rpcclient/      远程对象存储（rpcConn 抽象：TCP netpoll / shmipc 共享内存，round-robin 分发）
   └── rpccluster/     集群客户端：实例发现、本地优先选路、TiKV 索引、路由缓存、回源
-third_party/
-  ├── netpoll/        cloudwego/netpoll fork（对齐节点分配器 + TakeTry 零拷贝移交）
-  └── shmipc-go/      cloudwego/shmipc-go fork（数据区 4K 对齐，O_DIRECT 直读共享内存）
+third_party/          两份 fork 并入主模块（无嵌套 go.mod），改动清单与运维约束见 third_party/README.md
+  ├── netpoll/        cloudwego/netpoll v0.7.5 fork（对齐节点分配器 + TakeTry 零拷贝移交）
+  └── shmipc-go/      cloudwego/shmipc-go v0.2.0 fork（数据区 4K 对齐，O_DIRECT 直读共享内存）
 doc/                  设计文档（v1~v3、GC/Compaction/集群）与读写性能测试报告
 ```
 
@@ -97,7 +97,11 @@ doc/                  设计文档（v1~v3、GC/Compaction/集群）与读写性
 go build -o taihu ./cmd/taihu
 ```
 
-Go 1.25+。第三方依赖（netpoll、shmipc-go）使用本仓库 `third_party/` 下的 fork（见 `go.mod` 的 `replace` 指令，已落地避免模块环）。
+Go 1.25+。第三方依赖（netpoll、shmipc-go）使用本仓库 `third_party/` 下的 fork。两份 fork **并入了主模块**
+（目录下没有 `go.mod`，import 路径为 `github.com/liucxer/taihu/third_party/...`），因此外部模块 import 本仓库
+`pkg/` 时无需为 fork 另加任何 `replace` —— 这是刻意的：`replace` 只在主模块生效、不会传递给消费者，
+早期用 `replace` 挂 fork 的写法会让外部消费者拿到上游版本而构建失败或静默降级。基线版本、逐文件改动清单、
+许可证义务与运维约束见 [third_party/README.md](third_party/README.md)。
 
 ### 启动服务端
 

@@ -20,7 +20,7 @@ import (
 	"context"
 	"sync/atomic"
 
-	"github.com/cloudwego/netpoll/internal/runner"
+	"github.com/liucxer/taihu/third_party/netpoll/internal/runner"
 )
 
 // ------------------------------------ implement OnPrepare, OnRequest, CloseCallback ------------------------------------

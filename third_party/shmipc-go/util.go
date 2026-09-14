@@ -18,7 +18,6 @@ package shmipc
 
 import (
 	"os"
-	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -79,16 +78,20 @@ func maxInt(a, b int) int {
 	return a
 }
 
+// string2bytesZeroCopy 返回 s 的零拷贝 []byte 视图（len == cap == len(s)）。
+// 调用方只能读：底层是 string 的只读内存，写入会 panic。
+//
+// 原实现手搓 reflect.SliceHeader 再整体强转成切片头，go vet 会报
+// "possible misuse of reflect.SliceHeader" —— 该结构体的 Data 是 uintptr，
+// 这样构造出的切片头会让 GC 看不到这层引用。改用 unsafe.Slice +
+// unsafe.StringData（Go 1.20+）：语义等价（同样是 len==cap 的视图），
+// 且是 vet 认可的形式。空串返回 nil —— 唯一调用方 WriteBytes 对
+// len==0 直接 return，不会解引用，行为不变。
 func string2bytesZeroCopy(s string) []byte {
-	stringHeader := (*reflect.StringHeader)(unsafe.Pointer(&s))
-
-	bh := reflect.SliceHeader{
-		Data: stringHeader.Data,
-		Len:  stringHeader.Len,
-		Cap:  stringHeader.Len,
+	if len(s) == 0 {
+		return nil
 	}
-
-	return *(*[]byte)(unsafe.Pointer(&bh))
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
 func pathExists(path string) bool {
