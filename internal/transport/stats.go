@@ -27,8 +27,8 @@ var (
 	statRxCopy   atomic.Int64 // ReadCopy/Next 回退拷贝帧数
 
 	// 写/删流水线批量统计（batchWriter / batchDeleter worker 产批计数）。
-	statWriteBatches atomic.Int64 // 写 worker 已处理的批次数
-	statWriteItems   atomic.Int64 // 写流水线已处理的任务数（对象数）
+	statWriteBatches  atomic.Int64 // 写 worker 已处理的批次数
+	statWriteItems    atomic.Int64 // 写流水线已处理的任务数（对象数）
 	statDeleteBatches atomic.Int64 // 删 worker 已处理的批次数
 	statDeleteItems   atomic.Int64 // 删流水线已处理的任务数（key 数）
 )

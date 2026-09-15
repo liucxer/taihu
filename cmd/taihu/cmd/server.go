@@ -56,14 +56,14 @@ var serverCmd = &cobra.Command{
 	Example: `  # 启动单实例服务端（双网卡监听，端口自动分配）
   taihu server -listen 10.0.0.1,10.0.0.2 -db /mnt/db -dev /dev/nvme0n1 -server-name TAIHU-0 -pd 100.71.128.11:2379`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-			listen, _ := cmd.Flags().GetString("listen")
-			db, _ := cmd.Flags().GetString("db")
-			dev, _ := cmd.Flags().GetString("dev")
-			serverName, _ := cmd.Flags().GetString("server-name")
-			writeBatch, _ := cmd.Flags().GetInt("write-batch")
-			writeWorkers, _ := cmd.Flags().GetInt("write-workers")
-			delBatch, _ := cmd.Flags().GetInt("del-batch")
-			delWorkers, _ := cmd.Flags().GetInt("del-workers")
+		listen, _ := cmd.Flags().GetString("listen")
+		db, _ := cmd.Flags().GetString("db")
+		dev, _ := cmd.Flags().GetString("dev")
+		serverName, _ := cmd.Flags().GetString("server-name")
+		writeBatch, _ := cmd.Flags().GetInt("write-batch")
+		writeWorkers, _ := cmd.Flags().GetInt("write-workers")
+		delBatch, _ := cmd.Flags().GetInt("del-batch")
+		delWorkers, _ := cmd.Flags().GetInt("del-workers")
 
 		if db == "" || dev == "" {
 			return fmt.Errorf("-db and -dev are required")

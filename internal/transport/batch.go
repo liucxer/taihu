@@ -28,14 +28,14 @@ import (
 // 各字段 ≤0 表示对应流水线关闭（退化为逐请求串行处理，保持旧行为）。
 type PipelineConfig struct {
 	// 读（现有 shmBatchReader，仅 shm 路径使用）。
-	ReadBatch    int
-	ReadWorkers  int
+	ReadBatch   int
+	ReadWorkers int
 	// 写（batchWriter）。
-	WriteBatch    int
-	WriteWorkers  int
+	WriteBatch   int
+	WriteWorkers int
 	// 删（batchDeleter）。
-	DeleteBatch    int
-	DeleteWorkers  int
+	DeleteBatch   int
+	DeleteWorkers int
 }
 
 // pipeline 组装写/删两条流水线（读由 shmServer.batched 独立管理）。
