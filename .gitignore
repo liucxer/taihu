@@ -7,3 +7,9 @@ bin/
 # 及未来任何名为 taihu 的非根目录 —— 其下新增文件会被静默排除在版本库外。
 /taihu
 /taihu-client
+# 交叉编译产物：Makefile 之外手工打包的名字带 commit 短哈希（如 taihu.b93df7f.linux.arm64），
+# 只有根目录才可能出现，同样加锚点。
+/taihu.*
+# 本地整目录快照压缩包（含 .git，几十 MB，勿入库）
+trae.zip
+.trae.zip
