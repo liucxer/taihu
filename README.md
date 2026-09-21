@@ -56,7 +56,7 @@
 数据读写路径：
 
 - **写**：`Put` → ① `PutBegin` 从 Pebble 原子申请 4K 对齐段内偏移（段满自动滚动）；② `PutAppend` **在分配锁外** `device.Append` O_DIRECT 直写（数据 4K 对齐时零拷贝直写调用方缓冲）；③ `PutCommit` 写 key→(段,偏移,大小) 映射（先数据后元数据）。
-- **读**：`GetMapping`（LRU 缓存命中即走）→ `RefSegment` 持读引用（防 GC 复用竞态）→ `device.ReadAt` 直读 bufpool 对齐缓冲（4K 对齐窗口零拷贝，非对齐窗内一次平移）→ `UnrefSegment`。
+- **读**：一次 GET 取一次映射快照（`Meta`，LRU 缓存命中即走）→ `RefSegment` 持读引用（防 GC 复用竞态）→ 按快照逐 chunk `ReadAtMeta` 直读 bufpool 对齐缓冲（4K 对齐窗口零拷贝，非对齐窗内一次平移）→ `UnrefSegment`。快照使同一响应的全部数据帧来自单一版本，见下文「读一致性」。
 - **回收**：`Delete` 仅删映射；后台 GC 周期扫描把无在途读者的 Reclaiming 段转 Free 入池；Compaction 将高空洞 Full 段标记 Compacting 后逐个搬移存活对象，CAS（`MoveMapping`）原子切换映射并转移段存活计数。
 
 ---
@@ -153,9 +153,9 @@ taihu --pd 10.0.0.10:2379 instance segments --instance TAIHU-0 --detail   # 段�
 | 命令 | 说明 |
 |------|------|
 | `taihu server` | 启动对象服务端（daemon），暴露 Put/Get/Delete/Stat RPC + shmipc + pprof |
-| `taihu bench storage` | 本地裸盘 Storage 层压测（不走网络，`-db/-dev` 直连） |
+| `taihu bench storage` | 本地裸盘 Storage 层压测（不走网络，`--db/--dev` 直连） |
 | `taihu bench cluster` | 集群端到端压测（走 TiKV 定位实例，`taihuclient`） |
-| `taihu bench single` | 单机直通压测（不走 TiKV，`-transport rpc\|shm` 直连 server） |
+| `taihu bench single` | 单机直通压测（不走 TiKV，`--transport rpc\|shm` 直连 server） |
 | `taihu cluster list` | 列出注册区全部实例 |
 | `taihu cluster status` | 逐实例连通性/段汇总/水位体检 |
 | `taihu cluster index` | key→实例索引按实例归组计数 |
@@ -193,6 +193,14 @@ taihu --pd 10.0.0.10:2379 instance segments --instance TAIHU-0 --detail   # 段�
 
 - bufpool：2 的幂分桶（4KB~8GB）自管理 freelist（避开 `sync.Pool` 的 GC 清空行为），保证热路径零分配、零清零。
 - 元数据缓存：256 分片、全局预算 1 GiB（每片 4MB）的 LRU read-through 缓存，Pebble 为真实源，任何时刻可重建。
+
+### 读一致性（GET 级映射快照）
+
+- **不变式**：一次 `Get` 返回的字节必须来自**单一版本的连续区间**——对象跨多个 4 MiB 帧下发时，绝不能前半段来自版本 A、后半段来自版本 B。
+- **实现**：`handleGet`（TCP）与 `handleShmGet`（shm）在请求入口解析**一次** `key → (段,偏移,大小)`（`Storage.Meta`），整段读取全程复用（`ReadAtMeta` / `ReadAtIntoMeta`）；`ReadAt` / `ReadAtInto` 仍是 `GetMapping` + 委派，逐 chunk 重解析只在单 chunk 调用下等价。`size=-1` 的 size 也由该快照推导（与数据同版本）。
+- **必须配 GET 级段引用**：快照指向的段在覆盖写/删除后存活计数归零转 Reclaiming，而 GC **仅在读引用归零时**才允许回收复用（`Reclaiming→Free`）。故整段读取期间须持 `RefSegment`/`UnrefSegment`；不持引用地按旧快照续读，会读到被复用段上他人写入的数据（静默损坏，比版本混合更严重）。
+- **边界**：客户端 `Get(size=-1)` 是 `Stat` + `GetData` 两次 RPC，size 仍可能取自另一版本（既有且已知的 TOCTOU，非快照覆盖范围）；shm 中「恰为一个 4K 对齐整 4 MiB 块」的请求走 `BatchRead` 聚合批读，单块本身不存在跨块混合。
+- **回归用例**：`test/e2e` 的 `TestE1MultiChunkNoTear`（8 MiB+1 三帧对象，2 写者并发覆盖 + 4 读者，任何一次成功读都必须等于某一版完整内容）；`internal/storage` 的 `TestReadAtMetaSnapshot` 钉住「按快照读仍是旧版本、按 key 读是新版本」。
 
 ---
 
