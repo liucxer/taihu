@@ -162,6 +162,39 @@ func (c *Conn) endStream(st *stream) {
 	c.removeStream(st)
 }
 
+// drainPutTail 丢弃 Put 流已无用的尾部帧。
+//
+// 客户端 Put 是「全量先行发送」：PutHeader 之后立刻把所有 PutData 与 OpPutEnd 发完，
+// 最后才等响应。故服务端在 PutHeader 之后提前失败（对象超限 / 零长 / PutBegin 失败）时，
+// 客户端仍有尾帧在途；这些帧必须由本流消费掉——否则它们到达时流已被 endStream 注销、
+// op 又不是首帧类型，会被 dispatch 判为「未知流非首帧」协议错误 → deliverFatal → 关闭
+// 整条连接（连接一死，其上后续所有 RPC 全部失败；客户端仅轮转选连接，无剔除重建，
+// 于是死连接被永久复用，错误随时间线性累积）。
+//
+// budget 为待丢弃的数据字节数（即 PutHeader 的 size），消费满后再吃掉收尾的 OpPutEnd；
+// 对端提前收尾或连接关闭时立即返回。等待语义与正常 Put 路径一致（同样是等对端发完），
+// 不引入新的阻塞面。
+func (c *Conn) drainPutTail(st *stream, budget int64) {
+	var got int64
+	for got < budget {
+		msg, err := c.await(context.Background(), st)
+		if err != nil {
+			return
+		}
+		if msg.op != protocol.OpPutData {
+			msg.r.Release() // 对端提前收尾（OpPutEnd）
+			return
+		}
+		got += int64(msg.r.Len())
+		msg.r.Release()
+	}
+	msg, err := c.await(context.Background(), st) // 收尾帧 OpPutEnd
+	if err != nil {
+		return
+	}
+	msg.r.Release()
+}
+
 // handlePut 处理 Put 流：首帧 PutHeader{key,size}，PutHeader 后立即 PutBegin 串行分配
 // 段内位置（游标连续，保序分配）；随后 PutData 帧汇入 bufpool 缓冲，PutEnd 后整对象
 // 交给写流水线（AppendBatch 一次 io_submit 排空 + BatchPutCommit 批量建映射；流水线
@@ -185,20 +218,24 @@ func (s *Server) handlePut(c *Conn, st *stream) {
 	}
 	if size > s.storage.MaxObjectSize() {
 		_ = c.writeFrame(st.id, protocol.OpResp, protocol.EncCode(protocol.CodeTooLarge))
+		c.drainPutTail(st, size) // 客户端的数据帧已在途，不排空会关连接
 		return
 	}
 	if size == 0 {
 		if err := s.storage.Put(context.Background(), key, 0, nil); err != nil {
 			_ = c.writeFrame(st.id, protocol.OpResp, protocol.EncCode(protocol.MapStorageErr(err)))
+			c.drainPutTail(st, 0) // 零长 Put 也带 OpPutEnd 收尾帧
 			return
 		}
 		_ = c.writeFrame(st.id, protocol.OpResp, protocol.EncCode(protocol.CodeOK))
+		c.drainPutTail(st, 0)
 		return
 	}
 
 	seg, off, err := s.storage.PutBegin(context.Background(), key, size)
 	if err != nil {
 		_ = c.writeFrame(st.id, protocol.OpResp, protocol.EncCode(protocol.MapStorageErr(err)))
+		c.drainPutTail(st, size) // 典型：ErrNoSpace（盘满）时客户端整对象已在途
 		return
 	}
 
@@ -253,8 +290,8 @@ func (s *Server) handlePut(c *Conn, st *stream) {
 	}
 }
 
-// handleGet 处理 Get 请求：按 ChunkSize 分块 ReadAt 下发 OpGetData，
-// 最后一个数据帧置 final 位（OpGetDataFinal）收尾（不再发 OpGetEnd 空帧）；
+// handleGet 处理 Get 请求：入口取一次映射快照（GET 级），再按 ChunkSize 分块 ReadAtMeta
+// 下发 OpGetData，最后一个数据帧置 final 位（OpGetDataFinal）收尾（不再发 OpGetEnd 空帧）；
 // 出错发 OpGetErr（带错误码）。数据帧零拷贝引用 ReadAt 返回的 bufpool 缓冲，
 // writeFrame 返回（Flush 排空）后归还缓冲。
 func (s *Server) handleGet(c *Conn, st *stream) {
@@ -270,25 +307,31 @@ func (s *Server) handleGet(c *Conn, st *stream) {
 		_ = c.writeFrame(st.id, protocol.OpGetErr, protocol.EncCode(protocol.CodeInvalidArgument))
 		return
 	}
+	// GET 级映射快照：入口解析一次 key→meta 并全程复用，使整段响应严格来自同一版本
+	// （逐 chunk 重解析会在并发覆盖写中途切换版本，产生 chunk 级混合）；size==-1 的 size
+	// 也由该快照推导（与数据同版本）。同时持有快照段引用，防止该段在读取期间被 GC 回收
+	// 复用（覆盖写/删除后计数归零转 Reclaiming，仅 refs 归零才可回收）。
+	meta, err := s.storage.Meta(context.Background(), key)
+	if err != nil {
+		_ = c.writeFrame(st.id, protocol.OpGetErr, protocol.EncCode(protocol.MapStorageErr(err)))
+		return
+	}
 	if size == -1 {
-		total, err := s.storage.Stat(context.Background(), key)
-		if err != nil {
-			_ = c.writeFrame(st.id, protocol.OpGetErr, protocol.EncCode(protocol.MapStorageErr(err)))
-			return
-		}
-		size = total - off
+		size = meta.Size - off
 	}
 	if size < 0 {
 		_ = c.writeFrame(st.id, protocol.OpGetErr, protocol.EncCode(protocol.CodeInvalidRange))
 		return
 	}
+	s.storage.RefSegment(meta.SegmentID)
+	defer s.storage.UnrefSegment(meta.SegmentID)
 	pos, end := off, off+size
 	for pos < end {
 		want := end - pos
 		if want > protocol.ChunkSize {
 			want = protocol.ChunkSize
 		}
-		data, rerr := s.storage.ReadAt(context.Background(), key, pos, want)
+		data, rerr := s.storage.ReadAtMeta(context.Background(), meta, pos, want)
 		if len(data) > 0 {
 			op := protocol.OpCode(protocol.OpGetData)
 			if pos+int64(len(data)) >= end || rerr == io.EOF {

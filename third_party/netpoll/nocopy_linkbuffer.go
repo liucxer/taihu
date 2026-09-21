@@ -429,9 +429,16 @@ func (b *UnsafeLinkBuffer) Slice(n int) (r Reader, err error) {
 //   - 数据须位于单一节点内（b.head==b.read 且 b.read.next==nil；Slice 生成的
 //     子 Reader 会把 flush 置 nil，故以链表末节点判定单节点）；
 //   - 该节点须为收流精确对齐节点（flagInputAligned，容量=帧长，ack 后不再写入）；
-//   - 节点已被本帧完整消费（origin 无剩余未读数据，其余引用仅剩本 Reader）；
+//   - 节点已被本帧完整消费（origin 无剩余未读数据）；
+//   - 整帧须独占整个节点（base==0，即 len(node.buf)==len(origin.buf)）：一个节点
+//     可能承载多帧，末帧虽已写满且 origin 读完，整块前段仍属同块内其它帧的数据，
+//     一并交出后会被复用覆盖，故只认「整块独属本帧」；
 //   - 节点已写满（origin.malloc == cap）：未写满节点 book 仍会复用其缓冲，
-//     移交后被再写入会造成缓冲归属错乱，必须回退拷贝路径。
+//     移交后被再写入会造成缓冲归属错乱，必须回退拷贝路径；
+//   - 节点上无其它存活引用（origin.refer 仅剩本 Reader）：同节点可能承载多帧，
+//     前序帧的子 Reader 尚未 Release（另一路 RPC 正在读它的负载）时移交，
+//     缓冲经调用方归还后立刻被后续收流复用覆盖，前序读者会读到被改写的数据
+//     （跨 RPC 数据错配），同样必须回退拷贝路径。
 //
 // 成功时返回 (buf, full, true)：buf 为负载切片（len==剩余负载），底层为整块精确
 // 对齐缓冲；full 为整块缓冲（len==cap==节点容量，PutExact 按此归桶）。调用方用毕
@@ -452,11 +459,33 @@ func (b *UnsafeLinkBuffer) TakeTry() (buf, full []byte, ok bool) {
 	if origin.Len() != 0 {
 		return nil, nil, false // origin 仍有未读数据（多帧同节点），移交会丢数据
 	}
+	// 独占性检查（base==0）：整帧须恰好覆盖整块 origin 缓冲才允许移交。
+	// 收流按 bookSize 成块读入，一个节点可能承载多帧；此时即使 origin 已读完、
+	// 节点已写满且 refer==2，整块缓冲的前段仍属于同块内其它帧的数据，把整块
+	// 一并交出去、归还池后被后续收流复用覆盖，就会改写那些帧的内容。
+	// base = len(origin.buf) - len(node.buf)，只认 base==0（整块独属本帧）。
+	if len(node.buf) != len(origin.buf) {
+		return nil, nil, false
+	}
 	if origin.malloc != cap(origin.buf) {
 		return nil, nil, false // 节点未写满，book 仍会复用其缓冲
 	}
-	// 所有权移交：缓冲归还唯一路径为调用方的 put，节点对象后续 Release 不再归还缓冲。
+	// 所有权移交的原子性：必须先置 flagUnmanaged，再做引用检查。
+	// 主 Reader 的 Release 可能与本函数并发：它先判定 refer 是否归零、再判 reusable()
+	// 决定是否回收缓冲。若本函数在其判定之后才置标志，Release 会把缓冲当普通节点
+	// 归还进池，而调用方此时正持有它——后续收流复用同一缓冲即静默改写调用方数据。
+	// 先置标志可保证：任何能把 refer 递减到 0 的 Release 都必然看到「已移交」而跳过回收。
 	origin.setFlag(flagUnmanaged)
+	// 其它存活引用检查：origin.refer 计数 = 1（origin 自身）+ 存活 Refer 节点数，
+	// 本 Reader 是唯一存活引用时恰为 2。多于一者说明同节点上还有未 Release 的帧
+	// 子 Reader 在引用该缓冲，移交后缓冲会被复用覆盖（见函数注释）；少于一者说明
+	// 主 Reader 已释放该节点，缓冲可能已被回收，同样不能移交。
+	if atomic.LoadInt32(&origin.refer) != 2 {
+		// 未移交：撤销标记，恢复该节点的常规回收路径。
+		// 本 Reader 仍被本函数持有，故 refer 在此期间不会归零，撤销不会造成缓冲丢失。
+		origin.unsetFlag(flagUnmanaged)
+		return nil, nil, false
+	}
 	// 负载起点在 origin 缓冲内的偏移：origin 被本帧完整消费，故
 	// base = len(origin.buf) - len(node.buf)，负载 = node.buf[node.off:]。
 	base := len(origin.buf) - len(node.buf)
