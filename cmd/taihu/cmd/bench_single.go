@@ -25,18 +25,19 @@ var benchSingleCmd = &cobra.Command{
 	Long: `taihu bench single：单机直通端到端压测。
 
 必传参数：
-  -mode write|read|delete        测试模式
-  -transport rpc|shm             通信方式
-  -transport rpc 时：-addr         taihu-server TCP 地址（逗号分隔多地址）
-  -transport shm 时：-shm          taihu-server unix socket 路径
+  --mode write|read|delete       测试模式
+  --transport rpc|shm            通信方式
+  --transport rpc 时：--addr      taihu-server TCP 地址（逗号分隔多地址）
+  --transport shm 时：--shm       taihu-server unix socket 路径
 
 说明：
+  长选项必须用双横线（--mode），单横线会被 pflag 当作 shorthand 解析；
   不查 TiKV、无集群路由/索引；read 前须先用相同前缀 write 灌好数据。`,
 	Example: `  # 直通 RPC 写
-  taihu bench single -mode write -transport rpc -addr 100.71.128.12:50051 -size 4194304 -count 40000 -threads 32 -latency
+  taihu bench single --mode write --transport rpc --addr 100.71.128.12:50051 --size 4194304 --count 40000 --threads 32 --latency
 
   # 直通共享内存读
-  taihu bench single -mode read -transport shm -shm /dev/TAIHU-0 -count 40000 -threads 32 -latency`,
+  taihu bench single --mode read --transport shm --shm /dev/TAIHU-0 --count 40000 --threads 32 --latency`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c := &singleBenchConfig{}
 		c.transport, _ = cmd.Flags().GetString("transport")
@@ -107,9 +108,9 @@ type singleBenchConfig struct {
 
 func init() {
 	f := benchSingleCmd.Flags()
-	f.String("transport", "", "data-plane transport: rpc (TCP, with -addr) | shm (shared memory, with -shm)")
-	f.String("addr", "", "taihu-server TCP address(es), comma-separated (with -transport rpc)")
-	f.String("shm", "", "taihu-server unix socket path (with -transport shm)")
+	f.String("transport", "", "data-plane transport: rpc (TCP, with --addr) | shm (shared memory, with --shm)")
+	f.String("addr", "", "taihu-server TCP address(es), comma-separated (with --transport rpc)")
+	f.String("shm", "", "taihu-server unix socket path (with --transport shm)")
 	f.Int("conns", 4, "connections per TCP address (shmipc SessionNum for shm; multi-address builds addrs x conns, round-robin)")
 	f.String("cpuprofile", "", "write cpu profile to this file (pprof)")
 	f.String("mode", "", "write | read | delete")

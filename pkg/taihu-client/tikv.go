@@ -22,6 +22,7 @@ type TiKVOptions struct {
 	UsageThreshold   float64       // 选实例水位阈值百分比 0-100（<=0 或 >100 默认 80）
 	WriteRouting     string        // 写路由算法：RouteLocal（默认）或 RouteRoundRobin
 	Conns            int           // 每地址数据面连接数（<=0 默认 1）
+	Transport        string        // 数据面传输：TransportAuto（默认）/ TransportRPC（强制 TCP）/ TransportShm（强制共享内存）
 
 	Source       SourceGetter      // 回源回调（可选）
 	ClientName   string            // 客户端标识（仅标注/客户端注册用）
@@ -30,13 +31,18 @@ type TiKVOptions struct {
 	ClientLabels map[string]string // 客户端自定义标签
 }
 
+// newTiKVKV 是 cluster.NewTiKVKV 的间接层：单测注入假实现，避免连接真实 TiKV/PD。
+var newTiKVKV = func(ctx context.Context, pdAddrs []string, tls cluster.TLSConfig) (cluster.KV, error) {
+	return cluster.NewTiKVKV(ctx, pdAddrs, tls)
+}
+
 // NewFromTiKV 连接 TiKV TxnKV 并构建集群客户端（Storage）。
 // 返回的 Storage 已启动实例发现/索引后台任务，用毕须 Close()。
 func NewFromTiKV(ctx context.Context, opts TiKVOptions) (*Storage, error) {
 	if len(opts.PDAddrs) == 0 {
 		return nil, fmt.Errorf("taihuclient: TiKVOptions.PDAddrs is required")
 	}
-	kv, err := cluster.NewTiKVKV(ctx, opts.PDAddrs, cluster.TLSConfig{
+	kv, err := newTiKVKV(ctx, opts.PDAddrs, cluster.TLSConfig{
 		CA: opts.CA, Cert: opts.Cert, Key: opts.Key,
 	})
 	if err != nil {
@@ -50,6 +56,7 @@ func NewFromTiKV(ctx context.Context, opts TiKVOptions) (*Storage, error) {
 		UsageThreshold:   opts.UsageThreshold,
 		WriteRouting:     opts.WriteRouting,
 		Conns:            opts.Conns,
+		Transport:        opts.Transport,
 		Source:           opts.Source,
 		ClientID:         opts.ClientID,
 		ClientAddr:       opts.ClientAddr,

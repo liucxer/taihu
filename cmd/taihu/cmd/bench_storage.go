@@ -41,6 +41,11 @@ type storageBenchConfig struct {
 	memProfile  string
 }
 
+// deviceCapacity 是 device.DeviceCapacity 的测试缝隙（与 helpers.go 的 kvConnect 同款）：
+// 生产路径恒为真实 BLKGETSIZE64 裸盘容量查询，行为不变；单测环境无裸盘，
+// 替换为按普通文件大小近似，使命令级测试能端到端跑通 RunE 的全部流程。
+var deviceCapacity = device.DeviceCapacity
+
 // benchStorageCmd 本地裸盘 Storage 层压测。
 var benchStorageCmd = &cobra.Command{
 	Use:   "storage",
@@ -48,18 +53,20 @@ var benchStorageCmd = &cobra.Command{
 	Long: `taihu bench storage：本地裸盘 Storage 层压测（设计文档 §9）。
 
 必传参数：
-  -mode write|read                测试模式
-  -db <dir>                       pebble 元数据目录
-  -dev <path>                     裸设备路径
+  --mode write|read               测试模式
+  --db <dir>                      pebble 元数据目录
+  --dev <path>                    裸设备路径
 
 说明：
   读模式创建 Storage 后先 LoadCache 预热元数据，剔除 pebble 读对带宽的影响；
-  key 为 <prefix>/<seq>，read 前须先用相同前缀 write 灌好数据。`,
+  key 为 <prefix>/<seq>，read 前须先用相同前缀 write 灌好数据。
+  长选项必须用双横线（--mode），单横线会被 pflag 当作 shorthand 解析。
+  裸设备须独占：不能与正在运行的 taihu server 共用同一分区。`,
 	Example: `  # 4M 对象并发写（裸盘直写）
-  taihu bench storage -mode write -db /mnt/db -dev /dev/nvme0n1 -size 4194304 -count 40000 -threads 32 -latency
+  taihu bench storage --mode write --db /mnt/db --dev /dev/nvme0n1 --size 4194304 --count 40000 --threads 32 --latency
 
   # 4M 对象并发读（先 LoadCache 预热）
-  taihu bench storage -mode read -db /mnt/db -dev /dev/nvme0n1 -size 4194304 -count 40000 -threads 32 -latency -cpuprofile /tmp/storage.cpu`,
+  taihu bench storage --mode read --db /mnt/db --dev /dev/nvme0n1 --size 4194304 --count 40000 --threads 32 --latency --cpuprofile /tmp/storage.cpu`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c := &storageBenchConfig{}
 		c.mode, _ = cmd.Flags().GetString("mode")
@@ -95,7 +102,7 @@ var benchStorageCmd = &cobra.Command{
 		}
 
 		// 读取设备真实容量并计算布局（段数不再硬编码 2048）。
-		capacity, err := device.DeviceCapacity(c.devPath)
+		capacity, err := deviceCapacity(c.devPath)
 		if err != nil {
 			stopCPUProfile(cpuFile)
 			return fmt.Errorf("DeviceCapacity: %w", err)
