@@ -16,7 +16,7 @@ func testBackends(t *testing.T) []backend {
 			name: "libaio",
 			new: func(t *testing.T, maxEvents int) Ring {
 				t.Helper()
-				r, err := NewWithMode(maxEvents, ModeLibAIO)
+				r, err := NewWithOptions(maxEvents, Options{Mode: ModeLibAIO})
 				if err != nil {
 					t.Fatalf("New libaio: %v", err)
 				}
@@ -30,7 +30,7 @@ func testBackends(t *testing.T) []backend {
 				if info := Probe(); !info.Supported {
 					t.Skipf("io_uring 不可用: %s (kernel=%s)", info.Reason, info.KernelRelease)
 				}
-				r, err := NewWithMode(maxEvents, ModeIOUring)
+				r, err := NewWithOptions(maxEvents, Options{Mode: ModeIOUring})
 				if err != nil {
 					t.Fatalf("New io_uring: %v", err)
 				}

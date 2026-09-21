@@ -15,11 +15,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// CheckIOPoll 校验目标块设备是否开启了队列级轮询 —— IOPOLL 的前置条件。
-//
-// 未开启时内核的 blk_poll 直接返回 0，io_uring 的轮询请求既不完成也不报错，
-// 会永远停在 iopoll_list 上（表现为挂死），故这里提前硬失败并给出开启命令。
-func CheckIOPoll(devPath string) error {
+// checkIOPoll 校验目标块设备是否开启了队列级轮询 —— IOPOLL 的前置条件。
+// 导出入口 CheckIOPoll 与其释义在 aio.go。
+func checkIOPoll(devPath string) error {
 	sysPath := "/sys/class/block/" + filepath.Base(devPath) + "/queue/io_poll"
 	b, err := os.ReadFile(sysPath)
 	if err != nil {

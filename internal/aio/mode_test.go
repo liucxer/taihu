@@ -7,25 +7,6 @@ import (
 	"testing"
 )
 
-// TestModeString 覆盖 Mode.String() 的三个具名取值与未知取值的兜底格式。
-func TestModeString(t *testing.T) {
-	cases := []struct {
-		m    Mode
-		want string
-	}{
-		{ModeAuto, "auto"},
-		{ModeLibAIO, "libaio"},
-		{ModeIOUring, "io_uring"},
-		{Mode(7), "Mode(7)"},
-		{Mode(-1), "Mode(-1)"},
-	}
-	for _, c := range cases {
-		if got := c.m.String(); got != c.want {
-			t.Errorf("Mode(%d).String() = %q, want %q", int(c.m), got, c.want)
-		}
-	}
-}
-
 // TestParseMode 覆盖命令行取值解析：大小写/空白归一化、三个合法取值与非法取值。
 func TestParseMode(t *testing.T) {
 	cases := []struct {
@@ -62,95 +43,79 @@ func TestParseMode(t *testing.T) {
 	}
 }
 
-// TestNewWithModeInvalidMaxEvents maxEvents 越界时两个后端都必须报错，不得静默建出队列。
-func TestNewWithModeInvalidMaxEvents(t *testing.T) {
+// TestNewWithOptionsInvalidMaxEvents maxEvents 越界时三个后端取值都必须报错，不得静默建出队列。
+func TestNewWithOptionsInvalidMaxEvents(t *testing.T) {
 	for _, m := range []Mode{ModeLibAIO, ModeIOUring, ModeAuto} {
 		for _, n := range []int{0, -1, 1<<16 + 1} {
-			r, err := NewWithMode(n, m)
+			r, err := NewWithOptions(n, Options{Mode: m})
 			if err == nil {
 				_ = r.Close()
-				t.Errorf("NewWithMode(%d, %v) 应报错", n, m)
+				t.Errorf("NewWithOptions(%d, {Mode: %d}) 应报错", n, int(m))
 			}
 		}
 	}
 }
 
-// TestNew New 必须固定走 libaio，且越界 maxEvents 报错。
-func TestNew(t *testing.T) {
-	r, err := New(4)
-	if err != nil {
-		t.Fatalf("New(4): %v", err)
-	}
-	defer func() { _ = r.Close() }()
-	if _, ok := r.(*ring); !ok {
-		t.Fatalf("New 应固定用 libaio 后端，得到 %T", r)
-	}
-	if r2, err := New(0); err == nil {
-		_ = r2.Close()
-		t.Error("New(0) 应报错")
-	}
-}
-
-// TestNewWithOptionsEnvOverride EnvMode 仅在 ModeAuto 下生效，且非法取值必须报错
+// TestNewWithOptionsEnvOverride envMode 仅在 ModeAuto 下生效，且非法取值必须报错
 // 而不是静默降级。
 func TestNewWithOptionsEnvOverride(t *testing.T) {
 	// off → libaio
-	t.Setenv(EnvMode, "off")
+	t.Setenv(envMode, "off")
 	r, err := NewWithOptions(4, Options{})
 	if err != nil {
-		t.Fatalf("EnvMode=off: %v", err)
+		t.Fatalf("envMode=off: %v", err)
 	}
 	if _, ok := r.(*ring); !ok {
-		t.Errorf("EnvMode=off 应落到 libaio，得到 %T", r)
+		t.Errorf("envMode=off 应落到 libaio，得到 %T", r)
 	}
 	_ = r.Close()
 
 	// 非法取值 → 报错（不得静默降级）
-	t.Setenv(EnvMode, "bogus")
+	t.Setenv(envMode, "bogus")
 	if r, err := NewWithOptions(4, Options{}); err == nil {
 		_ = r.Close()
-		t.Error("非法 EnvMode 应报错")
-	} else if !strings.Contains(err.Error(), EnvMode) {
-		t.Errorf("err=%v 应带上环境变量名 %s", err, EnvMode)
+		t.Error("非法 envMode 应报错")
+	} else if !strings.Contains(err.Error(), envMode) {
+		t.Errorf("err=%v 应带上环境变量名 %s", err, envMode)
 	}
 
 	// 显式指定后端时 env 被忽略（即使取值非法）
 	if r, err := NewWithOptions(4, Options{Mode: ModeLibAIO}); err != nil {
-		t.Errorf("显式 ModeLibAIO 时不应受非法 EnvMode 影响: %v", err)
+		t.Errorf("显式 ModeLibAIO 时不应受非法 envMode 影响: %v", err)
 	} else {
 		_ = r.Close()
 	}
 
 	// auto（env 与内核能力都指向 auto）→ 走探测
-	t.Setenv(EnvMode, "auto")
+	t.Setenv(envMode, "auto")
 	rAuto, err := NewWithOptions(4, Options{})
 	if err != nil {
-		t.Fatalf("EnvMode=auto: %v", err)
+		t.Fatalf("envMode=auto: %v", err)
 	}
 	_ = rAuto.Close()
 
 	// on → io_uring（内核不支持时只能报错）
-	t.Setenv(EnvMode, "on")
+	t.Setenv(envMode, "on")
 	rOn, err := NewWithOptions(4, Options{})
 	if err != nil {
 		if !Probe().Supported {
 			t.Skipf("io_uring 不可用: %v", err)
 		}
-		t.Fatalf("EnvMode=on: %v", err)
+		t.Fatalf("envMode=on: %v", err)
 	}
 	if _, ok := rOn.(*uringRing); !ok {
-		t.Errorf("EnvMode=on 应落到 io_uring，得到 %T", rOn)
+		t.Errorf("envMode=on 应落到 io_uring，得到 %T", rOn)
 	}
 	_ = rOn.Close()
 
 	// on + IOPoll：只创建不提交（目标块设备未开队列轮询时提交会挂死）
-	t.Setenv(EnvMode, "on")
+	t.Setenv(envMode, "on")
 	rPoll, err := NewWithOptions(4, Options{IOPoll: true})
 	if err != nil {
 		if !Probe().Supported {
 			t.Skipf("io_uring 不可用: %v", err)
 		}
-		t.Fatalf("EnvMode=on + IOPoll: %v", err)
+		t.Fatalf("envMode=on + IOPoll: %v", err)
 	}
 	_ = rPoll.Close()
 }

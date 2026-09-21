@@ -100,7 +100,7 @@ func TestProbeCached(t *testing.T) {
 			t.Errorf("支持时 Reason 应为 ok，得到 %q", first.Reason)
 		}
 		// 探测结论必须与真实建 ring 的结果一致（不能只看 errno 就下结论）。
-		r, err := NewWithMode(4, ModeIOUring)
+		r, err := NewWithOptions(4, Options{Mode: ModeIOUring})
 		if err != nil {
 			t.Fatalf("Probe 报支持但建 ring 失败: %v", err)
 		}

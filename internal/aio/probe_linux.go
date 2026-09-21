@@ -2,7 +2,6 @@ package aio
 
 import (
 	"fmt"
-	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -15,44 +14,8 @@ import (
 // 其后紧跟 ops_len 个 struct io_uring_probe_op（各 8 字节）。
 const uringProbeHeaderLen = 16
 
-// Info 描述 io_uring 可用性探测结果。
-type Info struct {
-	Supported     bool   // 当前内核是否可用 io_uring
-	Reason        string // 人类可读原因（供日志与错误信息）
-	KernelRelease string // 内核版本字符串，仅供日志
-	SQEntries     uint32 // 内核回填的提交队列深度
-	CQEntries     uint32 // 内核回填的完成队列深度
-	Features      uint32 // 内核能力位（IORING_FEAT_*）
-}
-
-var (
-	probeMu   sync.Mutex
-	probeInfo Info
-	probeDone bool
-)
-
-// Probe 探测当前内核是否可用 io_uring。
-//
-// 判定完全基于 io_uring_setup 的 errno，不比较内核版本号 —— 版本号反映不了三类
-// 误判：RHEL 系的 io_uring_disabled sysctl、容器 seccomp 拦截、以及发行版把 io_uring
-// 反向移植进老内核（例如 openEuler/BCLinux 4.19.90 就带完整 backport，能力集约等于 5.8）。
-//
-// 只缓存确定性结论：资源类瞬时错误（ENOMEM/EMFILE 等）下次调用会重新探测，
-// 否则一次偶发失败会把进程永久钉死在 libaio 上。
-func Probe() Info {
-	probeMu.Lock()
-	defer probeMu.Unlock()
-	if probeDone {
-		return probeInfo
-	}
-	info, deterministic := probe()
-	if info.Supported || deterministic {
-		probeInfo, probeDone = info, true
-	}
-	return info
-}
-
 // probe 实际执行一次探测，第二个返回值表示结论是否确定性（可否缓存）。
+// 导出入口 Probe 与结论缓存在 aio.go。
 func probe() (Info, bool) {
 	info := Info{KernelRelease: kernelRelease()}
 
