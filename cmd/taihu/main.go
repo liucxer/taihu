@@ -9,8 +9,20 @@ import (
 	"github.com/liucxer/taihu/cmd/taihu/cmd"
 )
 
-func main() {
-	if err := cmd.Execute(); err != nil {
-		os.Exit(1)
+// run 以 args（不含程序名）为命令行参数执行 CLI，返回进程退出码。
+// 抽成函数只为让「参数装配 + 退出码」可被单测覆盖：生产路径 main 传入
+// os.Args[1:]，args 非 nil，等价于原先直接在 main 里调 cmd.Execute()。
+func run(args []string) int {
+	if args == nil {
+		args = os.Args[1:]
 	}
+	os.Args = append([]string{os.Args[0]}, args...)
+	if err := cmd.Execute(); err != nil {
+		return 1
+	}
+	return 0
+}
+
+func main() {
+	os.Exit(run(os.Args[1:]))
 }

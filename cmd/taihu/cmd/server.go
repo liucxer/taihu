@@ -23,7 +23,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/liucxer/taihu/internal/cluster"
-	"github.com/liucxer/taihu/internal/device"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
 	"github.com/liucxer/taihu/internal/storage"
@@ -45,7 +44,8 @@ var serverCmd = &cobra.Command{
 必传参数：
   -listen <IP1,IP2,...>      监听 IP 列表（逗号分隔；支持 bond0/1/2 多网卡，同一端口在全部 IP 绑定）
   -db <dir>                  pebble 元数据目录
-  -dev <path>                裸设备路径
+  -dev <path>                裸设备路径（建议指 GPT 单分区，分区 PARTLABEL=server-name；
+                            进程将以 O_EXCL 独占打开，存活期间该盘 mount/mkfs/重写分区表均被内核拒绝）
   -server-name <NAME>        实例唯一标识（如 TAIHU-0；也是 TiKV 容量记录与集群注册的 key）
   -pd <PD...>                TiKV PD 地址（逗号分隔；容量记录/比较、集群注册依赖）
 
@@ -107,7 +107,9 @@ var serverCmd = &cobra.Command{
 		// 容量读取 + TiKV 记录/比较：每次启动读取一次 nvme 容量，
 		// 与 TiKV 中该实例已有记录比对，不一致（换盘/容量变化）拒绝启动。
 		segSize := layout.DefaultSegmentSizeBytes // 段大小内置写死（8GiB），不允许命令行覆盖
-		kv, err := cluster.NewTiKVKV(ctx, strings.Split(global.pd, ","), cluster.TLSConfig{
+		// 直连注册区 TiKV（此处不经 helpers.go 的 connectKV：启动路径需保留原始错误前缀
+		// 与无 ctx 兜底语义）；newTiKVKV 是包级测试缝隙，生产恒为 cluster.NewTiKVKV。
+		kv, err := newTiKVKV(ctx, splitCSV(global.pd), cluster.TLSConfig{
 			CA: global.tikvCA, Cert: global.tikvCert, Key: global.tikvKey,
 		})
 		if err != nil {
@@ -115,7 +117,7 @@ var serverCmd = &cobra.Command{
 		}
 		defer kv.Close()
 
-		capacity, err := device.DeviceCapacity(dev)
+		capacity, err := deviceCapacity(dev)
 		if err != nil {
 			return fmt.Errorf("DeviceCapacity %s: %w", dev, err)
 		}

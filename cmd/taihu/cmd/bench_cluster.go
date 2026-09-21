@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -27,23 +26,24 @@ var benchClusterCmd = &cobra.Command{
 	Long: `taihu bench cluster：taihuclient 集群端到端压测。
 
 必传参数：
-  -mode write|read|delete        测试模式
-  -client-name                   客户端标识（根级参数；集群注册/同机判定用）
-  -pd <PD...>                    TiKV PD 地址（根级参数，逗号分隔）
+  --mode write|read|delete       测试模式
+  --client-name                  客户端标识（根级参数；集群注册/同机判定用）
+  --pd <PD...>                   TiKV PD 地址（根级参数，逗号分隔）
 
 可选参数：
-  -transport auto|rpc|shm        数据面传输：auto=同机shm/跨节点TCP（默认），rpc=强制TCP（含同机），shm=强制共享内存
-  -write-routing local|round-robin  写路由算法：local 优先本地（默认）/ round-robin 轮询全部实例
-  -conns                         每 TCP 地址连接数（shm 会话数；多 IP 实例总连接=地址数×conns）
-  -preload                       读模式：先预热 RouteCache 再计时（剔除每 key 查 TiKV 开销）
+  --transport auto|rpc|shm       数据面传输：auto=同机shm/跨节点TCP（默认），rpc=强制TCP（含同机），shm=强制共享内存
+  --write-routing local|round-robin  写路由算法：local 优先本地（默认）/ round-robin 轮询全部实例
+  --conns                        每 TCP 地址连接数（shm 会话数；多 IP 实例总连接=地址数×conns）
+  --preload                      读模式：先预热 RouteCache 再计时（剔除每 key 查 TiKV 开销）
 
 说明：
-  同机也可用 -transport rpc 测 RPC 性能；read 前须先用相同前缀 write 灌好数据。`,
+  长选项必须用双横线（--mode），单横线会被 pflag 当作 shorthand 解析；
+  同机也可用 --transport rpc 测 RPC 性能；read 前须先用相同前缀 write 灌好数据。`,
 	Example: `  # 跨节点自动选路写（同机 shm / 跨节点 TCP）
-  taihu --pd 100.71.128.11:2379,100.71.128.12:2379 bench cluster -mode write -client-name t11 -size 4194304 -count 40000 -threads 32 -latency
+  taihu --pd 100.71.128.11:2379,100.71.128.12:2379 bench cluster --mode write --client-name t11 --size 4194304 --count 40000 --threads 32 --latency
 
   # 同机强制 RPC 读（预热路由缓存，剔除每 key 查 TiKV 开销）
-  taihu --pd 100.71.128.11:2379 --client-name t12 bench cluster -mode read -transport rpc -count 40000 -threads 32 -latency -preload`,
+  taihu --pd 100.71.128.11:2379 --client-name t12 bench cluster --mode read --transport rpc --count 40000 --threads 32 --latency --preload`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c := &clusterBenchConfig{}
 		c.transport, _ = cmd.Flags().GetString("transport")
@@ -77,8 +77,10 @@ var benchClusterCmd = &cobra.Command{
 			return fmt.Errorf("cpuprofile: %w", err)
 		}
 
-		// 集群模式：先查 TiKV 定位实例（taihuclient；-transport 控制数据面传输方式）。
-		kv, kerr := cluster.NewTiKVKV(ctx, strings.Split(c.tikvPD, ","), cluster.TLSConfig{
+		// 集群模式：先直连 TiKV 定位实例（taihuclient；-transport 控制数据面传输方式）。
+		// 此处不经 helpers.go 的 connectKV：启动路径保留原始错误前缀与无 ctx 兜底语义；
+		// newTiKVKV 是包级测试缝隙，生产恒为 cluster.NewTiKVKV。
+		kv, kerr := newTiKVKV(ctx, splitCSV(c.tikvPD), cluster.TLSConfig{
 			CA: c.tikvCA, Cert: c.tikvCert, Key: c.tikvKey,
 		})
 		if kerr != nil {

@@ -10,6 +10,9 @@ type Option func(*options)
 type options struct {
 	aioMode   aio.Mode
 	aioIOPoll bool
+	// ring 仅测试注入：非 nil 时替代真实 aio ring（用于构造指定完成事件序列，
+	// 如瞬时 EAGAIN）。生产路径恒为 nil。
+	ring aio.Ring
 }
 
 // defaultOptions 默认走 auto：内核支持 io_uring 就用，否则回退 libaio 并记录原因。

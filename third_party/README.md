@@ -24,17 +24,23 @@ conn.go:30:10: undefined: netpoll.SetInputNodeSize
 也就是说，`pkg/` 承诺的公开 API 在当时是虚构的。并进主模块后这个阻碍被彻底消除，
 同时构建也不再依赖本地路径与网络。
 
-**注意：** 这里的关键在于 `internal/transport` 是通过**匿名接口类型断言**使用 fork 新增 API 的：
+**注意：** `internal/transport` 对 fork 新增 API 的依赖有**两种形态**，失效方式不同：
 
-- `internal/transport/client.go:187`：`msg.r.(interface{ TakeTry() ([]byte, []byte, bool) })`
-- `internal/transport/client.go:206`：`msg.r.(interface{ ReadCopy([]byte) (int, error) })`
+- **直接调用**（`internal/transport/frame.go:26-28`）：`netpoll.SetAlignedAllocator` /
+  `SetInputAlignedAllocator` / `SetInputNodeSize`。上游没有这些符号，故**编译期报错**（即上面那段）。
+- **匿名接口断言**（`internal/transport/client.go:183`）：
+  `msg.r.(interface{ ReadCopy([]byte) (int, error) })`。断言是**结构性**的——上游
+  `*UnsafeLinkBuffer` 没有这个方法，断言恒为 false，于是**静默退化成拷贝路径**，不报错。
 
-（写这份文档时这两处在 `conn.go`，该文件此后拆成了 `frame.go` + `client.go`，故路径已更新；
-上面那段消费者报错里的 `conn.go:28` 是当时编译器的原始输出，保留原样。）
+（上面那段消费者报错里的 `conn.go:28` 是当时编译器的原始输出——该文件此后拆成了
+`frame.go` + `client.go`——保留原样。）
 
-断言是**结构性**的——上游 netpoll 的 `*UnsafeLinkBuffer` 没有这两个方法，断言恒为 false，
-零拷贝路径会静默退化成拷贝路径或直接失败。所以「消费者拿到上游版本」不是编译报错那么简单，
-**它是会静默降级的**。这也是并模块必须做、且不能靠「消费者自己也加 replace」绕过的原因。
+曾用于零拷贝移交的 `TakeTry` 断言**已在 TCP 客户端停用**（移交路径存在静默数据错配，见
+`client.go:117-120` 的说明）；netpoll 侧的 `TakeTry`、`base==0` 护栏与单测仍在，shm 数据面
+的单帧移交不受影响。
+
+所以「消费者拿到上游版本」不只是编译报错那么简单，**它还会静默降级**。这也是并模块必须做、
+且不能靠「消费者自己也加 replace」绕过的原因。
 
 ## 上游基线与许可证
 
@@ -52,9 +58,10 @@ shmipc-go 上游本身没有 `NOTICE`（只有 `LICENSE` 和 `.licenserc.yaml`�
 
 ## 本地改动清单（相对上游基线逐一核对）
 
-以下清单由 `diff -rq` / `diff -u` 对本机 module cache 里的上游版本实测得出。改动分三类：
+以下清单由 `go get <lib>@<基线版本>` 拉取上游后 `diff -rq` / `diff -u` 实测得出。改动分四类：
 **[功能]** 是 fork 存在的原因；**[并模块]** 是把 fork 挂进主模块产生的；**[门禁]** 是并模块后
-语言版本升至主模块的 `go1.25`、`go vet` 新报出的问题所需的修复。
+语言版本升至主模块的 `go1.25`、`go vet` 新报出的问题所需的修复；**[测试]** 是 fork 携带的
+测试文件现状（上游测试迁入 + fork 自有补充）。
 
 ### netpoll（基线 v0.7.5）
 
@@ -71,22 +78,41 @@ shmipc-go 上游本身没有 `NOTICE`（只有 `LICENSE` 和 `.licenserc.yaml`�
 - `nocopy_linkbuffer.go` ——
   - `readCopy` → 导出为 `ReadCopy`，并补 `error` 返回值。原有的 `readCopy` 只拷不报错，
     调用方无法区分「拷满」与「对端关闭」；导出后 `internal/transport` 才能经断言调用它。
+    调用点见下面的 `connection_impl.go`。
   - 新增 `TakeTry() (buf, full []byte, ok bool)`：零拷贝整块移交。仅当剩余数据在单一节点内、
     该节点是收流精确对齐节点、且已被本帧完整消费、且已写满（`malloc == cap`，否则 `book` 还会复用它）
     时才移交；否则返回 `ok == false` 让调用方回退拷贝路径。移交后缓冲归还的唯一路径是调用方的
     `put(full)`（注意**不能**归还 `buf`，它是 `cap` 已被截断的子切片），且不得再 `Release` 该 Reader
     （避免双归还）；另有 `flagUnmanaged` 作防御。
+  - **移交判定的时序（`takeTry` 护栏顺序）**：必须先置 `flagUnmanaged`、再校验 `refer == 2`；
+    拒绝路径用 `unsetFlag(flagUnmanaged)` 撤销。原因：主 Reader 的 `Release()` 是「先判 `refer`
+    是否归零、再判 `reusable()`」，若本函数先校验、后置标志，Release 可能在标志置位前就把该缓冲
+    当普通节点归还进池，而调用方此时正持有它——后续收流复用同一缓冲即静默改写调用方数据。
+    先置标志可保证：任何能把 `refer` 递减到 0 的 Release 都必然看到「已移交」而跳过回收。
 - `nocopy_linkbuffer_race.go` —— 同上两者在 `SafeLinkBuffer`（`-race` 构建）下的加锁转发。
   注意该文件里 `// TakeTry implements Reader.` 的注释是从邻近方法抄来的，**`TakeTry` 并不在
   `Reader` 接口里**（上游及本 fork 的 `Reader` 接口都无此方法），它是具体类型上的方法，
   由调用方用匿名接口断言取用。
+- `connection_impl.go` —— 1 行：`Read` 的调用点 `readCopy(p)` → `ReadCopy(p)`，跟随上面的导出。
+  该文件除此无其它改动。
 
 **[并模块]**（仅两行 import，`github.com/cloudwego/netpoll/internal/runner` → 本仓库新路径）
 
 - `connection_onevent.go:23`、`netpoll_unix.go:28`
 
-**[测试]** 新增 `nocopy_taketry_test.go`（`package netpoll`，只用标准库 + 自带 testPool mock），
-是 fork 树里唯一的测试。随主模块 `go test ./...` 一起跑。
+**[测试]** fork 树里现有 18 个 `_test.go`：上游 15 个非 `mux/` 测试**已迁入**（迁入时做过适配：
+固定 `/tmp` 路径改 `t.TempDir()`、import 重排等，见下文运维约束 3），另有 3 个 fork 自有文件：
+
+- `nocopy_taketry_test.go`（`package netpoll`，只用标准库 + 自带 testPool mock）：`TakeTry`
+  正反例，含 `TestTakeTryNoReclaimBeforeCallerPut`（移交后、调用方 `put` 之前缓冲不得入池，
+  后续 `book` 也不得复用同一缓冲）与 `TestTakeTryRefusedAfterMainRelease`（拒绝路径必须撤销
+  `flagUnmanaged`，否则该节点缓冲永不回收；在节点上摘掉 `unsetFlag` 该测试即转红）。
+- `nocopy_taketry_hazard_test.go`：`TestTakeTrySharedNodeLiveReader`——多帧同节点时，若前序帧
+  的子 Reader 仍存活（另一路 RPC 正在读它的负载），末帧必须拒绝移交；否则整块缓冲被移交归还后
+  立刻复用，前序帧会读到被改写的内容。
+- `fork_extra_test.go`：fork 新增 API（注入分配器等）的补充用例。
+
+均随主模块 `go test ./...` 一起跑。上游的 `mux/`（连同其 2 个测试）未携带。
 
 ### shmipc-go（基线 v0.2.0）
 
@@ -104,6 +130,11 @@ shmipc-go 上游本身没有 `NOTICE`（只有 `LICENSE` 和 `.licenserc.yaml`�
      空链表占用判断失真，可能发出仍在使用的 buffer。
   3. **`BufferList.push` 防御性越界检查**：`newTail` 越界或 `newTail + bufferHeaderSize` 越界时
      打日志、`putBackBufferSlice` 后丢弃，而不是继续破坏链表。
+- `sys_memfd_create_linux.go` / `sys_memfd_create_bsd.go` —— 新增 `madviseHuge`：共享内存映射
+  建立后打 `Madvise(MADV_HUGEPAGE)`（linux 为真实实现，bsd 为空桩），调用点在
+  `buffer_manager.go:182`（创建段）与 `:251`（映射/attach 段）。目的是减少大块数据拷贝时的
+  TLB miss。该调用依赖内核 `shmem_enabled` 允许（`advise`/`always`/`within_size`；默认 `never`
+  时是**空操作**），失败被忽略、不影响正确性。部署侧要求见下文运维约束 5。
 
 **[门禁]**（并模块后语言版本 1.15 → 1.25，`go vet` 新报出；均不改变行为）
 
@@ -120,6 +151,12 @@ shmipc-go 上游本身没有 `NOTICE`（只有 `LICENSE` 和 `.licenserc.yaml`�
   vet 报 `unreachable code`。它本来也无效果：`d` 被 goroutine 闭包捕获且循环体内持续使用
   （`d.epollFd` / `d.runLambda` 等），生命周期本就有保障。
 
+**[测试]** fork 树里现有 15 个 `_test.go`：上游 14 个（除 `bench_test.go`）**已迁入**并适配，
+另有 `net_listener_test.go` 为 fork 自有。适配中包含针对 fork 布局的计算调整，例如
+`debug_test.go` 特意选取 `Size=4076`（`4076 + 20B` header 恰好 `align4K` 到 4096）来构造
+「单 buffer 即一个 4K 页」的用例；`buffer_manager_test.go` 的容量分配也改按 `align4K` 重算
+（`numOf4096` / `numOf8192`）。上游的 `example/`、`go.mod`/`go.sum` 未携带。
+
 ## 运维约束（务必遵守）
 
 1. **shmipc 的段布局与上游 ABI 不兼容。** `buffer_manager.go` 改了 stride 与各列表起始偏移
@@ -127,19 +164,29 @@ shmipc-go 上游本身没有 `NOTICE`（只有 `LICENSE` 和 `.licenserc.yaml`�
    **两端必须同时使用本 fork。** 升级 shmipc fork 时须两端一起升，并做一次实际 Put/Get 往返验证。
 2. **两处独立的往返验证，不要互相替代。** shm 路径依赖 segment 布局一致；netpoll 路径依赖
    fork 新增 API 存在。只测其中一条不能证明另一条完好。
-3. **fork 未携带上游测试。** 两份 fork 都**丢弃了上游所有 `_test.go`**（netpoll 仅存 fork 自带的
-   `nocopy_taketry_test.go`；shmipc-go 一个都没有）。因此 `make check` / `go test ./...` 全绿
-   **不代表 fork 的未改动部分被上游测试覆盖过**。对 fork 做非平凡改动时，请在临时副本里并入
+3. **上游测试已迁入，但覆盖面不等于上游原貌。** 两份 fork 现在都携带上游**绝大部分** `_test.go`
+   （netpoll 除 `mux/` 外 15 个；shmipc-go 除 `bench_test.go` 外 14 个），迁入时做过适配
+   （固定 `/tmp` 路径改 `t.TempDir()`、import 重排、按 fork 布局调整断言等）。仍未携带的是
+   netpoll 的 `mux/`、两份库的 `example/` 与 `go.mod`/`go.sum`。因此 `make check` / `go test ./...`
+   全绿**只覆盖了迁移后仍然存在的那些测试**；对 fork 做非平凡改动时，仍建议在临时副本里并入
    上游测试跑一遍，不要把门禁绿当成回归保证。
 4. **升语言版本会解锁新的 vet 检查。** 并模块让两份 fork 的有效语言版本从 `go1.15` / `go1.20`
    升到主模块的 `go1.25`，vet 因此新报出上述 3 处问题（还有一处 printf 命中）。同时 go1.22 的
    **逐迭代循环变量作用域**也随之生效。后者已审计：全仓库（含两份 fork）不存在「闭包内写入循环变量」
    这一唯一会因该变更而改变行为的模式，只读捕获只会变得更正确。
+5. **shm 大页（THP）需部署侧配合，否则 `madviseHuge` 是空操作。** 内核 `shmem_enabled` 默认
+   `[never]`，此时 `MADV_HUGEPAGE` 不生效（本集群已设为 `advise`，并持久化到三节点
+   `/etc/rc.d/rc.local`）。未设置不影响正确性，只是拿不到大页带来的 TLB 收益；排查 shm 性能
+   问题时先确认这一项。
 
 ## 如何更新一份 fork
 
 ```bash
 MC=$(go env GOMODCACHE)
+# 0) 基线可能已不在 module cache 里（尤其 netpoll：并模块后它不再是主模块依赖，缓存会被清理）。
+#    若下一步的路径不存在，先建个临时模块拉一次：
+#    mkdir -p /tmp/upc && cd /tmp/upc && go mod init upc
+#    go get github.com/cloudwego/netpoll@<新版本> github.com/cloudwego/shmipc-go@<新版本>
 # 1) 取上游目标版本到临时目录，与当前 fork 做 diff，逐个确认本文件里列出的改动仍在
 diff -rq "$MC/github.com/cloudwego/netpoll@<新版本>" third_party/netpoll
 # 2) 确认上游模块路径是否变化（本 fork 的两行内部 import 依赖它）

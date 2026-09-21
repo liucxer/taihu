@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -24,16 +25,23 @@ import (
 	"github.com/liucxer/taihu/pkg/taihu-client"
 )
 
-func main() {
-	pd := os.Getenv("TAIHU_PD")
-	if pd == "" {
-		log.Fatal("TAIHU_PD 未设置：形如 10.0.0.11:2379,10.0.0.12:2379,10.0.0.13:2379（与 taihu server 的 -pd 一致）")
-	}
+// clusterClient 是本示例用到的集群客户端能力集（pkg/taihu-client 的 *Storage 满足）。
+// 抽成接口只为让无集群环境下的单测注入假实现；对外契约仍是 taihuclient.NewFromTiKV。
+type clusterClient interface {
+	CheckPoolIsValid() error
+	Put(ctx context.Context, key string, size int64, in []byte) error
+	Get(ctx context.Context, key string, off, size int64) ([]byte, func(), error)
+	Stat(ctx context.Context, key string) (int64, error)
+	Delete(ctx context.Context, key string) error
+	Close() error
+}
 
-	ctx := context.Background()
+// 编译期断言：真实 SDK 客户端必须满足本示例使用的能力集。
+var _ clusterClient = (*taihuclient.Storage)(nil)
 
-	// 1. 构建集群客户端：连接 TiKV 注册区，自动启动实例发现/索引后台任务与数据面连接池。
-	cli, initErr := taihuclient.NewFromTiKV(ctx, taihuclient.TiKVOptions{
+// newClusterClient 构造集群客户端（生产恒为 NewFromTiKV；单测可替换注入假实现）。
+var newClusterClient = func(ctx context.Context, pd string) (clusterClient, error) {
+	return taihuclient.NewFromTiKV(ctx, taihuclient.TiKVOptions{
 		PDAddrs:    strings.Split(pd, ","),
 		ClientName: "billing-app",
 		// 可选参数（不设即默认）：
@@ -43,14 +51,24 @@ func main() {
 		//   WriteRouting:   写路由："local"（默认，本地优先）/ "round-robin"（全在线实例轮询）
 		//   Source:         回源回调（可选，集群全 miss 时拉远端源并回写缓存）
 	})
+}
+
+// run 连接集群并跑完示例读写删流程；pd 为 TAIHU_PD（逗号分隔 PD 地址），w 为普通输出。
+func run(ctx context.Context, pd string, w io.Writer) error {
+	if pd == "" {
+		return errors.New("TAIHU_PD 未设置：形如 10.0.0.11:2379,10.0.0.12:2379,10.0.0.13:2379（与 taihu server 的 -pd 一致）")
+	}
+
+	// 1. 构建集群客户端：连接 TiKV 注册区，自动启动实例发现/索引后台任务与数据面连接池。
+	cli, initErr := newClusterClient(ctx, pd)
 	if initErr != nil {
-		log.Fatalf("连接 taihu 集群失败：%v", initErr)
+		return fmt.Errorf("连接 taihu 集群失败：%v", initErr)
 	}
 	defer cli.Close() // 注销 SDK 客户端（若配置了 ClientID）并停止后台心跳
 
 	// 2. 尽早暴露配置错误：挂载/启动时确认集群有在线实例可服务（无实例返回 ErrNoInstances）。
 	if poolErr := cli.CheckPoolIsValid(); poolErr != nil {
-		log.Fatalf("集群无在线实例：%v", poolErr)
+		return fmt.Errorf("集群无在线实例：%v", poolErr)
 	}
 
 	// 3. 写对象：size = 逻辑大小，数据取 in[:size]。
@@ -58,41 +76,48 @@ func main() {
 	const key = "orders/2026-09-14/001"
 	data := []byte(`{"order_id":1,"amount":99.9}`)
 	if putErr := cli.Put(ctx, key, int64(len(data)), data); putErr != nil {
-		log.Fatalf("Put 失败：%v", putErr)
+		return fmt.Errorf("Put 失败：%v", putErr)
 	}
-	fmt.Printf("Put %q size=%d\n", key, len(data))
+	fmt.Fprintf(w, "Put %q size=%d\n", key, len(data))
 
 	// 4. 读对象：Get 返回 (data, release, err)，data 来自内部池化缓冲，
 	//    用毕**必须**调用 release() 归还（幂等）。漏归还会耗尽缓冲池、走兜底分配路径。
 	out, release, getErr := cli.Get(ctx, key, 0, -1) // size=-1 读至结尾
 	if getErr != nil {
-		log.Fatalf("Get 失败：%v", getErr)
+		return fmt.Errorf("Get 失败：%v", getErr)
 	}
 	defer release()
-	fmt.Printf("Get %q -> %s\n", key, out)
+	fmt.Fprintf(w, "Get %q -> %s\n", key, out)
 
 	// 5. Stat：返回对象逻辑大小；区间读：off/size 精确控制（off<0 或 off>size 返回 ErrInvalidRange）。
 	if size, statErr := cli.Stat(ctx, key); statErr != nil {
-		log.Fatalf("Stat 失败：%v", statErr)
+		return fmt.Errorf("Stat 失败：%v", statErr)
 	} else {
-		fmt.Printf("Stat %q size=%d\n", key, size)
+		fmt.Fprintf(w, "Stat %q size=%d\n", key, size)
 	}
 	head, releaseHead, headErr := cli.Get(ctx, key, 0, 8) // [0,8)
 	if headErr != nil {
-		log.Fatalf("区间读失败：%v", headErr)
+		return fmt.Errorf("区间读失败：%v", headErr)
 	}
-	fmt.Printf("Get [0,8) -> %s\n", head)
+	fmt.Fprintf(w, "Get [0,8) -> %s\n", head)
 	releaseHead()
 
 	// 6. 删除与错误判定：以 errors.Is 判错误（ErrNotFound / ErrInvalidRange 等，见 reexport.go）。
 	if delErr := cli.Delete(ctx, key); delErr != nil {
-		log.Fatalf("Delete 失败：%v", delErr)
+		return fmt.Errorf("Delete 失败：%v", delErr)
 	}
 	if _, _, afterDelErr := cli.Get(ctx, key, 0, -1); afterDelErr != nil {
 		if errors.Is(afterDelErr, taihuclient.ErrNotFound) {
-			fmt.Println("删除后 Get 预期返回 ErrNotFound")
+			fmt.Fprintln(w, "删除后 Get 预期返回 ErrNotFound")
 		} else {
-			log.Fatalf("删除后 Get 非预期错误：%v", afterDelErr)
+			return fmt.Errorf("删除后 Get 非预期错误：%v", afterDelErr)
 		}
+	}
+	return nil
+}
+
+func main() {
+	if err := run(context.Background(), os.Getenv("TAIHU_PD"), os.Stdout); err != nil {
+		log.Fatal(err)
 	}
 }

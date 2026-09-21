@@ -23,9 +23,17 @@ func requirePD() error {
 	return nil
 }
 
-// connectKV 连接注册区 KV（TiKV TxnKV）。client-go 对不可达 PD 的发现/重试不服从
+// connectKV 连接注册区 KV（TiKV TxnKV）；实现可替换，见 kvConnect。
+func connectKV(ctx context.Context) (cluster.KV, error) { return kvConnect(ctx) }
+
+// kvConnect 是 connectKV 的实际实现。作为测试缝隙抽成包级变量：单测里替换为
+// cluster.NewMemoryKV()，使 CLI 命令可在无 TiKV/PD 的环境下端到端跑通；
+// 生产路径恒为 connectKVReal，行为不变。
+var kvConnect = connectKVReal
+
+// connectKVReal 连接注册区 KV（TiKV TxnKV）。client-go 对不可达 PD 的发现/重试不服从
 // ctx，故包一层 goroutine + select 兜底：超过 ctx（-timeout）立即报错退出。
-func connectKV(ctx context.Context) (cluster.KV, error) {
+func connectKVReal(ctx context.Context) (cluster.KV, error) {
 	type result struct {
 		kv  cluster.KV
 		err error
@@ -46,6 +54,14 @@ func connectKV(ctx context.Context) (cluster.KV, error) {
 	case <-ctx.Done():
 		return nil, fmt.Errorf("tikv connect: %w (pd %s)", ctx.Err(), global.pd)
 	}
+}
+
+// newTiKVKV 是 cluster.NewTiKVKV 的测试缝隙，供 server / bench cluster 的启动路径使用。
+// 这两处原本直连 TiKV（不经 connectKV 的 goroutine + ctx 兜底，错误前缀也不同），
+// 返回值在此放宽为 cluster.KV，单测方可替换成 cluster.NewMemoryKV()；
+// 生产路径恒为 cluster.NewTiKVKV，行为不变。
+var newTiKVKV = func(ctx context.Context, pdAddrs []string, tls cluster.TLSConfig) (cluster.KV, error) {
+	return cluster.NewTiKVKV(ctx, pdAddrs, tls)
 }
 
 // splitCSV 拆逗号分隔列表（忽略空段）。

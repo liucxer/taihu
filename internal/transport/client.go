@@ -111,13 +111,13 @@ func (c *Conn) Put(ctx context.Context, key string, size int64, in []byte) error
 // 返回 (data, release, err)：data len==size 为本次调用私有缓冲；调用方用毕必须调用
 // release()（幂等）归还。
 //
-// 两条路径：
-//   - 零拷贝移交（整响应恰一帧，且收流节点为精确尺寸一帧一节点）：TakeTry 直接移交
-//     netpoll 收流节点缓冲给调用方，data 引用该缓冲，全程零用户态拷贝，release 经
-//     bufpool.PutExact 归还。移交成功后不得再 Release 该帧子 Reader（缓冲所有权已转移，
-//     避免双归还）；原节点引用由归还路径收尾（节点对象随之失联交由 GC）。
-//   - 对齐汇入（多帧响应或移交失败回退）：逐帧 ReadCopy/Next 汇入 bufpool 对齐缓冲，
-//     恰一次用户态拷贝，release 经 bufpool.Put 归还。正确性不依赖 netpoll 节点复用。
+// 实现为对齐汇入：逐帧 ReadCopy/Next 汇入 bufpool 对齐缓冲，恰一次用户态拷贝，
+// release 经 bufpool.Put 归还。正确性不依赖 netpoll 节点复用。
+//
+// 曾用过 netpoll 的零拷贝移交 TakeTry（整响应恰一帧时直接移交收流节点缓冲，零拷贝）。
+// 实测该路径存在静默数据错配（移交后整块缓冲被归还池并复用，内容被后续收流覆盖），
+// 仅收紧「帧独占整块」（base==0）仍会复现，故 TCP 路径已停用，netpoll 侧保留
+// base==0 护栏与单测；shm 数据面的单帧移交不受影响（recordRxDataFrame 的 zeroCopy）。
 func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, func(), error) {
 	if size < 0 {
 		total, err := c.Stat(ctx, key)
@@ -140,9 +140,7 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 
 	var (
 		pos      int64
-		buf      []byte // 汇集缓冲（对齐池，out = buf[:size]）；多帧路径
-		taken    []byte // 零拷贝移交缓冲（TakeTry 单帧路径）：负载切片，data 直接引用
-		fullBuf  []byte // 同上：整块精确对齐缓冲（len==cap==节点容量），用毕 PutExact 归还
+		buf      []byte // 汇集缓冲（对齐池，out = buf[:size]）
 		out      []byte // 返回缓冲
 		disposed bool
 	)
@@ -152,10 +150,6 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 			return
 		}
 		disposed = true
-		if fullBuf != nil {
-			bufpool.PutExact(fullBuf)
-			return
-		}
 		if buf != nil {
 			bufpool.Put(buf)
 		}
@@ -181,24 +175,7 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 				dispose()
 				return nil, nil, fmt.Errorf("taihu: get stream exceeds requested size")
 			}
-			if buf == nil && taken == nil {
-				if rem == size {
-
-					if tt, ok := msg.r.(interface{ TakeTry() ([]byte, []byte, bool) }); ok {
-						if b, full, ok := tt.TakeTry(); ok {
-							statRxTake.Add(1)
-							taken = b
-							fullBuf = full
-							out = b
-							pos = size
-							if final {
-
-								return out, dispose, nil
-							}
-							continue
-						}
-					}
-				}
+			if buf == nil {
 				buf = bufpool.Get(int(size))
 				out = buf[:size]
 			}
@@ -224,7 +201,6 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 			}
 			msg.r.Release()
 			if final {
-
 				if pos != size {
 					dispose()
 					return nil, nil, fmt.Errorf("taihu: get short read: got %d want %d", pos, size)

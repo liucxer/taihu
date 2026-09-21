@@ -24,10 +24,74 @@ func (t TLSConfig) enabled() bool { return t.CA != "" && t.Cert != "" && t.Key !
 // TiKVKV 基于 TiKV TxnKV 的 KV 实现：与 mgmt meta 等 TxnKV 客户端同编码共存
 // （memcomparable），避免 rawkv 裸 key 混入导致的 region 边界解码问题。
 type TiKVKV struct {
-	c *txnkv.Client
+	c tikvClient
 }
 
 var _ KV = (*TiKVKV)(nil)
+
+// 测试缝隙：TiKV 客户端/快照/事务/迭代器抽为最小接口（能力集与 client-go 具体类型
+// 逐一对齐，无额外开销），生产实现为 txnkvClient/txnkvSnapshot，单元测试注入假实现
+// 覆盖错误与边界路径——单测绝不连真实 TiKV/PD。迭代器接口之所以单独声明：
+// client-go 的 unionstore.Iterator 位于其 internal 包，本包无法引用该类型。
+type (
+	// tikvIterator 快照迭代器能力集（对应 unionstore.Iterator）。
+	tikvIterator interface {
+		Valid() bool
+		Key() []byte
+		Value() []byte
+		Next() error
+		Close()
+	}
+	// tikvSnapshot 一致性快照能力集（对应 *txnsnapshot.KVSnapshot）。
+	tikvSnapshot interface {
+		Get(ctx context.Context, key []byte) ([]byte, error)
+		BatchGet(ctx context.Context, keys [][]byte) (map[string][]byte, error)
+		SetIsolationLevel(level txnkv.IsoLevel)
+		Iter(start, end []byte) (tikvIterator, error)
+	}
+	// tikvTxn 事务能力集（对应 *txnkv.KVTxn）。
+	tikvTxn interface {
+		Set(key, value []byte) error
+		Delete(key []byte) error
+		Commit(ctx context.Context) error
+	}
+	// tikvClient 客户端能力集（对应 *txnkv.Client）。
+	tikvClient interface {
+		GetTimestamp(ctx context.Context) (uint64, error)
+		GetSnapshot(ts uint64) tikvSnapshot
+		Begin() (tikvTxn, error)
+		Close() error
+	}
+)
+
+// txnkvSnapshot 把真实 *txnsnapshot.KVSnapshot 适配为 tikvSnapshot
+// （Iter 的 unionstore.Iterator 归一为 tikvIterator）。
+type txnkvSnapshot struct{ s *txnsnapshot.KVSnapshot }
+
+func (a txnkvSnapshot) Get(ctx context.Context, key []byte) ([]byte, error) {
+	return a.s.Get(ctx, key)
+}
+
+func (a txnkvSnapshot) BatchGet(ctx context.Context, keys [][]byte) (map[string][]byte, error) {
+	return a.s.BatchGet(ctx, keys)
+}
+
+func (a txnkvSnapshot) SetIsolationLevel(level txnkv.IsoLevel) { a.s.SetIsolationLevel(level) }
+
+func (a txnkvSnapshot) Iter(start, end []byte) (tikvIterator, error) { return a.s.Iter(start, end) }
+
+// txnkvClient 把真实 *txnkv.Client 适配为 tikvClient。
+type txnkvClient struct{ c *txnkv.Client }
+
+func (a txnkvClient) GetTimestamp(ctx context.Context) (uint64, error) { return a.c.GetTimestamp(ctx) }
+
+func (a txnkvClient) GetSnapshot(ts uint64) tikvSnapshot {
+	return txnkvSnapshot{s: a.c.GetSnapshot(ts)}
+}
+
+func (a txnkvClient) Begin() (tikvTxn, error) { return a.c.Begin() }
+
+func (a txnkvClient) Close() error { return a.c.Close() }
 
 // NewTiKVKV 连接 TiKV PD 集群（TxnKV）。tls 启用时写入 client-go 全局 Security
 // 配置（txnkv.NewClient 只读全局配置）；ctx 仅为保持调用约定，暂不使用。
@@ -41,12 +105,12 @@ func NewTiKVKV(_ context.Context, pdAddrs []string, tls TLSConfig) (*TiKVKV, err
 	if err != nil {
 		return nil, fmt.Errorf("tikv txnkv connect: %w", err)
 	}
-	return &TiKVKV{c: c}, nil
+	return &TiKVKV{c: txnkvClient{c: c}}, nil
 }
 
 // snapshot 取最新时间戳的一致性快照；RC 隔离避免读被残留锁阻塞
 // （注册/索引语义允许读到最新已提交值，不需要 SI 的锁检查）。
-func (k *TiKVKV) snapshot(ctx context.Context) (*txnsnapshot.KVSnapshot, error) {
+func (k *TiKVKV) snapshot(ctx context.Context) (tikvSnapshot, error) {
 	ts, err := k.c.GetTimestamp(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("tikv tso: %w", err)

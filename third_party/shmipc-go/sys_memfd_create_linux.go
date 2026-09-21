@@ -29,3 +29,10 @@ func MemfdCreate(name string, flags int) (fd int, err error) {
 
 	return memFd, nil
 }
+
+// madviseHuge 尽力把共享内存映射标记为可合并大页（MADV_HUGEPAGE），减少
+// 大块数据拷贝时的 TLB 缺失。共享内存大页要求内核 shmem_enabled 允许
+// （advise/always/within_size，默认 never 时为空操作）；失败不影响正确性，忽略。
+func madviseHuge(mem []byte) {
+	_ = unix.Madvise(mem, unix.MADV_HUGEPAGE)
+}

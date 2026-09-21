@@ -40,9 +40,10 @@ func (s *Storage) UsageGet() (float64, error) {
 	return best, nil
 }
 
-// listIndexKeys 从 KV 索引区（cluster.IndexKeyPrefix）枚举全部 key，剔除前缀后返回。
+// ListIndexKeys 从 KV 索引区（cluster.IndexKeyPrefix）枚举全部 key，剔除前缀后返回。
 // 用于迁移 / destroy 等需要全量枚举对象的场景；prefix 过滤索引键前缀。
-func (s *Storage) listIndexKeys(ctx context.Context, prefix string) ([]string, error) {
+// 返回的 key 已剔除索引前缀，可直接与业务 key 比较。
+func (s *Storage) ListIndexKeys(ctx context.Context, prefix string) ([]string, error) {
 	start := []byte(cluster.IndexKeyPrefix + prefix)
 	end := []byte(cluster.IndexKeyPrefix + prefix + "\xff")
 	ks, _, err := s.cfg.KV.Scan(ctx, start, end, 0)

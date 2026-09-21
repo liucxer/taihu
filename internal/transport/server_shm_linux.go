@@ -8,7 +8,7 @@
 //
 // 请求处理逻辑镜像 TCP 路径 handlePut/handleGet/handleDelete/handleStat，
 // 复用 Parse* 纯函数（ByteReader 解耦后 SliceReader 适配共享内存切片）与
-// storage.Put/ReadAt/Delete/Stat；共享内存按帧 Reserve，Flush 后 peer 即可读。
+// storage.Put/ReadAtMeta/ReadAtIntoMeta/Delete/Stat；共享内存按帧 Reserve，Flush 后 peer 即可读。
 package transport
 
 import (
@@ -27,6 +27,7 @@ import (
 	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/device"
 	"github.com/liucxer/taihu/internal/layout"
+	"github.com/liucxer/taihu/internal/metastore"
 	"github.com/liucxer/taihu/internal/storage"
 	"github.com/liucxer/taihu/internal/transport/protocol"
 )
@@ -396,18 +397,24 @@ func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, paylo
 //     免 bufpool→共享内存 memcpy（读路径零拷贝）。请求段内全部整 4MiB 块收进
 //     同一条共享内存链并发直读，整链一次 Flush——单请求全程只有一个等齐屏障与
 //     一次 Flush，无逐批同步间隙。
-//   - 回退路径（off 非对齐）：Storage.ReadAt 读入 bufpool 对齐缓冲，shmWriteFrame 拷贝。
+//   - 回退路径（off 非对齐）：Storage.ReadAtMeta 读入 bufpool 对齐缓冲，shmWriteFrame 拷贝。
+//
+// 一次请求的全部帧共用入口解析的同一映射快照（meta），并全程持有该段引用。
 func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 	key, off, size, err := protocol.ParseGetReq(protocol.NewSliceReader(payload))
 	if err != nil {
 		return shmWriteFrame(st, protocol.OpGetErr, protocol.EncCode(protocol.CodeInvalidArgument))
 	}
+	// GET 级映射快照（语义同 TCP handleGet）：一次请求内所有数据帧共用同一 meta，使整段
+	// 响应严格来自单一版本；size==-1 的 size 亦由该快照推导。多帧路径全程持有快照段引用，
+	// 防止该段被 GC 回收复用。单块请求（下方 batch 快路径）由 BatchRead 内部一次解析并
+	// 持引用，不存在跨块混合，无需快照。
+	meta, err := s.storage.Meta(context.Background(), key)
+	if err != nil {
+		return shmWriteFrame(st, protocol.OpGetErr, protocol.EncCode(protocol.MapStorageErr(err)))
+	}
 	if size == -1 {
-		total, err := s.storage.Stat(context.Background(), key)
-		if err != nil {
-			return shmWriteFrame(st, protocol.OpGetErr, protocol.EncCode(protocol.MapStorageErr(err)))
-		}
-		size = total - off
+		size = meta.Size - off
 	}
 	if size < 0 {
 		return shmWriteFrame(st, protocol.OpGetErr, protocol.EncCode(protocol.CodeInvalidRange))
@@ -420,6 +427,9 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 		_ = rerr
 		return nil
 	}
+
+	s.storage.RefSegment(meta.SegmentID)
+	defer s.storage.UnrefSegment(meta.SegmentID)
 
 	if off%layout.BlockSize == 0 {
 		var slots []getSlot
@@ -435,7 +445,7 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 			q += want
 		}
 		if len(slots) > 0 {
-			done, red, served := shmWriteDataFramesChain(st, s.storage, key, slots, end)
+			done, red, served := shmWriteDataFramesChain(st, s.storage, meta, slots, end)
 
 			pos = slots[0].pos + int64(served)*protocol.ChunkSize
 			if red != nil {
@@ -454,7 +464,7 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 		}
 
 		if pos%layout.BlockSize == 0 && want%layout.BlockSize == 0 {
-			n, rerr := shmWriteDataFrameDirect(st, s.storage, key, pos, want, end)
+			n, rerr := shmWriteDataFrameDirect(st, s.storage, meta, pos, want, end)
 			if rerr != nil {
 				if rerr == io.EOF {
 					return nil
@@ -465,7 +475,7 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 			continue
 		}
 
-		data, rerr := s.storage.ReadAt(context.Background(), key, pos, want)
+		data, rerr := s.storage.ReadAtMeta(context.Background(), meta, pos, want)
 		if len(data) > 0 {
 			op := protocol.OpCode(protocol.OpGetData)
 			if pos+int64(len(data)) >= end || rerr == io.EOF {
@@ -543,14 +553,15 @@ func (s *shmServer) shmWriteDataFrameBatch(st *shmipc.Stream, b *shmBatchReader,
 
 // shmWriteDataFrameDirect O_DIRECT 直读共享内存的数据帧写（免 memcpy 快路径）：
 // Reserve 对齐切片后先写 OpGetErr 占位帧头，数据区 [ShmDataPad:ShmDataPad+dlen] 作为
-// O_DIRECT 目标缓冲直接 DMA 进共享内存（storage.ReadAtInto 同步等待完成）；成功则
+// O_DIRECT 目标缓冲直接 DMA 进共享内存（storage.ReadAtIntoMeta 同步等待完成，meta 为
+// 本次 GET 的请求级映射快照）；成功则
 // 更新帧头为数据帧（len 按实际读入 n 更新，短读/EOF 时 n < want）。返回实际 payload
 // 字节数 n。
 //
 // 空短读（n==0 && EOF）与直读失败（错误码帧已发）均返回 (0, io.EOF)：前者发空 final
 // 帧（对端报 short read），后者已发 OpGetErr 错误帧；调用方按 EOF 收尾即可，不再追加
 // 错误帧（避免未写帧头的直读切片污染流）。
-func shmWriteDataFrameDirect(st *shmipc.Stream, storage *storage.Storage, key string, pos, want, end int64) (int64, error) {
+func shmWriteDataFrameDirect(st *shmipc.Stream, storage *storage.Storage, meta metastore.ObjectMeta, pos, want, end int64) (int64, error) {
 	dlen := layout.Align4k(want)
 	buf, err := st.BufferWriter().Reserve(protocol.ShmDataPad + int(dlen))
 	if err != nil {
@@ -561,7 +572,7 @@ func shmWriteDataFrameDirect(st *shmipc.Stream, storage *storage.Storage, key st
 	buf[shmLenPrefixLen] = byte(protocol.OpGetErr)
 	copy(buf[shmLenPrefixLen+shmOpLen:], protocol.EncCode(protocol.CodeInternal))
 	ctx := context.Background()
-	n, rerr := storage.ReadAtInto(ctx, key, pos, want, buf[protocol.ShmDataPad:protocol.ShmDataPad+dlen])
+	n, rerr := storage.ReadAtIntoMeta(ctx, meta, pos, want, buf[protocol.ShmDataPad:protocol.ShmDataPad+dlen])
 	if rerr != nil && rerr != io.EOF {
 
 		copy(buf[shmLenPrefixLen+shmOpLen:], protocol.EncCode(protocol.MapStorageErr(rerr)))
@@ -612,7 +623,8 @@ type getSlot struct {
 //	  帧头；链序==块序（保序地基，严禁并发 Reserve）。某槽 Reserve 失败即截断，以已
 //	  Reserve 前缀为链，返回 served = 已 Reserve 槽数；未 Reserve 部分交由调用方回退
 //	  路径续读（不越界、不丢数据）。
-//	Phase B（并行）:每块 goroutine 调 storage.ReadAtInto 直读各自切片数据区，随后按
+//	Phase B（并行）:每块 goroutine 调 storage.ReadAtIntoMeta（meta 为本次 GET 的请求级
+//	  映射快照，整链同版本）直读各自切片数据区，随后按
 //	  结果写帧头（成功写 OpGetData/OpGetDataFinal，失败写 OpGetErr+MapStorageErr）。
 //	Phase C（主 goroutine）:整链一次 Flush 送出；客户端 shmReadFrame 按 [4B len] 定界
 //	  逐帧读，天然保序。
@@ -626,7 +638,7 @@ type getSlot struct {
 //
 // 返回 done（对象已读毕，末槽已发 final）、rerr（首个非 EOF 读错误，错误帧已整链发出）
 // 与 served（实际 Reserve 的槽数，≤ len(slots)）。
-func shmWriteDataFramesChain(st *shmipc.Stream, storage *storage.Storage, key string, slots []getSlot, end int64) (done bool, rerr error, served int) {
+func shmWriteDataFramesChain(st *shmipc.Stream, storage *storage.Storage, meta metastore.ObjectMeta, slots []getSlot, end int64) (done bool, rerr error, served int) {
 
 	for i := range slots {
 		buf, err := st.BufferWriter().Reserve(protocol.ShmDataPad + int(slots[i].dlen))
@@ -650,7 +662,7 @@ func shmWriteDataFramesChain(st *shmipc.Stream, storage *storage.Storage, key st
 		wg.Add(1)
 		go func(sl *getSlot) {
 			defer wg.Done()
-			n, rerr2 := storage.ReadAtInto(context.Background(), key, sl.pos, sl.want,
+			n, rerr2 := storage.ReadAtIntoMeta(context.Background(), meta, sl.pos, sl.want,
 				sl.buf[protocol.ShmDataPad:protocol.ShmDataPad+sl.dlen])
 			sl.n, sl.rerr = n, rerr2
 			if rerr2 != nil && rerr2 != io.EOF {

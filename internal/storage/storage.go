@@ -205,6 +205,19 @@ func (s *Storage) BatchDelete(ctx context.Context, keys []string) ([]error, erro
 	return s.db.BatchDeleteMapping(ctx, keys)
 }
 
+// Meta 返回 key 当前的对象映射快照（不存在返回 ierr.ErrNotFound）。一次 GET 需要跨多个
+// chunk 读取同一 key 时，入口解析一次并全程复用，避免逐 chunk 重解析在多 chunk 响应内
+// 混合两个版本（详见 ReadAtMeta）。
+func (s *Storage) Meta(ctx context.Context, key string) (metastore.ObjectMeta, error) {
+	return s.db.GetMapping(ctx, key)
+}
+
+// RefSegment / UnrefSegment 透出段读引用：GET 级快照须在整段读取期间持有快照段引用，
+// 否则覆盖写/删除后该段存活计数归零转 Reclaiming 并被 GC 复用，迟到的 chunk 会读到
+// 他人数据（比版本混合更严重的静默损坏）。
+func (s *Storage) RefSegment(segmentID int64)   { s.db.RefSegment(segmentID) }
+func (s *Storage) UnrefSegment(segmentID int64) { s.db.UnrefSegment(segmentID) }
+
 // ReadAt 读取对象内 [off, off+size) 区间的数据并返回（返回值为从 bufpool 取出的池化
 // 缓冲或 nil；调用方用毕必须 bufpool.Put(返回值) 归还，否则造成池泄漏）。
 //
@@ -221,6 +234,14 @@ func (s *Storage) ReadAt(ctx context.Context, key string, off, size int64) ([]by
 	if err != nil {
 		return nil, err
 	}
+	return s.ReadAtMeta(ctx, meta, off, size)
+}
+
+// ReadAtMeta 与 ReadAt 同语义（含 bufpool 归还契约），区别是映射由调用方以快照形式
+// 提供：一次 GET 跨多个 chunk 时入口解析一次 meta 并全程复用，使同一响应严格来自单一
+// 版本。调用方负责快照存活 —— 跨 chunk 期间须 RefSegment/UnrefSegment 持有
+// meta.SegmentID 引用，防止该段被 GC 回收复用（见 RefSegment）。
+func (s *Storage) ReadAtMeta(ctx context.Context, meta metastore.ObjectMeta, off, size int64) ([]byte, error) {
 	if off < 0 || off > meta.Size {
 		return nil, ierr.ErrInvalidRange
 	}
@@ -276,6 +297,12 @@ func (s *Storage) ReadAtInto(ctx context.Context, key string, off, size int64, d
 	if err != nil {
 		return 0, err
 	}
+	return s.ReadAtIntoMeta(ctx, meta, off, size, dst)
+}
+
+// ReadAtIntoMeta 与 ReadAtInto 同语义，映射由调用方以快照形式提供（快照存活责任同
+// ReadAtMeta：跨 chunk 期间须持有 meta.SegmentID 段引用）。
+func (s *Storage) ReadAtIntoMeta(ctx context.Context, meta metastore.ObjectMeta, off, size int64, dst []byte) (int64, error) {
 	if off < 0 || off > meta.Size || off%layout.BlockSize != 0 {
 		return 0, ierr.ErrInvalidRange
 	}
