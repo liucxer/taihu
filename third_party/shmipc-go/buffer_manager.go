@@ -179,6 +179,7 @@ func getGlobalBufferManagerWithMemFd(bufferPathName string, memFd int, capacity 
 	if err != nil {
 		return nil, fmt.Errorf("getGlobalBufferManagerWithMemFd Mmap failed:%w", err)
 	}
+	madviseHuge(mem)
 
 	if create {
 		sort.Sort(sizePercentPairs(pairs))
@@ -247,6 +248,7 @@ func getGlobalBufferManager(shmPath string, capacity uint32, create bool, pairs 
 	if err != nil {
 		return nil, err
 	}
+	madviseHuge(mem)
 
 	var bm *bufferManager
 	if create {

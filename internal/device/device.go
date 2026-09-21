@@ -36,6 +36,10 @@ const (
 	pumpTimeout = 200 * time.Millisecond
 	// submitRetry 提交队列满（ErrFull）时的重试间隔。
 	submitRetry = 100 * time.Microsecond
+	// complRetryMax 完成侧瞬时错误（EAGAIN/EINTR）的最大重试次数。
+	complRetryMax = 8
+	// complRetryCap 完成侧重试退避上限：submitRetry 起逐次翻倍，不超过该值。
+	complRetryCap = 2 * time.Millisecond
 	// chunk4MiB 典型整块 IO 尺寸（与传输层 ChunkSize 一致），用于大小统计分档。
 	chunk4MiB = 1 << 22
 )
@@ -86,10 +90,13 @@ func NewDevice(ctx context.Context, nvmePath string, segSize int64, opts ...Opti
 	if err != nil {
 		return nil, fmt.Errorf("taihu: open device %q: %w", nvmePath, err)
 	}
-	ring, err := aio.NewWithOptions(aioDepth, aio.Options{Mode: o.aioMode, IOPoll: o.aioIOPoll})
-	if err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("taihu: create aio ring: %w", err)
+	ring := o.ring // 仅测试注入；生产路径为 nil
+	if ring == nil {
+		ring, err = aio.NewWithOptions(aioDepth, aio.Options{Mode: o.aioMode, IOPoll: o.aioIOPoll})
+		if err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("taihu: create aio ring: %w", err)
+		}
 	}
 	d := &Device{
 		f:        f,
@@ -176,8 +183,18 @@ func (d *Device) pump() {
 // 与泵的同步点：提交前先锁内检查 closed（未提交则快速失败）并自增 inSubmit，
 // 使泵不会在「已 io_submit、事件尚未落定」的窗口内退出；随后锁内消费 pending
 // 或注册 m，泵保证事件必然投递，提交方不会永久阻塞。
+//
+// 完成侧瞬时错误（EAGAIN/EINTR，见 retriableErrno）按原参数重提，最多 complRetryMax 次；
+// 只有预算耗尽才把该 error 结果交回调用方 —— 与提交侧的 ErrFull 重试策略一致。
 func (d *Device) submitOp(buf []byte, off int64, read bool) (aio.Event, error) {
+	return d.submitOpN(buf, off, read, true)
+}
+
+// submitOpN 是 submitOp 的实现；count 为 false 时不计入 IO 尺寸统计
+// （批路径已按逻辑项统计过尺寸，重提不重复计数）。
+func (d *Device) submitOpN(buf []byte, off int64, read bool, count bool) (aio.Event, error) {
 	fd := int(d.f.Fd())
+	var retries int
 	for {
 		d.mu.Lock()
 		if d.closed {
@@ -207,17 +224,80 @@ func (d *Device) submitOp(buf []byte, off int64, read bool) (aio.Event, error) {
 			}
 			return aio.Event{}, err
 		}
-		// 仅统计成功提交的 IO（ErrFull 重试不重复计数）。
-		d.recordIO(int64(len(buf)))
-		if ev, ok := d.pending[seq]; ok { // 泵已取回本事件，直接消费
+		// 仅统计首次成功提交的 IO（ErrFull 与完成侧重试均不重复计数）。
+		if count {
+			d.recordIO(int64(len(buf)))
+			count = false
+		}
+		var ev aio.Event
+		if p, ok := d.pending[seq]; ok { // 泵已取回本事件，直接消费
 			delete(d.pending, seq)
 			d.mu.Unlock()
+			ev = p
+		} else {
+			d.m[seq] = ch
+			d.mu.Unlock()
+			ev = <-ch
+		}
+
+		errno, retriable := retriableErrno(ev.Res)
+		if !retriable {
 			return ev, nil
 		}
-		d.m[seq] = ch
-		d.mu.Unlock()
-		return <-ch, nil
+		if retries >= complRetryMax {
+			d.logComplRetry(read, off, int64(len(buf)), errno, retries, true)
+			return ev, nil
+		}
+		retries++
+		if retries == 1 {
+			d.logComplRetry(read, off, int64(len(buf)), errno, retries, false)
+		}
+		time.Sleep(complRetryBackoff(retries))
 	}
+}
+
+// retriableErrno 判定完成结果 res 是否为可重试的瞬时错误。
+// EAGAIN：O_DIRECT 直接 IO 暂时无法完成 —— 语义即「稍后重试」，失败时无字节落盘，
+// 原样重发安全；EINTR：请求被信号打断，同样以原参数重发。
+// 这类瞬时结果会出现在完成队列里（已实测：nvme 上 4MiB O_DIRECT 写经 io_uring 偶发
+// 以 -EAGAIN 完成；同负载 libaio 不复现）。完成侧若不重试就会把它当永久错误上抛，
+// 使一次本可成功的 Put/Read 无谓失败。
+func retriableErrno(res int64) (syscall.Errno, bool) {
+	if res >= 0 {
+		return 0, false
+	}
+	e := syscall.Errno(-res)
+	if e == syscall.EAGAIN || e == syscall.EINTR {
+		return e, true
+	}
+	return 0, false
+}
+
+// complRetryBackoff 返回第 n 次（从 1 起）完成侧重试的退避时长。
+func complRetryBackoff(n int) time.Duration {
+	d := submitRetry
+	for i := 1; i < n && d < complRetryCap; i++ {
+		d *= 2
+	}
+	if d > complRetryCap {
+		d = complRetryCap
+	}
+	return d
+}
+
+// logComplRetry 打印完成侧重试诊断：每条 IO 仅在首次重试与预算耗尽时各打一行，避免刷屏。
+func (d *Device) logComplRetry(read bool, off, size int64, errno syscall.Errno, n int, giveUp bool) {
+	op := "write"
+	if read {
+		op = "read"
+	}
+	if giveUp {
+		fmt.Fprintf(os.Stderr, "taihu: device %s: %s off=%d size=%d errno=%v: 完成侧重试 %d 次仍失败，上抛错误\n",
+			d.path, op, off, size, errno, n)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "taihu: device %s: %s off=%d size=%d errno=%v: 完成侧瞬时错误，按原参数重提（上限 %d 次）\n",
+		d.path, op, off, size, errno, complRetryMax)
 }
 
 // recordIO 累计一次成功提交的磁盘 IO 尺寸（4MiB 整块 vs 其他）。
@@ -462,10 +542,20 @@ func (d *Device) AppendBatch(ctx context.Context, jobs []WriteJob) error {
 		}
 		for i := 0; i < n; i++ {
 			d.recordIO(int64(len(chunk[i].buf)))
-			if firstErr == nil {
-				if e := checkWrite(evs[i], int64(len(chunk[i].buf))); e != nil {
-					firstErr = e
+			if firstErr != nil {
+				continue
+			}
+			ev := evs[i]
+			if _, retriable := retriableErrno(ev.Res); retriable {
+				// 批内瞬时错误：该条单独重提（完成侧重试在 submitOpN 内；尺寸已计过，不重复统计）。
+				ev, werr = d.submitOpN(chunk[i].buf, chunk[i].off, false, false)
+				if werr != nil {
+					firstErr = werr
+					continue
 				}
+			}
+			if e := checkWrite(ev, int64(len(chunk[i].buf))); e != nil {
+				firstErr = e
 			}
 		}
 		remaining = chunk[n:]
@@ -614,6 +704,25 @@ func (d *Device) ReadAtIntoBatch(ctx context.Context, jobs []ReadJob) ([]int64, 
 		d.recordIO(req0[i])
 		switch {
 		case ev.Res < 0:
+			if _, retriable := retriableErrno(ev.Res); retriable {
+				// 批内瞬时错误：该条退化为单条重提（完成侧重试在 submitOpN 内；尺寸已计过）。
+				ev2, werr2 := d.submitOpN(jobs[j].Buf[:req0[i]],
+					d.segmentBase(jobs[j].SegmentID)+jobs[j].Off, true, false)
+				if werr2 != nil {
+					ns[j] = 0
+					return ns, werr2
+				}
+				if ev2.Res < 0 {
+					ns[j] = 0
+					return ns, syscall.Errno(-ev2.Res)
+				}
+				n := ev2.Res
+				if n > 0 && n < req0[i] {
+					n = req0[i] // 与批路径口径一致：短读按请求窗口上报
+				}
+				ns[j] = n
+				continue
+			}
 			ns[j] = 0
 			return ns, syscall.Errno(-ev.Res)
 		case ev.Res == 0:

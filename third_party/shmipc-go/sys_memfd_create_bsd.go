@@ -27,3 +27,6 @@ import (
 func MemfdCreate(name string, flags int) (fd int, err error) {
 	return 0, fmt.Errorf("%s unsupported MemfdCreate system call", runtime.GOOS)
 }
+
+// madviseHuge 非 linux 平台无对应语义，空实现。
+func madviseHuge(mem []byte) {}
