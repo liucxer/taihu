@@ -1,6 +1,6 @@
 # 架构层约定
 
-> 本层管 taihu 仓库的**结构性不变量**：目录分层与依赖方向、全仓库代码风格、错误体系、提交信息格式 —— 这些规则跨包生效，任何一次改动都可能踩到。
+> 本层管 taihu 仓库的**结构性不变量**：目录分层与依赖方向、包的对外面、全仓库代码风格、错误体系、提交信息格式 —— 这些规则跨包生效，任何一次改动都可能踩到。
 
 ---
 
@@ -9,6 +9,7 @@
 | 文件 | 用途 |
 |------|------|
 | [layering.md](./layering.md) | 依赖方向不变量：`internal/` 不得 import `pkg/`、SDK 不得直接依赖存储引擎；两条 `make` 门禁的实现与理由；包依赖全貌 |
+| [api-surface.md](./api-surface.md) | 包的对外面：标识符默认私有、只被测试用的删掉、对外面集中到一个文件；**判据是「可达」不是「被引用」**（配置取值 / 返回值类型 / 接口满足三条都够不着才是真死代码） |
 | [code-style.md](./code-style.md) | 全仓库代码约定：中文注释与「为什么」取向、命名（receiver 单字母、首字母缩写全大写）、错误包装措辞、三条日志通道、import 分组 |
 | [error-model.md](./error-model.md) | 错误体系：`internal/ierr` 唯一事实源、包内未导出 sentinel、跨进程传 code 不传字符串、`internal/rpcclient` → `pkg/taihu-client` 的 re-export 链 |
 | [commits.md](./commits.md) | 提交信息：`type(scope): 中文标题` + 中文 bullet 正文 + 纯重构的「行为不变：」核对段 |
@@ -21,6 +22,7 @@
 
 - [ ] 我知道这次改动落在哪一层吗？先读 [layering.md](./layering.md) 确认新代码该进 `internal/` 还是 `pkg/`。
 - [ ] 我要新增的 import 会不会打破方向不变量？改完必须 `make check-layering` 与 `make check-sdk-only` 都能过。
+- [ ] 我新增的标识符真的需要导出吗？删除某个已有标识符时，我是按**引用计数**还是按**可达性**判的？先读 [api-surface.md](./api-surface.md) —— `internal/aio` 的 `ModeLibAIO` 与 `Info` 在生产代码里零引用，却都删不得。
 - [ ] 我要加的日志走哪条通道？先读 [code-style.md](./code-style.md) 的「日志三通道」，不要新开第四种。
 - [ ] 我要返回的错误是库错误（`internal/ierr` 的 sentinel）还是包内控制信号（未导出 sentinel）？见 [error-model.md](./error-model.md)。
 - [ ] 我要暴露给外部调用方的类型出现在导出签名里吗？若是，去 `internal/rpcclient/reexport.go` / `pkg/taihu-client/reexport.go` 补 alias。
