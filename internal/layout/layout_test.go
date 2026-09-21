@@ -34,4 +34,31 @@ func TestComputeLayout(t *testing.T) {
 	if got := ComputeLayout(segSize, 0); got.SegmentCount != 0 {
 		t.Fatalf("zero segSize: SegmentCount=%d want 0", got.SegmentCount)
 	}
+	// 负入参同样返回空布局（SegmentSizeBytes 也须为 0，不能带出非法段大小）。
+	for _, c := range []struct{ cap, seg int64 }{{-1, segSize}, {segSize, -1}, {-1, -1}} {
+		if got := ComputeLayout(c.cap, c.seg); got != (Layout{}) {
+			t.Fatalf("ComputeLayout(%d,%d)=%+v want 空布局", c.cap, c.seg, got)
+		}
+	}
+}
+
+func TestAlign4k(t *testing.T) {
+	if BlockSize != 4096 {
+		t.Fatalf("BlockSize=%d want 4096", BlockSize)
+	}
+	cases := []struct{ in, want int64 }{
+		{-1, 0},
+		{0, 0},
+		{1, BlockSize},
+		{BlockSize - 1, BlockSize},
+		{BlockSize, BlockSize},
+		{BlockSize + 1, 2 * BlockSize},
+		{3 * BlockSize, 3 * BlockSize},
+		{DefaultSegmentSizeBytes, DefaultSegmentSizeBytes},
+	}
+	for _, c := range cases {
+		if got := Align4k(c.in); got != c.want {
+			t.Fatalf("Align4k(%d)=%d want %d", c.in, got, c.want)
+		}
+	}
 }

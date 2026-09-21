@@ -214,7 +214,7 @@ func TestTakeTryUnfilledNode(t *testing.T) {
 }
 
 // TestTakeTryMultiFrameNode 多帧同节点：非末帧拒绝移交（origin 仍有未读数据），
-// 末帧（节点恰好写满）允许移交。
+// 末帧（节点写满、引用唯一）也拒绝——整块缓冲前段属于帧A，本帧非独占（base != 0）。
 func TestTakeTryMultiFrameNode(t *testing.T) {
 	const nodeSize = 30 // 帧A wire 10 + 帧B wire 20
 	pool := setupTakeTest(t, nodeSize)
@@ -240,27 +240,24 @@ func TestTakeTryMultiFrameNode(t *testing.T) {
 		t.Fatalf("subA.Release: %v", err)
 	}
 
-	// 帧B（末帧，节点写满）：允许移交。
+	// 帧B（末帧，节点写满、origin 已读完、引用唯一）：仍非独占（base = wb != 0），
+	// 拒绝移交并回退拷贝路径——整块缓冲前段是帧A 的数据，不能一并交出去。
 	subB := frameSlice(t, lb, wb)
 	if subB.Len() != 11 {
 		t.Fatalf("frame B payload len = %d, want 11", subB.Len())
 	}
-	taken, full, ok := takeTry(subB)
-	if !ok {
-		t.Fatalf("TakeTry failed for last frame in full node")
+	if _, _, ok := takeTry(subB); ok {
+		t.Fatalf("TakeTry succeeded for non-exclusive last frame (base != 0), want refuse")
 	}
-	if string(taken) != "hello-taket" {
-		t.Fatalf("taken = %q", taken)
+	pB, err := subB.Next(11)
+	if err != nil || string(pB) != "hello-taket" {
+		t.Fatalf("fallback subB: p=%q err=%v, want %q", pB, err, "hello-taket")
 	}
-	if &taken[0] != &buf[wa+9] {
-		t.Fatalf("frame B taken not zero-copy")
-	}
-	pool.put(full)
 	if err := subB.Release(); err != nil {
 		t.Fatalf("subB.Release: %v", err)
 	}
-	if pool.putCount() != 1 {
-		t.Fatalf("put count = %d, want 1", pool.putCount())
+	if pool.putCount() != 0 {
+		t.Fatalf("put count = %d, want 0 (no take)", pool.putCount())
 	}
 }
 
@@ -318,5 +315,87 @@ func TestTakeTryPoolRecycle(t *testing.T) {
 	}
 	if len(next) > 0 && &next[0] != &full[0] {
 		t.Fatalf("book did not reuse taken buffer")
+	}
+}
+
+// TestTakeTryNoReclaimBeforeCallerPut 移交成功后、调用方 put 之前，缓冲绝不能被
+// 归还池：一旦提前归还，后续收流的 book 会取到同一缓冲并写入新帧，把调用方正在读的
+// 数据静默改写（E3 内容错配的成因类别）。同时锁定「主/子 Reader 随后释放也不得
+// 二次归还」的不变式。
+func TestTakeTryNoReclaimBeforeCallerPut(t *testing.T) {
+	const nodeSize = 4 + 5 + 4
+	pool := setupTakeTest(t, nodeSize)
+	payload := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+
+	lb := NewLinkBuffer(0)
+	buf := fillInput(lb, nodeSize, nodeSize)
+	putFrame(buf, 7, 0x06, payload)
+	sub := frameSlice(t, lb, nodeSize)
+
+	taken, full, ok := takeTry(sub)
+	if !ok {
+		t.Fatalf("TakeTry failed for single full frame")
+	}
+	base := pool.putCount()
+
+	// 读循环随后位移主 Reader 并释放已消费节点（并发语义下的典型序列）。
+	if err := lb.Release(); err != nil {
+		t.Fatalf("lb.Release: %v", err)
+	}
+	if n := pool.putCount(); n != base {
+		t.Fatalf("taken buffer reclaimed before caller put: puts=%d, want %d", n, base)
+	}
+	// 后续收流不得复用该缓冲：调用方数据必须保持不变。
+	next := fillInput(lb, nodeSize, nodeSize)
+	if &next[0] == &full[0] {
+		t.Fatalf("subsequent book reused the taken buffer while caller still holds it")
+	}
+	if string(taken) != string(payload) {
+		t.Fatalf("taken payload overwritten: got %x, want %x", taken, payload)
+	}
+	// 调用方归还：恰一次入池。
+	pool.put(full)
+	if n := pool.putCount(); n != base+1 {
+		t.Fatalf("puts = %d, want %d", n, base+1)
+	}
+	// 防御：越界 Release 子 Reader 不得二次归还。
+	if err := sub.Release(); err != nil {
+		t.Fatalf("sub.Release: %v", err)
+	}
+	if n := pool.putCount(); n != base+1 {
+		t.Fatalf("double return after take: puts=%d, want %d", n, base+1)
+	}
+}
+
+// TestTakeTryRefusedAfterMainRelease 主 Reader 已释放该节点（refer 降为 1，缓冲
+// 可能已被回收）时必须拒绝移交；且拒绝路径必须撤销 flagUnmanaged，否则该节点缓冲
+// 既不再被 netpoll 回收、也无从移交，形成池泄漏。
+func TestTakeTryRefusedAfterMainRelease(t *testing.T) {
+	const nodeSize = 4 + 5 + 4
+	pool := setupTakeTest(t, nodeSize)
+
+	lb := NewLinkBuffer(0)
+	buf := fillInput(lb, nodeSize, nodeSize)
+	putFrame(buf, 7, 0x06, []byte{0x11, 0x22, 0x33, 0x44})
+	sub := frameSlice(t, lb, nodeSize)
+
+	// 再收一帧（新节点），随后主 Reader 释放已消费的节点 A → A.refer 降为 1。
+	buf2 := fillInput(lb, nodeSize, nodeSize)
+	putFrame(buf2, 8, 0x06, []byte{0x55, 0x66, 0x77, 0x88})
+	if err := lb.Release(); err != nil {
+		t.Fatalf("lb.Release: %v", err)
+	}
+	if _, _, ok := takeTry(sub); ok {
+		t.Fatalf("TakeTry succeeded after main reader released the node, want refuse")
+	}
+	// 读取负载后释放子 Reader：节点缓冲应正常回收进池（证明 unmanaged 已撤销）。
+	if _, err := sub.Next(4); err != nil {
+		t.Fatalf("sub.Next: %v", err)
+	}
+	if err := sub.Release(); err != nil {
+		t.Fatalf("sub.Release: %v", err)
+	}
+	if n := pool.putCount(); n != 1 {
+		t.Fatalf("refused take left the buffer unmanaged: puts=%d, want 1", n)
 	}
 }
