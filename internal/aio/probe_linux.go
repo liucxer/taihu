@@ -15,7 +15,7 @@ import (
 const uringProbeHeaderLen = 16
 
 // probe 实际执行一次探测，第二个返回值表示结论是否确定性（可否缓存）。
-// 导出入口 Probe 与结论缓存在 aio.go。
+// 导出入口在 aio.go，结论缓存与转发在 probe_cache.go。
 func probe() (Info, bool) {
 	info := Info{KernelRelease: kernelRelease()}
 

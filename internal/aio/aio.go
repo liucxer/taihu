@@ -20,18 +20,17 @@
 //   - buf 在 Submit 后、对应完成事件被 Wait 取回前必须保持存活且不被改写；
 //   - Linux + O_DIRECT 时 buf 首地址、偏移、长度需 4K 对齐（由 bufpool/device 层保证）。
 //
-// 本文件集中该包的**全部对外 API**（类型、常量、错误与入口函数）。后端实现按平台
-// 分文件：aio_linux.go（libaio）、aio_uring_linux.go（io_uring）、aio_other.go
-// （非 Linux 兜底）；探测的实现细节在 probe_linux.go / probe_other.go。
+// 本文件集中该包的**全部对外 API**（类型、常量、错误与入口函数），且**只含导出名** ——
+// 未导出的常量、变量与辅助函数在 aio_internal.go，探测结论缓存在 probe_cache.go。
+// 后端实现按平台分文件：aio_linux.go（libaio）、aio_uring_linux.go（io_uring）、
+// aio_other.go（非 Linux 兜底）；探测的实现细节在 probe_linux.go / probe_other.go。
 package aio
 
 import (
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -40,9 +39,6 @@ var ErrFull = errors.New("aio: submission queue full")
 
 // ErrTimeout 表示 Wait 在超时时间内未取够 min 个事件。
 var ErrTimeout = errors.New("aio: wait timeout")
-
-// errInvalidMaxEvents 表示 NewWithOptions 的 maxEvents 超出内核允许范围。
-var errInvalidMaxEvents = errors.New("aio: maxEvents must be in [1, 65536]")
 
 // ── 提交与完成的数据形状 ──────────────────────────────────────────────
 
@@ -125,9 +121,6 @@ func ParseMode(s string) (Mode, error) {
 	return ModeAuto, fmt.Errorf("aio: invalid io-uring mode %q (want auto|on|off)", s)
 }
 
-// envMode 环境变量兜底开关（仅在 ModeAuto 下生效，便于线上紧急回退；命令行优先）。
-const envMode = "TAIHU_AIO_URING"
-
 // Options 创建异步 IO 队列的参数。
 type Options struct {
 	// Mode 后端选择，零值为 ModeAuto。
@@ -187,26 +180,6 @@ func NewWithOptions(maxEvents int, o Options) (Ring, error) {
 	return r, nil
 }
 
-// iopollSuffix 把 IOPOLL 状态拼进启动日志（仅在启用时出现）。
-func iopollSuffix(on bool) string {
-	if on {
-		return " iopoll=on"
-	}
-	return ""
-}
-
-// logBackend 打一行启动日志标明实际生效的后端与判定原因。双内核并存期，
-// 这行是排障时唯一能确定「跑的是哪个后端」的证据，故队列深度取自**实际建出的
-// ring**，而不是探测时的临时 ring（探测用 64 条，与真实深度无关）。
-func logBackend(r Ring, why string) {
-	if sq, cq, ok := ringQueueDepth(r); ok {
-		log.Printf("taihu: aio backend=%s sq=%d cq=%d kernel=%s (%s)",
-			backendName(r), sq, cq, kernelRelease(), why)
-		return
-	}
-	log.Printf("taihu: aio backend=%s kernel=%s (%s)", backendName(r), kernelRelease(), why)
-}
-
 // ── io_uring 可用性探测 ──────────────────────────────────────────────
 
 // Info 描述 io_uring 可用性探测结果。
@@ -219,12 +192,6 @@ type Info struct {
 	Features      uint32 // 内核能力位（IORING_FEAT_*）
 }
 
-var (
-	probeMu   sync.Mutex
-	probeInfo Info
-	probeDone bool
-)
-
 // Probe 探测当前内核是否可用 io_uring。
 //
 // 判定完全基于 io_uring_setup 的 errno，不比较内核版本号 —— 版本号反映不了三类
@@ -235,17 +202,10 @@ var (
 // 否则一次偶发失败会把进程永久钉死在 libaio 上。
 //
 // 平台差异收敛在 probe() 内：非 Linux 平台恒为不支持（见 probe_other.go）。
+// 缓存与转发逻辑在 probe_cache.go —— 那部分平台无关，不该进平台文件（见
+// .trellis/spec/architecture/api-surface.md 规则 5(a)）。
 func Probe() Info {
-	probeMu.Lock()
-	defer probeMu.Unlock()
-	if probeDone {
-		return probeInfo
-	}
-	info, deterministic := probe()
-	if info.Supported || deterministic {
-		probeInfo, probeDone = info, true
-	}
-	return info
+	return probeCached()
 }
 
 // CheckIOPoll 校验目标块设备是否开启了队列级轮询 —— IOPOLL 的前置条件。
