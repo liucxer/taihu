@@ -8,10 +8,10 @@
 taihu 的错误只有一个事实源：**`internal/ierr`**。该包的文件头原文写着：
 
 > Package ierr 定义 taihu 存储的公共错误 —— **唯一事实源**。
-> 内部各层（device/metastore/storage/transport/protocol）直接使用本包错误；
+> 内部各层（aio/device/metastore/storage/transport/protocol）直接使用本包错误；
 > 面向客户端的 re-export 只有一处：`internal/rpcclient/reexport.go`（`pkg/taihu-client/reexport.go` 再转指一层）。**`internal/` 下的包不得自建错误别名层。**
 
-当前共 6 个 sentinel，全部在 `internal/ierr/ierr.go:10-23`：`ErrNotFound`、`ErrInvalidRange`、`ErrTooLarge`、`ErrNoSpace`、`ErrShortWrite`、`ErrConflict`。
+当前共 8 个 sentinel，全部在 `internal/ierr/ierr.go:10-27`：`ErrNotFound`、`ErrInvalidRange`、`ErrTooLarge`、`ErrNoSpace`、`ErrShortWrite`、`ErrConflict`、`ErrFull`、`ErrTimeout`。
 
 **改动错误时第一条要问的**：这个错误该不该进 `ierr`？如果它要跨包被 `errors.Is` 判断，就进；如果只是本包内部的失败信号，就地 `fmt.Errorf` 包装。
 
@@ -53,13 +53,25 @@ ErrTooLarge = errors.New("taihu: object too large, exceeds segment size")
 
 **因此新增 sentinel 的判据是**：它需要跨包/跨层被判断吗？需要 → 进 `ierr`。不需要 → 不要新建 sentinel，用 `fmt.Errorf` 包装即可。
 
+**「进 `ierr`」与「re-export 给客户端」是两件事，别只做一半。** 进 `ierr` 的判据是**本仓库内部**有人跨包判断它；能不能被 SDK 调用方命名，由 `internal/rpcclient/reexport.go` 那份**显式白名单**另外决定。当前 8 个 sentinel 只 re-export 了 5 个：
+
+| sentinel | 进 `ierr` | re-export | 差额的理由 |
+|---|---|---|---|
+| `ErrNotFound` / `ErrInvalidRange` / `ErrTooLarge` / `ErrNoSpace` / `ErrShortWrite` | ✅ | ✅ | 会作为 `Storage` 方法返回值到达调用方 |
+| `ErrConflict` | ✅ | ❌ | compaction 内部的 CAS 控制信号，客户端收不到（`internal/rpcclient/reexport.go:30` 已注明） |
+| `ErrFull` / `ErrTimeout` | ✅ | ❌ | `device` ↔ `aio` 的流控信号：只在重试判断里被 `==` 比较（`internal/device/device.go:221`、`:521`），从不出现在任何导出签名里 |
+
+**所以新增 sentinel 要问两步**：内部有没有人跨包判断它（决定进不进 `ierr`）、客户端会不会收到它（决定进不进白名单）。只做第一步，SDK 调用方就 `errors.Is` 不了；只做第二步而不进 `ierr`，内部又立了第二个事实源。
+
+**判断「客户端会不会收到」的方法**：看它落在哪个函数里。落在**未导出**函数（如 `Device.pump`）或**导出函数的重试分支**（如 `AppendBatch` 命中 `ErrFull` 后 `continue` 而不 `return`）里的，客户端收不到。2026-09-22 把 `ErrFull` / `ErrTimeout` 从 `internal/aio` 收进 `ierr` 时，正是按这条判据确认**不需要**动 re-export 白名单的。
+
 **例外**：`pkg/taihu-client/storage.go:18` 的 `ErrNoInstances` 在 SDK 包内，不在 `internal/` 的管辖范围（`ierr` 的禁令写的是「`internal/` 下的包不得自建错误别名层」）——它表达的是**客户端侧的部署状态**（没有在线实例），不是存储语义，不该进 `ierr`。
 
 ### gbp-018 · Custom Error Types（MEDIUM）— **部分适用**
 
 **规则**：需要携带额外信息时定义自定义错误类型，用 `errors.As` 提取。
 
-**对 taihu：部分适用——机制适用，形态少见。** 本仓库全仓只有**一个**自定义 error 类型：`internal/aio/aio_uring_linux.go:398-399` 的 `uringParamError`（`:404` 是它的 `Error()` 方法）。
+**对 taihu：部分适用——机制适用，形态少见。** 本仓库全仓只有**一个**自定义 error 类型：`internal/aio/aio_uring_linux.go:406-409` 的 `uringParamError`（`:411` 是它的 `Error()` 方法）。
 
 这不是「还没做」。本仓库的绝大多数错误信息走**包装链**（`fmt.Errorf("op: %w", err)` 层层加前缀）而不是**携带字段的错误类型**，因为：
 

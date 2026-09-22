@@ -1,9 +1,13 @@
-# layout —— 顶层目录布局（golang-standards/project-layout）
+# layout —— 目录与文件布局
 
-> 来源：`golang-standards/project-layout`（`master`，核对于 `a9d6fae`）。
-> 这一层不来自 gbp——它是本 spec 的第二个来源。
->
-> **它不是官方标准。** 该仓库 README 自己声明它是**社区约定**、非 Go 官方规范，且 `pkg/` 这类模式「不被所有人接受」。所以本层的用法是：**project-layout 提议、本仓库逐条裁决**，而不是照搬。
+本层有两半，来源不同，**分开读**：
+
+| 半 | 来源 | 内容 |
+|---|---|---|
+| **顶层目录**（本文档前半） | `golang-standards/project-layout` | 20 个目录的逐项裁决 |
+| **包内文件**（本文档末尾） | **本仓库自定**（本 spec 唯一的自拟规则） | 一个包的对外面集中在一个文件 |
+
+**顶层目录这半不是官方标准。** project-layout 的 README 自己声明它是**社区约定**、非 Go 官方规范，且 `pkg/` 这类模式「不被所有人接受」（`master`，核对于 `a9d6fae`）。所以用法是：**project-layout 提议、本仓库逐条裁决**，而不是照搬。这半不来自 gbp——它是本 spec 的第二个来源。
 
 ## 本仓库的实际顶层
 
@@ -220,3 +224,162 @@ doc/{README.md, 设计文档/, 性能测试报告/, 部署记录/}
 - **默认不新建**：本仓库现有 9 个顶层目录已经覆盖了全部需要。**顶层多一个名字，阅读成本就多一分。**
 
 **唯一硬禁令：项目内不得出现 `/src`。**
+
+---
+
+# 包内布局：一个包的对外面集中在一个文件
+
+> **来源：本仓库自定** —— 这是本 spec 里唯一的自拟规则（收编门槛见[根 index](../index.md) 的「三个来源」）。
+> project-layout 只覆盖顶层目录，gbp 的九个类别里没有「包内文件组织」这一类，**两个上游都不管这件事**。
+> 它管的是「文件摆在哪」，与上面的顶层目录同题，所以放在本层。
+> 做法不是新发明的：`internal/aio/aio_internal.go:8-12` 与 `internal/aio/probe_cache.go:5-9` 的注释里已经写明了同一个判据，这里只是把它升格为规则。
+
+## 规则
+
+**一个包应当有一个「对外面文件」**，同时满足两条**独立**判据：
+
+| 判据 | 内容 |
+|---|---|
+| **① 单一性** | 该包**全部包级导出**（`func` / `type` / `var` / `const`）都定义在**同一个**文件里 |
+| **② 纯粹性** | 那个文件里**不得有任何未导出的顶层声明**——未导出的类型 / 常量 / 变量 / 函数一律在别的文件 |
+
+**文件命名：与包同名。** 实测：本仓库**包级导出只落在一个文件的 7 个包里，6 个都用 `<包名>.go`** —— `aio.go` / `bufpool.go` / `ierr.go` / `layout.go` / `protocol.go` / `version.go`。唯一例外是 `cmd/taihu/cmd`（包名 `cmd`，主文件叫 `root.go`，那是 cobra 的惯例）。**新增包时用 `<包名>.go`，不要另起 `api.go` / `public.go` / `export.go`。**
+
+## 为什么值得
+
+1. **读一个包只要读一个文件**就知道它的全部对外契约，不必在实现细节里挑出可导出的部分。这是最初的动机（`internal/aio/aio_internal.go:8-12` 写的就是这句）。
+2. **「这个符号能不能改」变成一次查找**：在对外面文件里 → 破坏性变更；不在 → 内部实现。Go 没有工具能回答「有没有包外调用方」，靠读代码猜不可靠，靠一个固定的文件位置才可靠。
+3. **纯粹性让规则可机械核查**：对外面文件里出现小写开头的顶层声明就是错——**不需要判断「这个未导出符号重不重要」**。少了这条判据，「哪些未导出符号该挪走」每次都要吵一遍。
+
+## 三条例外（不算违规）
+
+### 例外一 · 实现导出接口的方法（硬性，无法避免）
+
+Go 不允许实现导出接口的方法私有。`internal/aio` 的 `Ring` 接口（`internal/aio/aio.go:61-88`）声明了 `SubmitRead` / `SubmitWrite` / `Wait` / `Close`，所以三个后端类型上的同名方法**必须**导出：
+
+| 文件 | 导出方法 | **包级导出** |
+|---|---|---|
+| `internal/aio/aio_linux.go` | 6 个（`SubmitRead:71` … `Close:228`） | **0** |
+| `internal/aio/aio_other.go` | 6 个 | **0** |
+| `internal/aio/aio_uring_linux.go` | 7 个 | **0** |
+
+**关键在最后一列**：这三个文件**一个包级导出都没有**——它们是「未导出类型 + 导出方法」。所以 `internal/aio` 的对外面**确实就是 `aio.go` 一个文件**（14 个包级导出、0 个未导出顶层声明，见 `internal/aio/aio.go:23-26` 的包注释）。
+
+**统计时的坑**：按「文件里有几个大写开头的名字」数，会把上面这 19 个接口方法算成「导出面分散在 4 个文件」——**结论是错的**。判据是**包级导出**，方法不计。
+
+### 例外二 · `_` 声明
+
+`var _ ByteReader = netpoll.Reader(nil)` 这类**没有名字**的顶层声明不计入「未导出声明」：它必须**紧挨着被断言的接口**才有意义，为了「纯粹性」把它挪走是更糟的选择。实例：`internal/transport/protocol/protocol.go:191-192` 紧跟在同一文件 `:184` 的 `ByteReader` 之后。（`_` 的三种合法用法见 [idiomatic/](../idiomatic/index.md) 的 gbp-039。）
+
+### 例外三 · `reexport.go`
+
+`internal/rpcclient/reexport.go`（14 个导出）与 `pkg/taihu-client/reexport.go`（8 个导出）是**逐层转指上游类型与错误**的文件，两者都是 **0 个未导出顶层声明**，符合纯粹性。
+
+**允许存在，但要守住形态**：里面只许出现 **type alias 与 `= upstream.Err` 形式的变量 / 常量**，**不许出现函数体**。实测两处都符合——14 个导出是 4 `type` + 5 `var` + 5 `const`，8 个导出是 3 `type` + 5 `var`，**`func` 数都是 0**。一旦有人在 `reexport.go` 里写了函数，它就从「投影」变成了「第二个契约来源」，那时应当拆成一个正经的包。
+
+## 当前状态（2026-09-22 实测，AST 判定）
+
+| 状态 | 包（E = 包级导出数，U = 未导出顶层声明数） |
+|---|---|
+| ✅ **两条都符合** | `internal/aio`(14E)、`internal/ierr`(8E)、`internal/layout`(5E)、`internal/transport/protocol`(65E) |
+| ⚠️ **单一但不纯** | `internal/bufpool`(4E/11U)、`internal/version`(3E/1U)、`cmd/taihu/cmd`(1E/6U) |
+| ⚠️ **按主题拆成多个纯导出文件** | `internal/cluster`(7 文件)、`pkg/taihu-client`(4 文件) |
+| ❌ **导出散在实现文件里** | `internal/storage`(3 文件)、`internal/transport`(8)、`internal/rpcclient`(7)、`internal/metastore`(3)、`internal/device`(4)、`internal/benchkit`(2) |
+
+**这条规则不追溯既有代码。** 让 8 个包返工是大范围移动，收益只是文件摆放——**本轮不要求改**。它对**新增代码**生效：
+
+- **新增导出名** → 放进该包**已有**的对外面文件；**不要新开**一个只放导出名的文件。
+- **新增未导出名** → **不要**放进对外面文件，哪怕只有 3 行。
+- **新增一个包** → 一开始就按本规则建：`<包名>.go` 只放导出名。
+
+**三种偏差的处置方向不同，不要一律返工：**
+
+- **`internal/cluster`：有意设计，跟着它自己的分法走。** 它把导出面按主题拆进 6 个**纯导出**文件（`capacity.go` 5E / `client.go` 8E / `instance.go` 4E / `kv.go` 6E / `kv_mem.go` 2E / `register.go` 5E），只有实现文件 `kv_tikv.go`（3E/6U）混着未导出名。它牺牲了「一个文件读完全部契约」，换来「按主题定位」。**本规则不要求它改**；新增导出名时**跟着它自己的主题走**，不要混进实现文件。
+- **`internal/storage` 一类：正在往规则方向走，只是没走完。** 判据是它们的**主文件已经是纯导出的**——`internal/storage/storage.go` 有 5 个包级导出、**0 个未导出**。所以这 8 个包的偏差只是**有导出名落在了别的文件里**（`storage` 的导出分在 `storage.go`(5E) / `compact.go`(4E) / `options.go`(3E/2U)）。**新增导出名时放进主文件，不要放进 `compact.go` 这类实现文件**——这是不必返工也能逐步收敛的路径。
+- **`internal/bufpool` / `internal/version` / `cmd/taihu/cmd`：差的只是纯粹性。** 导出已经集中在一个文件，只是该文件里还混着未导出声明。**新增未导出名时不要往那个文件里加**即可。
+
+## 核查脚本（正则在这里不可靠，必须用 AST）
+
+**`grep` 数不出这件事。** 块形式的声明里，名字前面**没有关键字**：`internal/ierr/ierr.go:9-27` 的 8 个 sentinel 全在 `var ( ... )` 块里，换行后是 `\tErrNotFound = errors.New(...)`——任何 `^var [A-Z]` 模式的 grep 都**一条也匹配不到**，会得出「该包 0 个导出」的错误结论。**这个坑必须记住**：同类命令在别的层（如 [performance/](../performance/index.md)）能凑合用，是因为那些规则数的东西不藏在块里。
+
+正确的数法用 `go/ast`。存成 `/tmp/apidump/main.go`：
+
+```go
+// apidump 列出每个包里「承载包级导出」的文件，并标出该包对外面文件的纯粹性。
+// 接口方法（receiver 非空）不计：Go 语言强制它们导出。`_` 声明也不计。
+package main
+
+import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+func main() {
+	for _, dir := range os.Args[1:] {
+		files, _ := filepath.Glob(filepath.Join(dir, "*.go"))
+		fset := token.NewFileSet()
+		var carriers []string
+		for _, f := range files {
+			if strings.HasSuffix(f, "_test.go") {
+				continue
+			}
+			af, err := parser.ParseFile(fset, f, nil, 0)
+			if err != nil {
+				continue
+			}
+			ne, nu := 0, 0
+			for _, d := range af.Decls {
+				switch dd := d.(type) {
+				case *ast.FuncDecl:
+					if dd.Recv != nil {
+						continue
+					}
+					if ast.IsExported(dd.Name.Name) { ne++ } else { nu++ }
+				case *ast.GenDecl:
+					if dd.Tok == token.IMPORT {
+						continue
+					}
+					for _, s := range dd.Specs {
+						var names []*ast.Ident
+						switch sp := s.(type) {
+						case *ast.TypeSpec:
+							names = append(names, sp.Name)
+						case *ast.ValueSpec:
+							names = append(names, sp.Names...)
+						}
+						for _, n := range names {
+							if n.Name == "_" {
+								continue
+							}
+							if ast.IsExported(n.Name) { ne++ } else { nu++ }
+						}
+					}
+				}
+			}
+			if ne > 0 {
+				tag := fmt.Sprintf("%s(%dE", filepath.Base(f), ne)
+				if nu > 0 {
+					tag += fmt.Sprintf("/%dU", nu)
+				}
+				carriers = append(carriers, tag+")")
+			}
+		}
+		if len(carriers) > 0 {
+			fmt.Printf("%-28s %d 个文件  %s\n", dir, len(carriers), strings.Join(carriers, " "))
+		}
+	}
+}
+```
+
+跑法（`internal/*` 不会递归到 `internal/transport/protocol`，必须用 `find` 展开）：
+
+```bash
+find internal pkg cmd -name '*.go' ! -name '*_test.go' | xargs -n1 dirname | sort -u \
+  | command grep -v third_party > /tmp/dirs.txt
+xargs go run /tmp/apidump/main.go < /tmp/dirs.txt
+```
