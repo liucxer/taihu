@@ -86,12 +86,12 @@ func newIOUringRing(int, bool) (Ring, error) {
 
 ```go
 // probe 探测 io_uring 可用性。非 Linux 平台恒不支持，且结论是确定性的（可缓存）。
-// 导出入口 Probe 与结论缓存在 aio.go。
+// 导出入口在 aio.go，结论缓存与转发在 probe_cache.go。
 func probe() (Info, bool) {
 	return Info{Reason: "io_uring 仅 Linux 支持", KernelRelease: kernelRelease()}, true
 }
 ```
-（`internal/aio/probe_other.go:7-11`；第二个返回值 `true` 表示结论可缓存，见 `internal/aio/aio.go:171-187` 的 auto 分支）
+（`internal/aio/probe_other.go:7-11`；第二个返回值 `true` 表示结论可缓存，消费方是 `internal/aio/probe_cache.go:23-33` 的 `probeCached`，它在 `probe_other.go` / `probe_linux.go` 之外 —— 缓存是平台无关的。`Probe` 在 `internal/aio/aio.go:207-209` 只做一层转发。）
 
 **（c）shm 能力：不支持但上层可运行期判断**（见 §6）。
 

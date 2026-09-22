@@ -52,14 +52,14 @@ check-sdk-only:
 
 | 文件 | 用途 |
 |---|---|
-| [buffer-and-concurrency.md](./buffer-and-concurrency.md) | 缓冲所有权协议、`bufpool` 为何否决 `sync.Pool`、单一完成泵模型、Ring 并发契约、metastore 锁纪律 |
+| [buffer-and-concurrency.md](./buffer-and-concurrency.md) | 缓冲所有权协议、`bufpool` 为何否决 `sync.Pool`、单一完成泵模型、Ring 并发契约、metastore 锁纪律；**goroutine 生命周期纪律**（35 处 `go` 语句的形态分类、`stopCh`+`done` 招牌写法、两类已知例外）；**性能指引只适用热路径** |
 | [metadata-and-compaction.md](./metadata-and-compaction.md) | pebble 命名空间与编码、`Store` 接口契约、段状态机与 GC、分配器、CAS 搬移与 compaction |
 
 ## 已知缺口（对后续 agent 是真信息）
 
 - **`internal/storage` 没有包文档注释**。包内 4 个非测试文件（`storage.go`、`compact.go`、`admin.go`、`options.go`）首行均为 `package storage`，无 `// Package storage ...`。包级设计意图散落在各导出方法注释里，例如「Storage 不持有写游标状态」写在 `internal/storage/storage.go:14-18` 的 `Storage` 类型注释上。
 - **`internal/metastore` 的包文档只在 `store.go`** —— `internal/metastore/store.go:1-2`。`kv_pebble.go`、`segments.go`、`meta.go`、`cache.go` 都没有包文档；实现约定写在类型注释上，例如段管理的全部机制（存活计数、状态机、读引用、空闲池、后台 GC）写在 `internal/metastore/segments.go:13-26` 的 `segmentManager` 注释里。
-- **`internal/aio` 的包文档只在 `aio.go`** —— `internal/aio/aio.go:1-25`（并明确说明「本文件集中该包的全部对外 API」）。`aio_linux.go`、`aio_uring_linux.go`、`probe_linux.go` 只有文件内注释。
+- **`internal/aio` 的包文档只在 `aio.go`** —— `internal/aio/aio.go:1-26`（并明确说明「本文件集中该包的**全部对外 API**，且**只含导出名**」）。`aio_linux.go`、`aio_uring_linux.go`、`probe_linux.go`、`aio_internal.go`、`probe_cache.go` 只有文件内注释、无包文档。
 - **`internal/device` 同理**：包文档在 `internal/device/device.go:1-11`，平台专有文件（`device_linux.go`、`info_linux.go`、`options.go`）无包文档。
 - **本层没有 `internal/storage` 级别的「设计文档」落点**：`CompactorConfig` 的注释指向一份仓库外文档《segment 级 Compaction（数据迁移）设计方案》—— `internal/storage/compact.go:17-18`。该文档不在仓库内，读注释是唯一途径。
 

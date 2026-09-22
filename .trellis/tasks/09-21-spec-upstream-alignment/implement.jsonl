@@ -1,0 +1,7 @@
+{"file": ".trellis/tasks/09-21-spec-upstream-alignment/design.md", "reason": "准入条件§3.2 与归位原则§3.1 是每条规则能否入库的判据"}
+{"file": ".trellis/spec/architecture/index.md", "reason": "8 层结构；本轮新增 architecture/go-style.md 的归属依据"}
+{"file": ".trellis/spec/architecture/code-style.md", "reason": "语言层规则既有承载体：扩章、措辞订正、以及 th-049 自相矛盾正例的修正对象"}
+{"file": ".trellis/tasks/09-21-spec-upstream-alignment/research/dedup-uber.md", "reason": "uber 122 条适用规则的去重结论与拟落位置"}
+{"file": ".trellis/tasks/09-21-spec-upstream-alignment/research/dedup-ecc-gbp.md", "reason": "ecc/gbp 72 条适用规则的去重结论与拟落位置"}
+{"file": ".trellis/tasks/09-21-spec-upstream-alignment/research/triage.md", "reason": "三分类原始归属，含已符合表与勘误"}
+{"file": ".trellis/tasks/09-21-spec-upstream-alignment/research/conflicts.md", "reason": "评审门：11 条冲突的裁决汇总，决定措辞与例外标注方式"}

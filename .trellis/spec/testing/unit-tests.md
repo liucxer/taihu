@@ -203,3 +203,100 @@ type errKV struct {
 	batchErr error
 }
 ```
+
+---
+
+## 规则 8：表测试保持"输入 → 期望"的单层形态
+
+上游 `uber-119` / `120` / `122` / `123` / `124` 是一组：表测试只应承载**行为仅随输入变化**的用例；一旦表里需要条件断言、多条分支路径，就该拆成多个测试或独立 `Test...` 函数。
+
+taihu 现状是该组的**既成正例** —— 实测自有测试里：
+
+```bash
+# 表字段用 shouldXxx 式分支开关的 —— 无命中
+grep -rnE 'should[A-Z][a-zA-Z]*\s+(bool|error|string)' --include='*_test.go' internal pkg cmd test
+# 表里放函数值的（setupMocks func(*X) 式）—— 无命中
+```
+
+表一律是「输入 → 期望输出」。规则 4 的两个例子（`internal/transport/protocol/protocol_test.go:81-103` 的 `name/key/size`、`internal/layout/layout_test.go:49-63` 的 `in/want`）都是这个形态。
+
+**字段名的省略规则**（上游 `uber-107`）：表中字段数 **≤3 时可以省略字段名**，直接写匿名结构体。本仓库两种写法都在用，各自对应当下规模：
+
+| 写法 | 条件 | 实例 |
+|------|------|------|
+| 带字段名 + `name string` | 需要用例名，或字段 >3 | `internal/transport/protocol/protocol_test.go:81-103` |
+| 匿名字段 `struct{ in, want int64 }` | ≤3 字段的纯映射 | `internal/layout/layout_test.go:49-63` |
+
+## 规则 9：断言失败用 `t.Fatal*` / `t.Error*`，不用 `panic`
+
+上游 `uber-037`：即使在测试里也应优先用 `t.Fatal` / `t.FailNow` 而不是 panic，确保失败被标记为**测试失败**而非整个测试二进制崩溃。
+
+实测自有 `_test.go` 里只有 2 处 `panic`，**都不是断言替代品**：
+
+| 位置 | 内容 | 为什么可以留 |
+|------|------|--------------|
+| `internal/storage/storage_test.go:24-27` | `alignedPayload(n int)` 里 `panic("alignedPayload requires 4K multiple")` | 函数**签名里没有 `t *testing.T`**，调不了 `t.Fatalf`；传入非 4K 倍数是测试作者写错，不是被测行为 |
+| `internal/transport/protocol/protocol_test.go:390` | 解析器分发表 `switch` 的 `panic("unknown parser " + name)` | 同上，该 helper 返回 `error` 给调用方，未知 name 是测试作者写错 |
+
+**规则**：断言与"被测行为不符合预期"一律 `t.Fatalf` / `t.Errorf`。只有「签名里没有 `t`、且输入由测试作者写死」的纯 helper 才允许 panic —— 且新增这类 helper 时**优先改成返回 `error` 或补上 `t` 参数**，不要照抄上面两处。理由：helper 里的 panic 炸掉的是整个包的所有用例，失败定位成本远高于一次 `t.Fatal`。
+
+## 规则 10：先写测试（硬规则）
+
+上游 `ecc-034` 的 TDD 流程：**先写测试（RED）→ 跑到失败 → 最小实现（GREEN）→ 跑到通过 → 重构 → 复查覆盖率**。
+
+**这条在本仓库先按"从今往后"执行，历史提交记为待改进** —— 用 git 历史做锚点，两条代表性的：
+
+| 提交 | 实测 | 说明 |
+|------|------|------|
+| `fed67b4` | 改 84 个文件，其中 **81** 个 `_test.go` | 一次成批补测试，是"先实现后补测"的典型形态（注：该提交**信息**自称「82 个单测文件」，与 `--stat` 不符，引用时用 81） |
+| `9bcc797` | 改 6 个文件（`internal/device/{device,device_linux,options}.go` + `third_party/shmipc-go/` 3 个），**0** 个 `_test.go` | 改了设备重试与 O_EXCL 独占打开，无任何测试随改动进入 |
+
+这两条**不作为反例被追溯责难** —— 它们记录的是本规范生效前的惯例。**新改动照流程来**：先落一个能失败的测试，再写实现。
+
+**落地判据**（可机械检查）：一次提交里若出现"新增了行为分支却没有新增/修改对应的 `_test.go`"，就要在提交正文里说明为什么不适用（例：纯文档、纯重命名、`_linux` 专有代码且已在 `make check-linux` 覆盖）。
+
+## 规则 11：测试体按 Arrange-Act-Assert 三段组织
+
+上游 `ecc-036`。现状是既成正例 —— 表驱动用例天然分成「准备用例数据（Arrange）→ 调用被测函数（Act）→ 断言（Assert）」三段。`internal/layout/layout_test.go:45-64` 是完整形态：
+
+```go
+func TestAlign4k(t *testing.T) {
+	if BlockSize != 4096 {                    // :46-48 前置守卫（见下）
+		t.Fatalf("BlockSize=%d want 4096", BlockSize)
+	}
+	cases := []struct{ in, want int64 }{      // :49-58  Arrange
+		{-1, 0},
+		...
+	}
+	for _, c := range cases {                 // :59
+		if got := Align4k(c.in); got != c.want {   // :60  Act + Assert 同一行
+			t.Fatalf("Align4k(%d)=%d want %d", c.in, got, c.want)
+		}
+	}
+}
+```
+
+注意 `:46-48` 是**前置守卫断言**：它先确认 `BlockSize` 这个表所依赖的常量没被改动，再进表。表里多处直接写 `BlockSize`（`:52-55`）而非字面量 4096，守卫就是为这个写法兜底 —— 常量一旦被改，这里立刻失败，而不是让整张表悄悄改变语义。**表里引用了全局常量时照这个形态加一行守卫。**
+
+**不需要写注释标出三段**，靠空行分段即可。**规则**：不要在断言之间夹杂新的 Act —— 若一个用例需要"调用 → 断言 → 再调用 → 再断言"，说明它在测多个行为，拆成两个 `t.Run`。这条与规则 8（表测试保持单层）是同一诉求的两个侧面。
+
+---
+
+## 刻意偏离上游规则
+
+本节登记「**明确知道上游怎么说、但 taihu 有意不照做**」的条目。三要素缺一不可：上游主张 / taihu 的做法（带锚点）/ 为什么偏离（具体到可检验）。
+
+**不在这节里的「不遵守」不是偏离，是遗漏** —— 写不出可检验理由的，按缺陷处理。
+
+### 1. 性能测量不在单测层，不写 `go test -bench`
+
+- **用 `go test -bench` 量化性能，配合 `benchstat` 做前后对比。** —— 上游见 `gbp-044`。
+  **taihu 的做法**是**不写 benchmark**：自有代码里 `func Benchmark` **零命中**（`grep -rn 'func Benchmark' --include='*.go' cmd internal pkg test examples` 的结果是 0）；仓库里仅有的 16 个全在 fork 里（`third_party/netpoll/` 11 个、`third_party/shmipc-go/` 5 个，见本文规则 3 的表）。性能测量走 `internal/benchkit/` 的自研 harness 与 `test/e2e/` 的 F/G 组 —— 这条约定本身写在本文 `:75`。
+  **为什么偏离**：`go test -bench` 的三条硬限制正好卡住本仓库要测的东西 —— ① 它起不了真实的 O_DIRECT / io_uring 设备负载，跑出来的是缓存命中路径；② 它只覆盖单进程，而本仓库的性能问题（在途队列深度、`Ring.ErrFull` 背压、批量提交粒度）要跨进程才复现；③ 它只跑 TCP 或什么都不跑，覆盖不了 shm 与 netpoll 两条数据面。`internal/benchkit` 的 `Config.Pipeline`（`internal/benchkit/run.go:33`）、`-transport` 三选一与 e2e 的 `E2E_PD` 门控，就是为这三条限制准备的。**代价也认**：`benchstat` 那套统计对比本仓库没有对应物，跨提交的性能回归靠人读 `internal/benchkit` 的输出，不靠门禁。
+
+### 2. 不用 testify，断言手写
+
+- **用 testify 让断言更清晰，并区分 `assert` 与 `require`。** —— 上游见 `gbp-046`。
+  **taihu 的做法**是手写断言，形态与失败消息惯例见本文规则 2。自有代码对 testify **零引用**（`grep -rl 'testify' --include='*.go' cmd internal pkg test examples` = 0）。
+  **为什么偏离**：`go.mod:12` 里的 `github.com/stretchr/testify v1.9.0` 只为 `third_party/shmipc-go/` 的 13 个上游 fork 测试而存在（它们随 `go test ./...` 一起跑）。**这条偏离的理由是可检验的**：手写断言让测试代码的标准库依赖只有 `testing` 一手到底，读测试的人不需要在「这是断言库的行为还是 Go 的行为」之间切换；代价是失败消息要自己写，这条成本由规则 2 的消息惯例（`"<主体>(<入参>)=<got> want <want>"`）抵掉。
+  **别被 `go.mod` 骗到**：依赖清单里有 testify ≠ 仓库在用 —— 这是本文规则 2 特意提醒过的判据，也是 `.trellis/spec/guides/index.md` §二记的第 3 种假阳性。

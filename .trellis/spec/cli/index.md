@@ -89,6 +89,25 @@ var kvConnect = connectKVReal
 
 规则 8：**每个有必填项的命令都有一个集中的 `validate()`，`RunE` 拿到 flag 后先调它再干活。** `bench_storage.go:204-221`（mode 必须 write/read，size/threads/count/db/dev 校验）、`bench_single.go:126-143`（transport 与 addr/shm 的配对，再委托 `Config.Validate`）、`bench_cluster.go:166-183`（transport 枚举 + `-client-name` / `-pd` 必填）。`RunE` 侧只在 `bench_storage.go:85-87`、`bench_single.go:57-59`、`bench_cluster.go:69-71` 调用一次；调完立刻 `return err`，不夹带打印。
 
+规则 9：**超时必须可配，或者写明为什么是这个值 —— 不许静默写死。**（上游 `ecc-015` 的意图：`context` 传超时，而不是各处自己定）
+
+优先级从高到低，新写任何带超时的路径时按这个顺序选：**① 暴露成参数 → ② 从父 ctx 派生 → ③ 写死但注释说明为什么是这个值**。三条都不满足的就是缺陷。
+
+**本仓库的默认形态是 ① + ②**：
+
+- 超时是**参数**，不是常量。全局开关在 `root.go:91`（`pf.DurationVar(&global.timeout, "timeout", 5*time.Second, ...)`），一处收敛在 `ctxWithTimeout`（`root.go:111-113`），子命令一律经它派生；子超时再从父 ctx 派生 —— `cluster.go:279`、`:295` 的 `context.WithTimeout(ctx, 3*time.Second)`。
+- 库侧的 `5 * time.Second` 是 `if timeout <= 0` 的**兜底默认值**，正常路径由调用方传入 —— `internal/cluster/client.go:38-40`、`pkg/taihu-client/registry.go:58-60`。
+
+**唯一一处反例**（记为已知例外）：`internal/transport/server.go:83`
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+```
+
+`GracefulStop()` 三个问题叠加：方法**不接参数**（调用方无从控制）、用 `context.Background()`（与任何父 ctx 断开，`--timeout` 影响不到它）、**无注释**说明 5s 的来路。⇒ 违反 ①、②、③ 全部三条。
+
+**但它不是纯粹的疏漏**：关停路径**确实需要一个兜底期限**，否则 `GracefulStop` 可能永久挂住 ——「有界」是刻意的，问题只在「这个界不可配且来路不明」。所以规则允许 ③ 作为退路，不允许「既不可配也不写」。**本轮只记录，不改代码**（该待办见任务 `09-21-spec-upstream-alignment`）。
+
 ---
 
 ## 格式化

@@ -6,17 +6,28 @@
 
 ## 1. 标题格式：`type(scope): <中文标题>`
 
-`git log` 现有 143 条提交里，除一条 `Merge pull request #...` 和一条早期的英文提交外，**标题全部是中文**（实测 `git log --format=%s | grep -vP '[\x{4e00}-\x{9fff}]'` 只命中 2 条）。
+`git log` 现有 **145** 条提交里，除一条 `Merge pull request #...` 和一条早期的英文提交外，**标题全部是中文**（实测 `git log --format=%s | grep -vP '[\x{4e00}-\x{9fff}]'` 只命中 2 条）。
 
-已用过的 type：`refactor`(11)、`fix`(7)、`perf`(6)、`docs`(6)、`feat`(5)、`chore`(4)、`style`(1)。
+已用过的 type（实测 `git log --format=%s | grep -oE '^[a-z]+(\([^)]*\))?!?:' | sed 's/[(!:].*//' | sort | uniq -c`）：
 
-已用过的 scope（40 条带 scope 的提交里统计）：`transport`(7)、`perf`(3)、`bench`(3)、`aio`(3)、`storage`(2)、`repo`(2)、`pkg`(2)，以及各 1 次的 `server`、`sdk`、`rename`、`naming`、`device`、`cmd`、`bufpool`、`batch`、`doc`、`design`、`review`、`fmt`、`build`、`layout`、`trae`、`third_party`。
+| type | 条数 | | type | 条数 |
+|------|------|---|------|------|
+| `docs` | 42 | | `chore` | 11 |
+| `feat` | 28 | | `revert` | 3 |
+| `perf` | 22 | | `style` | 2 |
+| `refactor` | 17 | | `test` | 1 |
+| `fix` | 16 | | `init` | 1 |
+| | | | `bench` | 1 |
+
+**这份清单是开放的，不是白名单** —— `revert` / `test` / `init` / `bench` 各只出现过一两次，但它们都合法：type 取的是「这次改动的性质」，不是某个固定集合里的选项。新改动选最贴切的那个，别硬套高频词。
+
+已用过的 scope（42 条带 scope 的提交，其中 3 条为多 scope）：`transport`(8)、`storage`(3)、`perf`(3)、`bench`(3)、`aio`(3)、`sdk`(2)、`repo`(2)、`pkg`(2)，以及各 1 次的 `trellis`、`trae`、`third_party`、`spec`、`server`、`review`、`rename`、`naming`、`layout`、`fmt`、`doc`、`device`、`design`、`cmd`、`cli`、`build`、`bufpool`、`batch`。
 
 **scope 用包名或子系统名**（`internal/aio` → `aio`，`internal/transport` → `transport`），一次改多个模块就并写：`refactor(cli,sdk):`、`fix(storage,transport):`。
 
 ### 2. 仓库级改动省略 scope
 
-最近 45 条里只有 3 条不带 scope，全是跨包/无归属的改动：
+不带 scope 的提交本来就少，典型形态（跨包/无归属的改动）—— 取三条历史样本：
 
 ```
 fed67b4 test: 补齐 82 个单测文件与 e2e 套件，third_party fork 回迁上游测试
@@ -24,7 +35,7 @@ fed67b4 test: 补齐 82 个单测文件与 e2e 套件，third_party fork 回迁�
 d65adcc style: gofmt 规范化（补文件末尾换行 + const 块对齐），无逻辑变更
 ```
 
-**即 scope 是"这次改动落在哪个包"，不是必填字段**；改动没有单一归属时（补测试、动 go.sum、全仓库 gofmt）就不写。
+**即 scope 是"这次改动落在哪个包"，不是必填字段**；改动没有单一归属时（补测试、动 go.sum、全仓库 gofmt）就不写。（顺带一提：这三条都已滚出 `git log -45` 的窗口，所以**不要用"最近 N 条"当判据** —— 上表的所有数字都随提交增长而变，引用前重新测。）
 
 ---
 
@@ -72,7 +83,18 @@ fix(device): 完成侧瞬时错误重试、设备 O_EXCL 独占打开；shmipc �
 
 ## 6. 纯重构必须补「行为不变：」核对段
 
-这是本仓库最硬的一条正文约定。它只用于**声称"只搬不改"**的提交 —— 全仓库 143 条里只有 2 条带它（`git log` 逐条比对所得：`c50473a`、`522ae0c`），**恰恰因为它只在真重构时才写**。
+这是本仓库最硬的一条正文约定。它只用于**声称"只搬不改"**的提交 —— 145 条里只有 4 条带它，**恰恰因为它只在真重构时才写**：
+
+| 提交 | 类型 | 声称未变的是什么 |
+|------|------|------------------|
+| `c50473a` | `refactor(aio)` | 代码：ring 选型三分支、启动日志、函数体逐字节 |
+| `522ae0c` | `fix(cmd)` | 代码：正常关机路径照旧（见下方 bullet 变体） |
+| `876b75c` | `docs(spec)` | 本轮只改 `.trellis/spec/` 下的 markdown，未触碰任何 Go 代码 |
+| `3bc5f91` | `chore(trellis)` | 本轮不新增/修改/删除任何 Go 代码，`Makefile` 与 `doc/` 一字未动 |
+
+后两条说明**这条约定不限于代码重构** —— 纯文档/配置提交同样可以用它把"没碰代码"讲清楚。
+
+⚠️ 用 `git log --grep='行为不变'` 统计时，命中的还包含**正文里引用了这个词组**的提交（本 spec 自身的提交就是），所以要逐条看正文，不能用 grep 计数。
 
 `c50473a` 的核对段（放在正文末尾，独立成段）：
 

@@ -1,223 +1,111 @@
-# Code Reuse Thinking Guide
+# 复用与单一事实源
 
-> **Purpose**: Stop and think before creating new code - does it already exist?
-
----
-
-## The Problem
-
-**Duplicated code is the #1 source of inconsistency bugs.**
-
-When you copy-paste or rewrite existing logic:
-- Bug fixes don't propagate
-- Behavior diverges over time
-- Codebase becomes harder to understand
+> 本指南**不是规则清单** —— 规则在其余 7 层。它回答一个动作问题：**动手写新东西之前，先搜什么、搜到什么深度算够**。
+>
+> 判据来自本仓库的真实漏改（§2）与真实「刻意的重复」（§4），不是通用建议。
 
 ---
 
-## Before Writing New Code
+## 1. 本仓库已有的单一事实源
 
-### Step 1: Search First
+这几样东西被刻意收在一处。动到它们之前先知道消费方在哪 —— 否则就是「改了一半」。
+
+| 事实源 | 唯一所在 | 消费方 |
+|---|---|---|
+| 库错误 sentinel | `internal/ierr/ierr.go:1-3`（包文档自称**唯一事实源**） | `device` / `metastore` / `storage` / `transport` 全层；对外经 `internal/rpcclient/reexport.go:31-42` 转出一份 |
+| 线上帧布局 | `internal/transport/protocol/protocol.go:51` `FrameHeaderLen = 5` | `internal/transport/frame.go:106`（校验下界）、`:196-197`（写帧头）、`internal/transport/server.go:7`（文档注释） |
+| 段物理布局 | `internal/layout/layout.go` | `device` 与 `metastore` 共同依赖 —— `internal/layout/layout.go:1-2` 写明「本包独立存在的唯一理由是打断循环依赖」 |
+| 库错误 ↔ 线上错误码 | `internal/transport/protocol/protocol.go:113` `MapStorageErr` / `:129` `MapCode` | 服务端只调前者（`internal/transport/server.go:226` 等 8 处）、客户端只调后者（`internal/transport/client.go:106` 等 4 处） |
+
+**派生优于复写。** 最短的正面示例是 `internal/transport/protocol/protocol.go:54` —— 新容量由既有常量算出来，而不是再写一个手算结果：
+
+```go
+// MaxFrameTotal 帧负载上限 = FrameHeaderLen + ChunkSize。
+const MaxFrameTotal = FrameHeaderLen + ChunkSize
+```
+
+改了 `FrameHeaderLen` 或 `ChunkSize`，`MaxFrameTotal` 自动跟上；若当初写成 `= 37`，这次改动就会漏掉它。
+
+## 2. 一个真实的漏改：`64eaec3`
+
+这条不是假设，是本仓库发生过的：
+
+```
+feat(bench): bench_cluster 补齐 --pipeline 参数
+
+benchkit 已支持 Pipeline（每个 worker 保持的在途 op 数，>1 时走
+runPipelinedWorker 并发下发），bench_single 也已读取该 flag，但
+bench_cluster 既没注册也没读取，集群压测无法开流水线，恒为串行。
+```
+
+形态值得记住：**共享逻辑（`internal/benchkit/run.go:33` 的 `Config.Pipeline`）已经支持，两个调用点里只有一个接上了线**。`cmd/taihu/cmd/bench_single.go:123` 注册了 `f.Int("pipeline", ...)` 并 `:55` 读取，`cmd/taihu/cmd/bench_cluster.go` 两样都没有 —— 于是同一个 benchkit 在两个命令下行为不同，且不报错。
+
+修法只有 2 行（`git show --stat 64eaec3` 的 `2 ++`），但发现它花了很久。**这类「一半接上线」的形态靠编译器查不出来**，只能靠写完一个调用点后去搜另一个：
 
 ```bash
-# Search for similar function names
-grep -r "functionName" .
-
-# Search for similar logic
-grep -r "keyword" .
+# 我改/加了 X，还有谁读它？
+grep -rn 'Pipeline' --include='*.go' cmd/ internal/benchkit/ | grep -v _test.go
 ```
 
-### Step 2: Ask These Questions
+## 3. 动手前的三问
 
-| Question | If Yes... |
-|----------|-----------|
-| Does a similar function exist? | Use or extend it |
-| Is this pattern used elsewhere? | Follow the existing pattern |
-| Could this be a shared utility? | Create it in the right place |
-| Am I copying code from another file? | **STOP** - extract to shared |
+| 问 | 若「是」 |
+|---|---|
+| 同样的值/常量在别处定义过吗？ | 用那一个；要改就改那一个（§1 的表先过一遍） |
+| 我是在复制一段已有的**逻辑**吗？ | **停** —— 先判断它是不是该抽到共享位置（§5 说了什么时候**不**该抽） |
+| 我加的参数/字段有**多个消费方**吗？ | 那就把每一个消费方都接上线，别只接手上这个（§2） |
 
----
-
-## Common Duplication Patterns
-
-### Pattern 1: Copy-Paste Functions
-
-**Bad**: Copying a validation function to another file
-
-**Good**: Extract to shared utilities, import where needed
-
-### Pattern 2: Similar Components
-
-**Bad**: Creating a new component that's 80% similar to existing
-
-**Good**: Extend existing component with props/variants
-
-### Pattern 3: Repeated Constants
-
-**Bad**: Defining the same constant in multiple files
-
-**Good**: Single source of truth, import everywhere
-
-### Pattern 4: Repeated Payload Field Extraction
-
-**Bad**: Multiple consumers cast the same JSON/event fields locally:
-
-```typescript
-const description = (ev as { description?: string }).description;
-const context = (ev as { context?: ContextEntry[] }).context;
-```
-
-This is duplicated contract logic even when the code is only two lines. Each
-consumer now has its own definition of what a valid payload means.
-
-**Good**: Put the decoder, type guard, or projection next to the data owner:
-
-```typescript
-if (isThreadEvent(ev)) {
-  renderThreadEvent(ev);
-}
-```
-
-**Rule**: If the same untyped payload field is read in 2+ places, create a
-shared type guard / normalizer / projection before adding a third reader.
-
----
-
-## When to Abstract
-
-**Abstract when**:
-- Same code appears 3+ times
-- Logic is complex enough to have bugs
-- Multiple people might need this
-
-**Don't abstract when**:
-- Only used once
-- Trivial one-liner
-- Abstraction would be more complex than duplication
-
----
-
-## After Batch Modifications
-
-When you've made similar changes to multiple files:
-
-1. **Review**: Did you catch all instances?
-2. **Search**: Run grep to find any missed
-3. **Consider**: Should this be abstracted?
-
-### Reducers Should Use Exhaustive Structure
-
-When state is derived from action-like values (`action`, `kind`, `status`,
-`phase`), prefer a reducer with one `switch` over scattered `if/else` updates.
-
-```typescript
-// BAD - action-specific state transitions are hard to audit
-if (action === "opened") { ... }
-else if (action === "comment") { ... }
-else if (action === "status") { ... }
-
-// GOOD - one reducer owns the transition table
-switch (event.action) {
-  case "opened":
-    ...
-    return;
-  case "comment":
-    ...
-    return;
-}
-```
-
-This matters when the event log is the source of truth. A reducer is the
-documented replay model; display code and commands should not duplicate pieces
-of that replay model.
-
----
-
-## Checklist Before Commit
-
-- [ ] Searched for existing similar code
-- [ ] No copy-pasted logic that should be shared
-- [ ] No repeated untyped payload field extraction outside a shared decoder
-- [ ] Constants defined in one place
-- [ ] Similar patterns follow same structure
-- [ ] Reducer/action transitions live in one reducer or command dispatcher
-
----
-
-## Gotcha: Python if/elif/else Exhaustive Check
-
-**Problem**: Python's if/elif/else chains have no compile-time exhaustive check. When you add a new value to a `Literal` type (e.g., `Platform`), existing if/elif/else chains silently fall through to `else` with wrong defaults.
-
-**Symptom**: New platform works partially — some methods return Claude defaults instead of platform-specific values. No error is raised.
-
-**Example** (`cli_adapter.py`):
-```python
-# BAD: "gemini" falls through to else, returns "claude"
-@property
-def cli_name(self) -> str:
-    if self.platform == "opencode":
-        return "opencode"
-    else:
-        return "claude"  # gemini silently gets "claude"!
-
-# GOOD: explicit branch for every platform
-@property
-def cli_name(self) -> str:
-    if self.platform == "opencode":
-        return "opencode"
-    elif self.platform == "gemini":
-        return "gemini"
-    else:
-        return "claude"
-```
-
-**Prevention**: When adding a new value to a Python `Literal` type, search for ALL if/elif/else chains that switch on that type and add explicit branches. Don't rely on `else` being correct for new values.
-
----
-
-## Gotcha: Asymmetric Mechanisms Producing Same Output
-
-**Problem**: When two different mechanisms must produce the same file set (e.g., recursive directory copy for init vs. manual `files.set()` for update), structural changes (renaming, moving, adding subdirectories) only propagate through the automatic mechanism. The manual one silently drifts.
-
-**Symptom**: Init works perfectly, but update creates files at wrong paths or misses files entirely.
-
-**Prevention**:
-- **Best**: Eliminate the asymmetry — have the manual path call the automatic one (e.g., `collectTemplateFiles()` calls `getAllScripts()` instead of maintaining its own list)
-- **If asymmetry is unavoidable**: Add a regression test that compares outputs from both mechanisms
-- When migrating directory structures, search for ALL code paths that reference the old structure
-
-**Real example**: `trellis update` had a manual `files.set()` list for 11 scripts that `getAllScripts()` already tracked. Fix: replaced the manual list with a `for..of getAllScripts()` loop. See `update.ts` refactor in v0.4.0-beta.3.
-
----
-
-## Template File Registration (Trellis-specific)
-
-When adding new files to `src/templates/trellis/scripts/`:
-
-**Single registration point**: `src/templates/trellis/index.ts`
-
-1. Add `export const xxxScript = readTemplate("scripts/path/file.py");`
-2. Add to `getAllScripts()` Map
-
-That's it. `commands/update.ts` uses `getAllScripts()` directly — no manual sync needed.
-
-**Why this matters**: Without registration in `getAllScripts()`, `trellis update` won't sync the file to user projects. Bug fixes and features won't propagate.
-
-**History**: Before v0.4.0-beta.3, `update.ts` had its own hand-maintained file list that frequently fell out of sync with `getAllScripts()`. This caused 11 Python files to be silently skipped during `trellis update`. The fix was to eliminate the duplicate list and use `getAllScripts()` as the single source of truth.
-
-### Quick Checklist for New Scripts
+批量改动之后回搜一遍，本仓库有现成的机械手段：
 
 ```bash
-# After adding a new .py file, verify it's in getAllScripts():
-grep -l "newFileName" src/templates/trellis/index.ts  # Should match
+make check            # check-fmt + check-layering + check-sdk-only + go vet
 ```
 
-### Template Sync Convention
+`check-layering` 与 `check-sdk-only` 就是两条**用 grep 实现的越界检测** —— 它们不查重复代码，但查「同一件事有没有在错误的层里被做第二遍」（规则与理由见 `Makefile:35-36` 的注释与 [layering.md](../architecture/layering.md)）。改完先跑它们，比人眼过一遍可靠。
 
-`.trellis/scripts/` (dogfooded) and `packages/cli/src/templates/trellis/scripts/` (template) must stay identical. After editing `.trellis/scripts/`, always sync:
+## 4. 重复**不是**问题：两处可以并存
+
+本仓库最容易被误判成「duplicate」的地方，是 `internal/transport` 的两个平台桩：
+
+```go
+// errShmUnsupported shmipc 仅支持 Linux。
+var errShmUnsupported = errors.New("taihu: shmipc only supported on linux")
+```
+
+`internal/transport/server_shm_other.go:14` 与 `internal/rpcclient/dial_shm_other.go:12` 各持一份，**消息相同、互不复用**。这是刻意的：它们是不同层的平台桩，行为与生存期独立。合并到 `internal/ierr` 会把「一个平台的降级实现」提升成「全仓库公共错误」，语义反而错了。
+
+判据：**重复的是「值的巧合」还是「契约的同一件事」？** 前者各留一份，后者收一处。
+
+## 5. 什么时候**不**抽象
+
+「重复三次就抽」在本仓库不成立 —— 有两条刻意的未抽象，都写明了理由：
+
+| 未抽象 | 理由 |
+|---|---|
+| `internal/transport/batch.go:15` | 注释写明「不做主动关闭」—— 不为没有需求的调用方预先建一套生命周期 API |
+| `internal/cluster/kv.go:8` | 接口只列实际用到的几个方法 —— 最小接口，不预建抽象 |
+
+**只在同时满足下面两条时才抽**：
+
+1. 它已经在 2 个以上地方**真的**重复（不是「将来可能」）；
+2. 抽象之后，读的人不用跳转就能知道它做什么。
+
+任一条不满足，就地写清楚，比抽出去更好读。
+
+## 6. 唯一的「必须先搜」硬约束
+
+改**任何**跨进程/跨版本的常量之前，先搜它的解析侧：
 
 ```bash
-rsync -av --delete --exclude='__pycache__' .trellis/scripts/ packages/cli/src/templates/trellis/scripts/
+grep -rn 'FrameHeaderLen\|MaxFrameTotal\|metaVersion' --include='*.go' internal/ | grep -v _test.go
 ```
 
-**Gotcha**: Running rsync with wrong source/destination paths can create nested garbage directories (e.g., `.trellis/scripts/packages/cli/...`). Always double-check paths before running.
+原因见 `cross-layer-thinking-guide.md` §4 —— 本仓库有一个**写了但没人读**的版本字节（`internal/metastore/meta.go:14` 的 `metaVersion`，三处 encode 写入 `:30`/`:57`/`:94`，解码侧零使用）。它证明了「我写的时候两边都改了」这个直觉并不可靠。
+
+---
+
+## 相关
+
+- 规则本体：[api-surface.md](../architecture/api-surface.md) 规则 7（依赖从构造函数进）、[code-style.md](../architecture/code-style.md) 规则 19（魔法数字改具名常量）
+- 跨层传播：`cross-layer-thinking-guide.md`
+- 平台文件成对的复用形态：[file-splitting.md](../platform/file-splitting.md)

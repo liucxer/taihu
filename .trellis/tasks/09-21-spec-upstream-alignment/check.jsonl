@@ -1,0 +1,3 @@
+{"file": ".trellis/tasks/09-21-spec-upstream-alignment/research/verify_spec_refs.py", "reason": "引用完整性校验脚本，P5 唯一机器判据"}
+{"file": ".trellis/tasks/09-21-spec-upstream-alignment/implement.md", "reason": "P5 验收判据与不做事清单"}
+{"file": ".trellis/tasks/09-21-spec-upstream-alignment/research/triage.md", "reason": "核对每条并入规则的上游归属"}

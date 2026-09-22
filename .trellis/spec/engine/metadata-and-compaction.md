@@ -20,7 +20,7 @@ pebble 是单 keyspace、无列族，因此用 key 前缀隔离两个逻辑命�
 - state 内部键字面量：`"cursor"` 与 `"seg/"` + little-endian(int64) —— `internal/metastore/meta.go:143-147`、`internal/metastore/meta.go:149-154`。
 - 迭代区间一律用「前缀末字节 +1」求独占上界，`internal/metastore/kv_pebble.go:86-91` 的 `appendUpper` 是这做法的复用点。
 
-**编码规则**（固定字段 little-endian，每个 value 头部 1 字节 version 便于演进）—— `internal/metastore/meta.go:13-18`：
+**编码规则**（固定字段 little-endian，每个 value 头部预留 1 字节 version）—— `internal/metastore/meta.go:13-18`：
 
 ```go
 const (
@@ -33,6 +33,43 @@ const (
 
 - 三个 `decodeXxx` 都以「长度不等于常量则报错」作为第一道校验 —— `internal/metastore/meta.go:37-40`、`internal/metastore/meta.go:63-66`、`internal/metastore/meta.go:101-104`。
 - **写入默认 Sync**，以保证「先写设备数据 → 写 mapping → 更新 cursor」的持久化顺序，崩溃后游标不回退 —— `internal/metastore/kv_pebble.go:22`；具体由 `syncWO = &pebble.WriteOptions{Sync: true}` 承载 —— `internal/metastore/kv_pebble.go:65`。
+
+### 版本字节与字段布局：两条规则
+
+**规则 A：版本字节必须在解码侧真的校验。** 目前**没有** —— 这是本仓库的一处真实缺陷，本轮只记录、不改码。
+
+`metaVersion` 定义在 `internal/metastore/meta.go:14`，三处 encode 都把它写进去了（`:30` ObjectMeta、`:57` WriteCursor、`:94` SegmentMeta），但解码侧从不读：
+
+```go
+func decodeObjectMeta(b []byte) (ObjectMeta, error) {          // internal/metastore/meta.go:37
+	if len(b) != objectMetaLen {
+		return ObjectMeta{}, fmt.Errorf("taihu: bad ObjectMeta length %d", len(b))
+	}
+	return ObjectMeta{
+		SegmentID: int64(binary.LittleEndian.Uint64(b[1:9])),   // b[0] 是版本位，直接跳过
+```
+
+实测 `grep -n metaVersion internal/metastore/meta.go` 只有 4 行命中：**1 处定义 + 3 处写入，解码路径零使用**。
+
+**后果**：长度校验（`:38-41`）能在字段增删时拦住；**同长度的字段重排或语义变更拦不住** —— 磁盘上的旧数据会被静默按新布局解读，读出错值且不报错。round-trip 测试兜不住这一层：`meta_test.go:6` 的两侧用同一份代码、同一个版本，永远自洽 —— 它验证的是「编解码实现自洽」，不是「与磁盘上既有的字节兼容」。
+
+**新写任何磁盘格式时**：版本字节要么在解码侧真的校验（读到不认识的版本就报错），要么干脆不写 —— 写了不验会给人「有演进能力」的错觉。
+
+**规则 B：字段布局用命名常量表达，不要在编解码两侧各写一遍魔法数字。**（上游 `uber-047` 的意图。语言层的一般形式是「魔法数字改具名常量」，见 [code-style.md](../architecture/code-style.md) 规则 19；这里记的是它在**格式契约**上的特殊形态）
+
+编码侧 `internal/metastore/meta.go:31-33` 用 `b[1:]` / `b[9:]` / `b[17:]`，解码侧 `:42-44` 用 `b[1:9]` / `b[9:17]` / `b[17:25]` —— 同一个布局写了两遍。
+
+线上格式已经做到正确形态：`internal/transport/protocol/protocol.go:63` 的 `SegItemLen = 8 + 1 + 8 + 8` 把字段宽度写进常量表达式（改字段立刻可见），且 `protocol_test.go:555-575` 的 `TestWireConstantsAreConsistent` 专门钉住这组派生关系 —— 见 [wire-protocol.md](../transport/wire-protocol.md) §2。
+
+三种格式契约的强度对照，**新代码照最强的那档写**：
+
+| 契约 | 机制 | 强度 |
+|------|------|------|
+| 内核 ABI | `unsafe.Sizeof` / `unsafe.Offsetof` 编译期断言 —— `internal/aio/aio_uring_linux.go:141-146` | **最强**：与内核 UAPI 不一致直接编不过 |
+| 线上格式 | 命名常量表达布局 + `TestWireConstantsAreConsistent` —— `internal/transport/protocol/protocol.go:51-63` | 中 |
+| 磁盘格式 | 两侧各写一套魔法数字 + round-trip 测试 —— `internal/metastore/meta.go:31-33`、`:42-44` | **最弱**，是规则 B 要修的对象 |
+
+**为什么 round-trip 测试不够**（上游主张的落地形式）：它能兜住「编码解码写得不一致」，但**兜不住「两侧一起改错」** —— 那种情况下测试仍绿，而磁盘上的旧数据静默读不出来。线上格式两端可以同时升级，磁盘上的数据没有这个机会。
 
 ### 领域态只有一份，wire 态刻意分开
 

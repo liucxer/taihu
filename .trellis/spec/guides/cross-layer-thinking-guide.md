@@ -1,327 +1,138 @@
-# Cross-Layer Thinking Guide
+# 跨层与跨边界
 
-> **Purpose**: Think through data flow across layers before implementing.
-
----
-
-## The Problem
-
-**Most bugs happen at layer boundaries**, not within layers.
-
-Common cross-layer bugs:
-
-- API returns format A, frontend expects format B
-- Database stores X, service transforms to Y, but loses data
-- Multiple layers implement the same logic differently
+> 本指南管一件事：**一次改动要穿过几层**。层内怎么写由各层规则负责，这里只回答「我改了这头，另一头在哪」。
+>
+> 下面每条都指回本仓库真实发生过的漏改或真实存在的链，不是通用建议。
 
 ---
 
-## Before Implementing Cross-Layer Features
+## 1. 本仓库有哪几层，方向不变量是什么
 
-### Step 1: Map the Data Flow
-
-Draw out how data moves:
+不重述 —— 规则与门禁见 [layering.md](../architecture/layering.md)。这里只留最短的辨认法：
 
 ```
-Source → Transform → Store → Retrieve → Transform → Display
+cmd/taihu  →  internal/{transport,rpcclient,benchkit}  →  internal/{storage,cluster,device,aio,...}  →  internal/{layout,ierr}
+                pkg/taihu-client  ↗（只能走 rpcclient/cluster/metastore/ierr/version）
 ```
 
-For each arrow, ask:
+**判据**：改完之后 `make check` 的 `check-layering` 与 `check-sdk-only` 都还要是 `OK`（`Makefile:35-36` 写明了两条各自防的是什么）。
 
-- What format is the data in?
-- What could go wrong?
-- Who is responsible for validation?
+## 2. 一条 flag 的全链：五段，少接一段不报错
 
-### Step 2: Identify Boundaries
+`-batch` 这个 flag 从命令行到真正干活的 goroutine 要穿五段：
 
-| Boundary              | Common Issues                     |
-| --------------------- | --------------------------------- |
-| API ↔ Service         | Type mismatches, missing fields   |
-| Service ↔ Database    | Format conversions, null handling |
-| Backend ↔ Frontend    | Serialization, date formats       |
-| Component ↔ Component | Props shape changes               |
+| # | 段 | 位置 |
+|---|---|---|
+| 1 | 注册 | `cmd/taihu/cmd/server.go:291-292` `f.Int("batch", 0, ...)` |
+| 2 | 读取 | `cmd/taihu/cmd/server.go:212-213` `cmd.Flags().GetInt("batch")` |
+| 3 | 装进配置 | `cmd/taihu/cmd/server.go:215-216` `transport.PipelineConfig{ReadBatch: batchTarget}` |
+| 4 | 构造 | `internal/transport/batch.go:48` `newPipeline` → `:78` `newBatchWriter` |
+| 5 | 起 goroutine | `internal/transport/batch.go:90-93` |
 
-### Step 3: Define Contracts
+**为什么值得记**：第 1、2 段的失败方式是**静默**的。flag 注册了但没人读（第 2 段断）→ 用户设了没反应；flag 没注册但有人读（第 1 段断）→ `GetInt` 取回默认值 0，同样没反应。两种都不编译报错、不运行报错。
 
-For each boundary:
+同形的一次真实事故记在 `code-reuse-thinking-guide.md` §2（`64eaec3`，两个 bench 命令里只有一个接上了 `--pipeline`）。
 
-- What is the exact input format?
-- What is the exact output format?
-- What errors can occur?
+**结论**：新增一个可配参数时，**五段都要点名确认**，而不是「肯定传下去了」。
 
----
+## 3. 一条 error 跨进程要穿过的 5 层
 
-## Common Cross-Layer Mistakes
-
-### Mistake 1: Implicit Format Assumptions
-
-**Bad**: Assuming date format without checking
-
-**Good**: Explicit format conversion at boundaries
-
-### Mistake 2: Scattered Validation
-
-**Bad**: Validating the same thing in multiple layers
-
-**Good**: Validate once at the entry point
-
-### Mistake 3: Leaky Abstractions
-
-**Bad**: Component knows about database schema
-
-**Good**: Each layer only knows its neighbors
-
-### Mistake 4: Every Consumer Parses The Same Payload
-
-**Bad**: A command reads JSONL events and casts fields inline:
-
-```typescript
-const thread = (ev as { thread?: string }).thread;
-const labels = (ev as { labels?: string[] }).labels;
-```
-
-This looks local, but it means every consumer owns a private version of the
-event contract. The next field change will update one command and miss another.
-
-**Good**: Decode once at the event boundary, then export typed projections:
-
-```typescript
-if (!isThreadEvent(ev)) return false;
-return ev.thread === filter.thread;
-```
-
-**Rule**: For append-only logs, JSON streams, RPC payloads, or config files,
-create one owner for:
-
-- event / payload type definitions
-- type guards and normalization from `unknown`
-- metadata projections used by UI commands
-- reducers that replay state from the source of truth
-
-Rendering code may format fields, but it must not redefine the payload contract.
-
----
-
-## Checklist for Cross-Layer Features
-
-Before implementation:
-
-- [ ] Mapped the complete data flow
-- [ ] Identified all layer boundaries
-- [ ] Defined format at each boundary
-- [ ] Decided where validation happens
-
-After implementation:
-
-- [ ] Tested with edge cases (null, empty, invalid)
-- [ ] Verified error handling at each boundary
-- [ ] Checked data survives round-trip
-- [ ] Checked that consumers import shared decoders / projections instead of
-      casting payload fields locally
-- [ ] Checked that derived state points back to the source event identifier
-      (`seq`, `id`, `version`) instead of inventing a second cursor
-
----
-
-## Cross-Platform Template Consistency
-
-In Trellis, command templates (e.g., `record-session.md`) exist in **multiple platforms** with identical or near-identical content. This is a cross-layer boundary.
-
-### Checklist: After Modifying Any Command Template
-
-- [ ] Find all platforms with the same command: `find src/templates/*/commands/trellis/ -name "<command>.*"`
-- [ ] Update all platform copies (Markdown `.md` and TOML `.toml`)
-- [ ] For Gemini TOML: adapt line continuations (`\\` vs `\`) and triple-quoted strings
-- [ ] Run `/trellis:check-cross-layer` to verify nothing was missed
-
-**Real-world example**: Updated `record-session.md` in Claude to use `--mode record`, but forgot iFlow, Kilo, OpenCode, and Gemini — caught by cross-layer check.
-
----
-
-## Generated Runtime Template Upgrade Consistency
-
-Some generated files are both documentation and runtime input. In Trellis,
-`.trellis/workflow.md` is parsed by `get_context.py`, `workflow_phase.py`,
-SessionStart filters, and per-turn hooks. Template changes must be validated
-against both fresh init and upgrade paths.
-
-### Checklist: After Modifying A Runtime-Parsed Template
-
-- [ ] Identify every runtime parser that reads the template, not just the file
-      writer that installs it
-- [ ] Check whether relevant syntax lives outside obvious managed regions
-      such as tag blocks
-- [ ] Verify fresh `init` output and a versioned `update` scenario that writes
-      the older `.trellis/.version`
-- [ ] Add an upgrade regression using an older pristine template fixture, then
-      assert the installed file reaches the current packaged shape
-- [ ] Update the backend spec that owns the runtime contract
-
----
-
-## Versioned Documentation Boundary
-
-Versioned documentation is a cross-layer boundary: source paths, `docs.json`
-version routing, and the rendered version selector must all describe the same
-release line.
-
-### Checklist: Before Editing Versioned Docs
-
-- [ ] Identify the target release line: stable, beta, or RC
-- [ ] Verify the edited MDX path matches that line:
-  - stable: `docs-site/{start,advanced,...}` and `docs-site/zh/{start,advanced,...}`
-  - beta: `docs-site/beta/**` and `docs-site/zh/beta/**`
-  - RC: `docs-site/rc/**` and `docs-site/zh/rc/**`
-- [ ] Verify `docs.json` navigation points the version label to the same paths
-- [ ] Grep the opposite tree for release-line-specific terms before committing
-- [ ] Treat beta content appearing under root release paths as a source-path bug,
-      not a rendering bug
-
-**Real-world example**: A beta-only task workflow change documented
-`prd.md` + `design.md` + `implement.md`, task-creation consent, and Codex
-mode banners under root `start/` and `advanced/` paths. The docs site then
-served 0.6 beta behavior under the Release selector. The fix was to restore root
-release docs, move the 0.6 content to `beta/` and `zh/beta/`, and add a grep
-audit for beta markers against the root release tree.
-
-**Real-world example**: Codex inline mode changed workflow platform markers from
-`[Codex]` / `[Kilo, Antigravity, Windsurf]` to `[codex-sub-agent]` /
-`[codex-inline, Kilo, Antigravity, Windsurf]`. Fresh init was correct, but
-`trellis update` only merged `[workflow-state:*]` blocks and preserved stale
-markers outside those blocks. Result: upgraded projects got new hook scripts
-but old workflow routing, so `get_context.py --mode phase --platform codex`
-could return empty Phase 2.1 detail.
-
----
-
-## Mode-Detection Probe Checklist
-
-When a CLI auto-detects a mode by probing a remote resource (e.g., checking if `index.json` exists to decide marketplace vs direct download):
-
-### Before implementing:
-
-- [ ] Probe runs in **ALL** code paths that use the result (interactive, `-y`, `--flag` combos)
-- [ ] 404 vs transient error are distinguished — don't treat both as "not found"
-- [ ] Transient errors **abort or retry**, never silently switch modes
-- [ ] Shared state (caches, prefetched data) is **reset** when context changes (e.g., user switches source)
-- [ ] **Shortcut paths** (e.g., `--template` skipping picker) must have the same error-handling quality as the probed path — check that downstream functions don't call catch-all wrappers
-
-### After implementing:
-
-- [ ] Trace every path from probe result to the mode-decision branch — no fallthrough
-- [ ] External format contracts (giget URI, raw URLs) are tested or at least documented as comments
-- [ ] Metadata reads consume a complete response or use a streaming parser — never parse a fixed-size prefix as full JSON
-- [ ] When reconstructing a composite identifier from parsed parts, verify **all** fields are included and in the **correct position** (e.g., `provider:repo/path#ref` not `provider:repo#ref/path`)
-- [ ] Verify that **action functions** called after a shortcut don't internally use the old catch-all fetch — they must use the probe-quality variant when error distinction matters
-
-**Real-world example**: Custom registry flow had 8 bugs across 3 review rounds: (1) probe only ran in interactive mode, (2) transient errors fell through to wrong mode, (3) giget URI had `#ref` in wrong position, (4) prefetched templates leaked across source switches, (5) `--template` shortcut bypassed probe but `downloadTemplateById` internally used catch-all `fetchTemplateIndex`, turning timeouts into "Template not found".
-
-**Real-world example**: Agent-session update hints fetched npm `latest` metadata with `response.read(4096)` and then parsed it as complete JSON. The `@mindfoldhq/trellis` package metadata exceeded 4 KB, so the JSON was truncated, parse failed silently, and the first session injection showed no update hint. Fix: read the complete response before parsing, and add a regression where `version` is followed by an 8 KB metadata tail.
-
----
-
-## Cross-Platform Template Consistency
-
-In Trellis, command templates (e.g., `record-session.md`) exist in **multiple platforms** with identical or near-identical content. This is a cross-layer boundary.
-
-### Checklist: After Modifying Any Command Template
-
-- [ ] Find all platforms with the same command: `find src/templates/*/commands/trellis/ -name "<command>.*"`
-- [ ] Update all platform copies (Markdown `.md` and TOML `.toml`)
-- [ ] For Gemini TOML: adapt line continuations (`\\` vs `\`) and triple-quoted strings
-- [ ] Run `/trellis:check-cross-layer` to verify nothing was missed
-
-**Real-world example**: Updated `record-session.md` in Claude to use `--mode record`, but forgot iFlow, Kilo, OpenCode, and Gemini — caught by cross-layer check.
-
----
-
-## Generated Runtime Template Upgrade Consistency
-
-Some generated files are both documentation and runtime input. In Trellis,
-`.trellis/workflow.md` is parsed by `get_context.py`, `workflow_phase.py`,
-SessionStart filters, and per-turn hooks. Template changes must be validated
-against both fresh init and upgrade paths.
-
-### Checklist: After Modifying A Runtime-Parsed Template
-
-- [ ] Identify every runtime parser that reads the template, not just the file
-  writer that installs it
-- [ ] Check whether relevant syntax lives outside obvious managed regions
-  such as tag blocks
-- [ ] Verify fresh `init` output and a versioned `update` scenario that writes
-  the older `.trellis/.version`
-- [ ] Add an upgrade regression using an older pristine template fixture, then
-  assert the installed file reaches the current packaged shape
-- [ ] Update the backend spec that owns the runtime contract
-
-**Real-world example**: Codex inline mode changed workflow platform markers from
-`[Codex]` / `[Kilo, Antigravity, Windsurf]` to `[codex-sub-agent]` /
-`[codex-inline, Kilo, Antigravity, Windsurf]`. Fresh init was correct, but
-`trellis update` only merged `[workflow-state:*]` blocks and preserved stale
-markers outside those blocks. Result: upgraded projects got new hook scripts
-but old workflow routing, so `get_context.py --mode phase --platform codex`
-could return empty Phase 2.1 detail.
-
----
-
-## Mode-Detection Probe Checklist
-
-When a CLI auto-detects a mode by probing a remote resource (e.g., checking if `index.json` exists to decide marketplace vs direct download):
-
-### Before implementing:
-- [ ] Probe runs in **ALL** code paths that use the result (interactive, `-y`, `--flag` combos)
-- [ ] 404 vs transient error are distinguished — don't treat both as "not found"
-- [ ] Transient errors **abort or retry**, never silently switch modes
-- [ ] Shared state (caches, prefetched data) is **reset** when context changes (e.g., user switches source)
-- [ ] **Shortcut paths** (e.g., `--template` skipping picker) must have the same error-handling quality as the probed path — check that downstream functions don't call catch-all wrappers
-
-### After implementing:
-- [ ] Trace every path from probe result to the mode-decision branch — no fallthrough
-- [ ] External format contracts (giget URI, raw URLs) are tested or at least documented as comments
-- [ ] Metadata reads consume a complete response or use a streaming parser — never parse a fixed-size prefix as full JSON
-- [ ] When reconstructing a composite identifier from parsed parts, verify **all** fields are included and in the **correct position** (e.g., `provider:repo/path#ref` not `provider:repo#ref/path`)
-- [ ] Verify that **action functions** called after a shortcut don't internally use the old catch-all fetch — they must use the probe-quality variant when error distinction matters
-
-**Real-world example**: Custom registry flow had 8 bugs across 3 review rounds: (1) probe only ran in interactive mode, (2) transient errors fell through to wrong mode, (3) giget URI had `#ref` in wrong position, (4) prefetched templates leaked across source switches, (5) `--template` shortcut bypassed probe but `downloadTemplateById` internally used catch-all `fetchTemplateIndex`, turning timeouts into "Template not found".
-
-**Real-world example**: Agent-session update hints fetched npm `latest` metadata with `response.read(4096)` and then parsed it as complete JSON. The `@mindfoldhq/trellis` package metadata exceeded 4 KB, so the JSON was truncated, parse failed silently, and the first session injection showed no update hint. Fix: read the complete response before parsing, and add a regression where `version` is followed by an 8 KB metadata tail.
-
----
-
-## When to Create Flow Documentation
-
-Create detailed flow docs when:
-
-- Feature spans 3+ layers
-- Multiple teams are involved
-- Data format is complex
-- Feature has caused bugs before
-
----
-
-## Event Log / Projection Boundary
-
-Append-only logs are cross-layer contracts. A single event travels through:
+这是本仓库最完整的一条跨层数据流，改动错误体系前必须整条看一遍：
 
 ```
-CLI input → event writer → events.jsonl → reader → filter → reducer → display
+internal/ierr/ierr.go:9-23          唯一事实源：ErrNotFound / ErrInvalidRange / ...
+      ↓ 库内直接返回
+internal/storage/…                  返回 ierr.ErrXxx
+      ↓ 服务端出口，只此一次转换
+internal/transport/protocol/protocol.go:113   MapStorageErr(err) → ErrCode
+      ↓ 线上只传 code，不传字符串
+      帧（OpResp / OpGetErr + EncCode）
+      ↓ 客户端入口，只此一次转换
+internal/transport/protocol/protocol.go:129   MapCode(code) → error
+      ↓ 转出给 SDK
+internal/rpcclient/reexport.go:31-42         re-export 成 rpcclient.ErrXxx
+      ↓
+pkg/taihu-client/reexport.go                 再转指一层
+      ↓
+外部调用方 errors.Is(err, taihuclient.ErrNotFound)
 ```
 
-### Checklist: After Adding A New Event Kind Or Field
+三条要点：
 
-- [ ] Add the event kind to the central event taxonomy
-- [ ] Add a typed event variant or type guard at the event layer
-- [ ] Add normalization helpers for array/object fields that come from
-      user input or JSON
-- [ ] Keep `seq` / `id` assignment in the event writer only
-- [ ] Make filters and reducers consume the typed event guard, not local casts
-- [ ] Make display code consume reducer output or typed events, not raw JSON
-- [ ] Add at least one regression that proves history replay and live filtering
-      use the same filter model
+- **服务端只调 `MapStorageErr`、客户端只调 `MapCode`**，不得反向。调用点实测：`MapStorageErr` 在 `internal/transport/server.go:226` 等 8 处与 `server_admin.go`、`server_shm_linux.go`；`MapCode` 只在 `internal/transport/client.go:106` 等 4 处与 `client_admin.go`、`client_shm_linux.go`。
+- **跨进程只传 code**，所以新增一个库错误时，只改 `ierr` 是不够的 —— 必须同时在 `protocol.go` 的映射里给出它的 code，否则它会退化成「未知错误」。
+- **`ierr.ErrConflict` 刻意不在链上**：它是 compaction 内部的 CAS 控制信号，`internal/rpcclient/reexport.go:30` 明确排除。加错误时要判断「这是客户端会收到的，还是内部信号」。
 
-**Real-world example**: Thread channels added `kind: "thread"`, `description`,
-`context`, labels, and `lastSeq`. The first implementation replayed thread
-state correctly, but several commands still re-parsed event payload fields with
-local casts. The fix was to make the core event layer own `ThreadChannelEvent`
-and `isThreadEvent`, make `reduceChannelMetadata` the only channel metadata
-projection, and make `reduceThreads` the only thread replay reducer.
+## 4. 一个枚举值的全链：在磁盘上有位置
+
+`SegmentState` 不只是一个 Go 常量 —— 它在磁盘上占一个字节：
+
+| # | 层 | 位置 |
+|---|---|---|
+| 1 | 类型定义 | `internal/metastore/meta.go:74` `type SegmentState uint8` |
+| 2 | 持久化 | `internal/metastore/meta.go:94` `b[0] = metaVersion`，`:106` `SegmentState(b[1])` 按**固定字节偏移**解出 |
+| 3 | 状态机 | `internal/metastore/segments.go:93-99`（`Compacting` → `Full` / `Reclaiming` 的重启自愈分支） |
+| 4 | 对外 | `internal/rpcclient/reexport.go:54` `type SegmentState = metastore.SegmentState`、`:58` 起的常量 |
+
+**所以「加一个段状态」不是加一行常量**：第 2 段决定它能不能被解出来，第 3 段决定它重启后自不自愈，第 4 段决定 SDK 用户能不能命名它。漏掉第 4 段时**编译不会报错**，只是包对外悄悄不可用 —— 这正是 `internal/rpcclient/api_test.go` 用外置测试包逐个命名这些类型的原因。
+
+## 5. 磁盘格式的版本字节：一个写了但没人读的契约
+
+真实缺陷，本轮只记录不改码。
+
+`internal/metastore/meta.go:14` 定义了 `metaVersion = byte(0)`，三处 encode 都把它写进去了（`:30` ObjectMeta、`:57` WriteCursor、`:94` SegmentMeta）。但解码侧**从不读它**：
+
+```go
+func decodeObjectMeta(b []byte) (ObjectMeta, error) {
+	if len(b) != objectMetaLen {
+		return ObjectMeta{}, fmt.Errorf("taihu: bad ObjectMeta length %d", len(b))
+	}
+	return ObjectMeta{
+		SegmentID: int64(binary.LittleEndian.Uint64(b[1:9])),   // b[0] 是版本位，直接跳过了
+		...
+```
+（`internal/metastore/meta.go:37-46`）
+
+`grep -n metaVersion internal/metastore/meta.go` 只有 4 行命中：1 处定义 + 3 处写入，解码路径**零使用**。
+
+**后果**：长度校验（`:38-41`）能在字段增删时拦住；但**同长度的字段重排或语义变更拦不住** —— 旧数据会被静默按新布局解读，读出错值还不报错。`meta_test.go` 的 round-trip 测试兜不住它：两侧用同一份代码、同一个版本，永远自洽。
+
+**为什么放进本指南**：这是「我以为两边都改了」这类判断失灵的实证。改任何磁盘格式或线上格式之前，**先去解码侧搜一遍**，不要相信写入侧改了就等于契约成立。
+
+## 6. 缓冲的所有权是跨层的
+
+`bufpool` 借出的缓冲要穿过多层才被归还，归还责任在调用方：
+
+- 契约写在包文档里 —— `internal/bufpool/bufpool.go:5-8`（`Get` 返回 4K 对齐、len 为 2 的幂；`Put` 按 cap 归一化回整桶）。
+- 存活期约束写在 `internal/aio/aio.go:20-21`：「buf 在 Submit 后、对应完成事件被 Wait 取回前必须保持存活且不被改写」。
+- 实测调用方分布：`internal/device/device.go` 12 处、`internal/transport/{frame,client,server}.go` 各 3 处、`internal/storage/` 2 处、`internal/rpcclient/storage_rpc.go` 1 处。
+
+**改动读路径时，跨层的不是函数调用而是所有权** —— 谁 Get 的、在哪一层归还、归还前有没有人还持有引用。详见 [buffer-and-concurrency.md](../engine/buffer-and-concurrency.md) 第一节。
+
+## 7. 平台分裂：同语义承诺是跨层的
+
+`_linux.go` / `_other.go` 不是「一份实现 + 一个桩」，而是**同一个契约的两份实现**。调用方（`cmd/`）因此不需要 build tag，只做一次运行期判断。
+
+规则与判据见 [file-splitting.md](../platform/file-splitting.md)。这里只提醒跨层的部分：**在 `_linux.go` 里加一个导出符号时，先问 `_other.go` 要不要同名的** —— 判断标准是「非 Linux 上有没有调用方」，不是「这个平台支不支持」。
+
+## 8. 改一层之前，先找契约的另一半
+
+一张查表：
+
+| 我改了 | 另一半在哪 |
+|---|---|
+| `internal/ierr` 的错误 | `internal/transport/protocol/protocol.go` 的 code 映射 + `internal/rpcclient/reexport.go` |
+| 导出签名里新增了 `internal/` 类型 | `internal/rpcclient/reexport.go` 补 alias（**漏了不报错**，见 `api_test.go` 的编译期兜底） |
+| 线上帧的布局 | `internal/transport/frame.go` 的读写两侧 + `internal/transport/protocol/protocol.go` 的常量 |
+| 磁盘格式 | 同文件的 encode **与** decode 两侧；先看 §5 |
+| 段状态机 | `internal/metastore/segments.go` 的重启自愈分支（§4 第 3 段） |
+| 平台专有实现 | 成对的 `_other.go`（§7） |
+| `bufpool` 的契约 | 所有 Get/Put 调用层的归还路径（§6） |
+
+---
+
+## 相关
+
+- 规则本体：[layering.md](../architecture/layering.md)（方向不变量）、[error-model.md](../architecture/error-model.md)（错误体系）、[wire-protocol.md](../transport/wire-protocol.md)（线上格式）
+- 重复与复用：`code-reuse-thinking-guide.md`
+- 平台分裂：[file-splitting.md](../platform/file-splitting.md)
