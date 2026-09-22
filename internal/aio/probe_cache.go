@@ -9,7 +9,7 @@ import "sync"
 // 那两个文件只留真正的平台差异。对外入口 Probe 在 aio.go，是一层薄转发。
 
 var (
-	probeMu   sync.Mutex
+	probeMu   sync.Mutex // 保护 probeInfo / probeDone
 	probeInfo Info
 	probeDone bool
 )

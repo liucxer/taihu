@@ -26,6 +26,8 @@ func probe() (Info, bool) {
 		info.Reason = describeUringErr(err)
 		return info, !transientErrno(err)
 	}
+	// 探测用的一次性 ring fd：Close 的 errno 无可挽回动作（此处已拿到结论、
+	// fd 也不再被引用），忽略以免覆盖下面真正要返回的探测结论。
 	defer func() { _ = unix.Close(fd) }()
 
 	if ok, why := uringSupportsRW(fd); !ok {

@@ -20,25 +20,18 @@
 //   - buf 在 Submit 后、对应完成事件被 Wait 取回前必须保持存活且不被改写；
 //   - Linux + O_DIRECT 时 buf 首地址、偏移、长度需 4K 对齐（由 bufpool/device 层保证）。
 //
-// 本文件集中该包的**全部对外 API**（类型、常量、错误与入口函数），且**只含导出名** ——
+// 本文件集中该包的**全部对外 API**（类型、常量与入口函数），且**只含导出名** ——
 // 未导出的常量、变量与辅助函数在 aio_internal.go，探测结论缓存在 probe_cache.go。
 // 后端实现按平台分文件：aio_linux.go（libaio）、aio_uring_linux.go（io_uring）、
 // aio_other.go（非 Linux 兜底）；探测的实现细节在 probe_linux.go / probe_other.go。
 package aio
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 )
-
-// ErrFull 表示提交队列已满（io_submit 返回 EAGAIN），应先 Wait 取回完成事件后重试。
-var ErrFull = errors.New("aio: submission queue full")
-
-// ErrTimeout 表示 Wait 在超时时间内未取够 min 个事件。
-var ErrTimeout = errors.New("aio: wait timeout")
 
 // ── 提交与完成的数据形状 ──────────────────────────────────────────────
 

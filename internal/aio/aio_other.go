@@ -9,12 +9,14 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/liucxer/taihu/internal/ierr"
 )
 
 // ring 非 Linux 平台（macOS 开发/自测）兜底实现：每个提交起一个 goroutine
 // 执行同步 pread/pwrite，完成后唤醒 Wait。接口语义与 Linux 版一致。
 type ring struct {
-	mu       sync.Mutex
+	mu       sync.Mutex // 保护 seq / inflight / closed
 	seq      uint64
 	inflight map[uint64]*op
 	wake     chan struct{}
@@ -169,13 +171,13 @@ func (r *ring) Wait(min, max int, timeout *time.Duration) ([]Event, error) {
 			return events, nil
 		}
 		if !deadline.IsZero() && time.Now().After(deadline) {
-			return events, ErrTimeout
+			return events, ierr.ErrTimeout
 		}
 		var waitCh <-chan time.Time
 		if !deadline.IsZero() {
 			d := time.Until(deadline)
 			if d <= 0 {
-				return events, ErrTimeout
+				return events, ierr.ErrTimeout
 			}
 			waitCh = time.After(d)
 		}

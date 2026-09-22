@@ -6,6 +6,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/liucxer/taihu/internal/ierr"
 )
 
 // 事件与 iocb 布局必须与 linux/aio_abi.h 一致（64 位平台）。
@@ -121,7 +123,7 @@ func (r *ring) submit(fd int, buf []byte, off int64, op uint16) (uint64, error) 
 	r.mu.Unlock()
 	if errno != 0 {
 		if errno == unix.EAGAIN {
-			return 0, ErrFull
+			return 0, ierr.ErrFull
 		}
 		return 0, errno
 	}
@@ -159,7 +161,7 @@ func (r *ring) submitBatch(fd int, specs []batchSpec, op uint16) (uint64, int, e
 	if errno != 0 {
 		r.mu.Unlock()
 		if errno == unix.EAGAIN {
-			return 0, 0, ErrFull
+			return 0, 0, ierr.ErrFull
 		}
 		return 0, 0, errno
 	}
@@ -217,7 +219,7 @@ func (r *ring) Wait(min, max int, timeout *time.Duration) ([]Event, error) {
 		out = append(out, Event{Data: evs[i].Data, Res: evs[i].Res})
 	}
 	if int(got) < min && timeout != nil {
-		return out, ErrTimeout
+		return out, ierr.ErrTimeout
 	}
 	return out, nil
 }

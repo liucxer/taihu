@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/liucxer/taihu/internal/ierr"
 )
 
 const testChunk = 4096
@@ -231,7 +233,7 @@ func assertWaitTimeoutExpires(t *testing.T, r Ring) {
 	evs, err := r.Wait(1, 4, &d)
 	elapsed := time.Since(start)
 
-	if err != ErrTimeout {
+	if err != ierr.ErrTimeout {
 		t.Fatalf("want ErrTimeout, got %v (evs=%v)", err, evs)
 	}
 	if len(evs) != 0 {

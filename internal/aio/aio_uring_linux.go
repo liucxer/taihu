@@ -13,6 +13,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/liucxer/taihu/internal/ierr"
 )
 
 // checkIOPoll 校验目标块设备是否开启了队列级轮询 —— IOPOLL 的前置条件。
@@ -212,6 +214,8 @@ func newIOUringRing(maxEvents int, iopoll bool) (Ring, error) {
 
 	r, err := mapUringRing(fd, p, maxEvents, iopoll)
 	if err != nil {
+		// 建 ring 已判定失败，Close 的 errno 无可挽回动作；忽略它以免覆盖
+		// mapUringRing 返回的真正原因（那才是调用方需要的诊断）。
 		_ = unix.Close(fd)
 		return nil, err
 	}
@@ -260,6 +264,8 @@ func mapUringRing(fd int, p ioUringParams, maxEvents int, iopoll bool) (*uringRi
 		}
 		cq, err := unix.Mmap(fd, int64(ioringOffCQRing), int(cqRingSz), prot, mflags)
 		if err != nil {
+			// Munmap 的 errno 无可挽回动作（映射会随 ring fd 关闭回收），忽略以免
+			// 覆盖真正要返回的 mmap 错误。unmapUringRing 中的三处同理。
 			_ = unix.Munmap(sq)
 			return nil, err
 		}
@@ -298,6 +304,7 @@ func mapUringRing(fd int, p ioUringParams, maxEvents int, iopoll bool) (*uringRi
 }
 
 // unmapUringRing 解除映射（SINGLE_MMAP 下 SQ/CQ 是同一块，只能解一次）。
+// 三处 Munmap 的 errno 同 mapUringRing：无可挽回动作，忽略以免掩盖调用方的错误。
 func unmapUringRing(r *uringRing) {
 	if r.sqRing != nil {
 		_ = unix.Munmap(r.sqRing)
@@ -326,19 +333,19 @@ type uringRingField struct {
 // 掩码本身为 7 需要用该偏移读出来（见 verifyUringRing）。把偏移当值来比是错的。
 func uringRingFields(p *ioUringParams) []uringRingField {
 	return []uringRingField{
-		{"sq_off.head", true, p.SQOff.Head, 4},
-		{"sq_off.tail", true, p.SQOff.Tail, 4},
-		{"sq_off.ring_mask", true, p.SQOff.RingMask, 4},
-		{"sq_off.ring_entries", true, p.SQOff.RingEntries, 4},
-		{"sq_off.flags", true, p.SQOff.Flags, 4},
-		{"sq_off.dropped", true, p.SQOff.Dropped, 4},
-		{"sq_off.array", true, p.SQOff.Array, 4},
-		{"cq_off.head", false, p.CQOff.Head, 4},
-		{"cq_off.tail", false, p.CQOff.Tail, 4},
-		{"cq_off.ring_mask", false, p.CQOff.RingMask, 4},
-		{"cq_off.ring_entries", false, p.CQOff.RingEntries, 4},
-		{"cq_off.overflow", false, p.CQOff.Overflow, 4},
-		{"cq_off.cqes", false, p.CQOff.CQEs, 4},
+		{name: "sq_off.head", sq: true, off: p.SQOff.Head, width: 4},
+		{name: "sq_off.tail", sq: true, off: p.SQOff.Tail, width: 4},
+		{name: "sq_off.ring_mask", sq: true, off: p.SQOff.RingMask, width: 4},
+		{name: "sq_off.ring_entries", sq: true, off: p.SQOff.RingEntries, width: 4},
+		{name: "sq_off.flags", sq: true, off: p.SQOff.Flags, width: 4},
+		{name: "sq_off.dropped", sq: true, off: p.SQOff.Dropped, width: 4},
+		{name: "sq_off.array", sq: true, off: p.SQOff.Array, width: 4},
+		{name: "cq_off.head", sq: false, off: p.CQOff.Head, width: 4},
+		{name: "cq_off.tail", sq: false, off: p.CQOff.Tail, width: 4},
+		{name: "cq_off.ring_mask", sq: false, off: p.CQOff.RingMask, width: 4},
+		{name: "cq_off.ring_entries", sq: false, off: p.CQOff.RingEntries, width: 4},
+		{name: "cq_off.overflow", sq: false, off: p.CQOff.Overflow, width: 4},
+		{name: "cq_off.cqes", sq: false, off: p.CQOff.CQEs, width: 4},
 	}
 }
 
@@ -382,10 +389,10 @@ func verifyUringRing(r *uringRing, p *ioUringParams) error {
 		got  uint32
 		want uint32
 	}{
-		{"sq_off.ring_mask", u32At(r.sqRing, p.SQOff.RingMask), p.SQEntries - 1},
-		{"sq_off.ring_entries", u32At(r.sqRing, p.SQOff.RingEntries), p.SQEntries},
-		{"cq_off.ring_mask", u32At(r.cqRing, p.CQOff.RingMask), p.CQEntries - 1},
-		{"cq_off.ring_entries", u32At(r.cqRing, p.CQOff.RingEntries), p.CQEntries},
+		{name: "sq_off.ring_mask", got: u32At(r.sqRing, p.SQOff.RingMask), want: p.SQEntries - 1},
+		{name: "sq_off.ring_entries", got: u32At(r.sqRing, p.SQOff.RingEntries), want: p.SQEntries},
+		{name: "cq_off.ring_mask", got: u32At(r.cqRing, p.CQOff.RingMask), want: p.CQEntries - 1},
+		{name: "cq_off.ring_entries", got: u32At(r.cqRing, p.CQOff.RingEntries), want: p.CQEntries},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -445,7 +452,7 @@ func (r *uringRing) SubmitRead(fd int, buf []byte, off int64) (uint64, error) {
 		return 0, err
 	}
 	if n == 0 {
-		return 0, ErrFull
+		return 0, ierr.ErrFull
 	}
 	return seq, nil
 }
@@ -462,7 +469,7 @@ func (r *uringRing) SubmitWrite(fd int, buf []byte, off int64) (uint64, error) {
 		return 0, err
 	}
 	if n == 0 {
-		return 0, ErrFull
+		return 0, ierr.ErrFull
 	}
 	return seq, nil
 }
@@ -499,7 +506,7 @@ func (r *uringRing) submit(fd int, specs []ReadSpec, op uint8) (uint64, int, err
 		free = lim
 	}
 	if free <= 0 {
-		return 0, 0, ErrFull
+		return 0, 0, ierr.ErrFull
 	}
 	if n > free {
 		n = free
@@ -535,7 +542,7 @@ func (r *uringRing) submit(fd int, specs []ReadSpec, op uint8) (uint64, int, err
 	case errno == unix.EAGAIN || errno == unix.EBUSY || errno == unix.ENOMEM:
 		// 一条都未被消费（EBUSY = CQ 溢出链表未能 flush；EAGAIN = 请求槽位不足）。
 		r.rewind(tail0)
-		return 0, 0, ErrFull
+		return 0, 0, ierr.ErrFull
 	default:
 		// EINTR 等：SQE 可能已被内核取走，绝不能重试；以内核推进的 sq_head 为准。
 		consumed = r.consumedSince(tail0)
@@ -638,7 +645,7 @@ func (r *uringRing) Wait(min, max int, timeout *time.Duration) ([]Event, error) 
 		out = r.reap(out, max)
 	}
 	if len(out) < min {
-		return out, ErrTimeout // 与 libaio 一致：返回已取到的部分事件 + ErrTimeout
+		return out, ierr.ErrTimeout // 与 libaio 一致：返回已取到的部分事件 + ErrTimeout
 	}
 	return out, nil
 }

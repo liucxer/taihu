@@ -12,6 +12,7 @@ import (
 
 	"github.com/liucxer/taihu/internal/aio"
 	"github.com/liucxer/taihu/internal/bufpool"
+	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/layout"
 )
 
@@ -92,7 +93,7 @@ func (f *fakeRing) Wait(min, max int, timeout *time.Duration) ([]aio.Event, erro
 	if len(f.comps) == 0 {
 		f.mu.Unlock()
 		time.Sleep(time.Millisecond)
-		return nil, aio.ErrTimeout
+		return nil, ierr.ErrTimeout
 	}
 	n := len(f.comps)
 	if n > max {

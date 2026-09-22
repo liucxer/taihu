@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/liucxer/taihu/internal/ierr"
 )
 
 // TestUringSetupRawInvalidEntries io_uring_setup 的参数被内核拒绝时返回 errno。
@@ -84,10 +86,10 @@ func TestUringDepthLimit(t *testing.T) {
 		t.Errorf("截断后首序号 %d want %d（序号不得重叠）", first2, first+3)
 	}
 	// 在途已达 depth → ErrFull（单条提交同样受限）
-	if _, _, err := r.SubmitReadBatch(fd, specs[:1]); err != ErrFull {
+	if _, _, err := r.SubmitReadBatch(fd, specs[:1]); err != ierr.ErrFull {
 		t.Errorf("SubmitReadBatch 在途满 err=%v want ErrFull", err)
 	}
-	if _, err := r.SubmitRead(fd, make([]byte, testChunk), 0); err != ErrFull {
+	if _, err := r.SubmitRead(fd, make([]byte, testChunk), 0); err != ierr.ErrFull {
 		t.Errorf("SubmitRead 在途满 err=%v want ErrFull", err)
 	}
 
@@ -229,7 +231,7 @@ func TestUringWaitNoIO(t *testing.T) {
 	d := 20 * time.Millisecond
 	start := time.Now()
 	evs, err := fake.Wait(1, 4, &d)
-	if err != ErrTimeout {
+	if err != ierr.ErrTimeout {
 		t.Fatalf("Wait 超时 err=%v want ErrTimeout", err)
 	}
 	if len(evs) != 0 {

@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/liucxer/taihu/internal/ierr"
 )
 
 // TestLibAIOBatchRoundTrip 批量读写往返：一次 io_submit 排入多条，校验序号连续、
@@ -161,7 +163,7 @@ func TestLibAIOWaitBounds(t *testing.T) {
 	}
 	d := 20 * time.Millisecond
 	evs, err := l.Wait(1, 200, &d)
-	if err != ErrTimeout {
+	if err != ierr.ErrTimeout {
 		t.Fatalf("Wait 超时 err=%v want ErrTimeout", err)
 	}
 	if len(evs) != 0 {

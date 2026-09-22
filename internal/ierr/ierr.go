@@ -1,5 +1,5 @@
 // Package ierr 定义 taihu 存储的公共错误 —— **唯一事实源**。
-// 内部各层（device/metastore/storage/transport/protocol）直接使用本包错误；
+// 内部各层（aio/device/metastore/storage/transport/protocol）直接使用本包错误；
 // 面向客户端的 re-export 只有一处：internal/rpcclient/reexport.go（pkg/taihu-client/reexport.go
 // 再转指一层）。internal/ 下的包不得自建错误别名层。
 package ierr
@@ -20,4 +20,8 @@ var (
 	// ErrConflict 表示条件写（CAS）失败：当前映射与期望不符（并发 Put/Delete 竞态），
 	// 调用方应跳过本次操作并重试。compaction 搬移使用。
 	ErrConflict = errors.New("taihu: mapping conflict")
+	// ErrFull 表示提交队列已满（io_submit 返回 EAGAIN），应先 Wait 取回完成事件后重试。
+	ErrFull = errors.New("taihu: submission queue full")
+	// ErrTimeout 表示 Wait 在超时时间内未取够 min 个事件。
+	ErrTimeout = errors.New("taihu: wait timeout")
 )
