@@ -280,6 +280,52 @@ func TestAlign4k(t *testing.T) {
 
 **不需要写注释标出三段**，靠空行分段即可。**规则**：不要在断言之间夹杂新的 Act —— 若一个用例需要"调用 → 断言 → 再调用 → 再断言"，说明它在测多个行为，拆成两个 `t.Run`。这条与规则 8（表测试保持单层）是同一诉求的两个侧面。
 
+## 规则 12：按包统计覆盖率，目标 ≥80%，越高越好
+
+上游 `ecc-032`（最低测试覆盖率 80%）与 `ecc-018`（用 `go test -cover ./...` 统计）。
+
+**判据是「按包」，不是全仓总百分比。** 一个 48.2% 的包摊进 16 个能测出数字的包里，总均值仍有 90.4% —— 异常会被大包直接抹平。只有按包统计，例外才会显形。
+
+实测（2026-09-22，口径见下）：
+
+| 包 | 覆盖率 | | 包 | 覆盖率 |
+|---|---|---|---|---|
+| `internal/aio` | **48.2%** ← 唯一低于 80% | | `internal/cluster` | 92.1% |
+| `cmd/taihu/cmd` | 82.7% ⚠️ | | `internal/metastore` | 94.1% |
+| `cmd/taihu` | 85.7% | | `internal/rpcclient` | 97.2% |
+| `internal/device` | 85.9% | | `pkg/taihu-client` | 97.6% |
+| `internal/bufpool` | 88.4% | | `internal/benchkit` | 100.0% |
+| `internal/transport` | 90.7% | | `internal/layout` | 100.0% |
+| `internal/storage` | 91.4% | | `internal/transport/protocol` | 100.0% |
+| `examples/taihu-client` | 91.7% | | `internal/version` | 100.0% |
+| `internal/ierr` | `[no statements]` | | | |
+
+统计集里 **17 个包**：16 个有覆盖率数字，算术平均 **90.4%**；`internal/ierr` 报 `[no statements]`（该包只有 sentinel 定义与 `errors.Is` 转发，没有可计数的语句），**本条不适用于它**，不要为了让它「有数字」去加测试。
+
+**规则**：新增或改动一个包时，它的覆盖率不得低于 80%；已在 80% 以上的，只许升不许降。**越高越好** —— 80% 是下限不是目标值，上表 15 个包已在此之上，不要拿它当「够了」的挡箭牌。
+
+⚠️ **`cmd/taihu/cmd` 那 82.7% 是在 2 个测试失败的情况下报出来的** —— `TestBenchStorageCmdErrorPaths` 与 `TestBenchSingleCmdShmRoundTrip` 在 macOS 上已知失败（shm 仅 Linux / 非块设备回退路径），**非改动引入**，覆盖率数字照常计入。这不是新发现，仓库早有记录：成因与完整失败清单见 `.trellis/spec/platform/build-verification.md:103-108`，这两个测试的断言行号见 `.trellis/spec/cli/index.md:144-149`。**不要为了「让本机全绿」去改它们。**
+
+统计口径固定为：
+
+```bash
+go test -cover $(go list ./... | grep -v third_party | grep -v test/e2e)
+```
+
+两个排除项都是必须的，不是图省事：`third_party/` 是 fork 的上游代码，它的测试套件在本机 panic —— `third_party/shmipc-go` 的 `Test_EventDispatcher` 以空指针解引用告终，运行时把位置报在 `event_dispatcher_test.go:126`（`clientConn := d.newConnection(fd)` 那一行）；`test/e2e/` 要真集群（不设 `E2E_PD` 时全部 Skip，见 [index.md](./index.md)）。**这两个包的覆盖率不适用本条规则。**
+
+**这条命令在 macOS 上退出码是 1，这是预期的**，原因就是本条开头 ⚠️ 里那 2 个平台性失败。`go test` 仍会逐包打印结果（`ok` / `FAIL` 行带 `coverage:`），**读输出里的数字，不要只看退出码**。还有个解析陷阱：`cmd/taihu/cmd` 的 `coverage:` 行**不附在** `FAIL\t<pkg>` 那一行末尾，而是被测试二进制的裸 `FAIL` 隔开、单独占一行 —— 按「`ok`/`FAIL` 行」抓取的工具会整个漏掉这个包（本表的第一次统计就是这么漏的）。判定改动是否破坏测试以 Linux 为准，口径见 `.trellis/spec/platform/build-verification.md:108`。
+
+### ⚠️ 已知例外：`internal/aio` 本机测不出真实覆盖率
+
+`internal/aio` 测得 48.2%，但**这个数字不能读成「测试写得少」** —— 它的分母只有 137 条语句，而该包非测试代码有 **1529 行，其中 1017 行（66%）是 Linux 专属**（`aio_linux.go` / `aio_uring_linux.go` / `probe_linux.go`）。三件事叠加，导致本机根本量不到这个包：
+
+1. **Linux 专属文件在 macOS 上不编译，也就不进统计** —— 占该包 66% 的实现连分母都没进。
+2. **平台测试带 `_linux_test` 后缀，本机不运行** —— `probe_linux_test.go:1` 就是 `//go:build linux`；后端的 `t.Skipf` 机制见规则 5、规则 6 与 `aio_backends_linux_test.go:9-13` 的说明。
+3. **`make check-linux` 只做 `go test -c`**（`Makefile:69`：`go test -c -o /dev/null ./...`），编译测试二进制而**不执行** —— 所以 Linux 侧的真实覆盖率**在本机没有任何一条命令能测出来**。
+
+因此 `aio` 的这个数是**测不到**，不是**不达标**。要拿它的真实覆盖率，得在 Linux 机器上跑 `go test -cover ./internal/aio` 再把结果回填到上表。**在那之前，不要把 48.2% 当成待补的缺口去追。**
+
 ---
 
 ## 刻意偏离上游规则

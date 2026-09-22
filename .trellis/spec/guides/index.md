@@ -13,7 +13,7 @@
 | [code-reuse-thinking-guide.md](./code-reuse-thinking-guide.md) | 动手写新东西前的搜索纪律：本仓库的单一事实源清单、一次真实漏改（`64eaec3`）、什么时候**不**该抽象 |
 | [cross-layer-thinking-guide.md](./cross-layer-thinking-guide.md) | 一次改动要穿过几层：flag 的 5 段链、error 跨进程的 5 层、枚举值的磁盘位置、以及一张「改了 A，另一半在 B」查表 |
 | 本文 §三 | **溯源表** —— 上游编号 → spec 文件:节 的反向索引；外加「已符合、本轮未新增规则」的 78 条 |
-| 本文 §四 | **不适用附录** —— 62 条不适用 / 10 条冲突裁决 / 2 条已登记缺口，一行一条说明为什么 |
+| 本文 §四 | **不适用附录** —— 60 条不适用 / 10 条冲突裁决 / 2 条已登记缺口，一行一条说明为什么 |
 
 ---
 
@@ -62,7 +62,9 @@
 - `ecc-` —— Everything Claude Code 的 go 规则，79 条
 - `gbp-` —— cexll/golang-base-practices-skills，53 条
 
-### 已并入（114 条）
+以上三份合计 266 条。**另有第四份来源**（2026-09-22 补入，不在那 266 条内），见下表末尾。
+
+### 已并入（116 条）
 
 下表的文件名是省略目录的简写：go-style.md 即 [go-style.md](../architecture/go-style.md)，unit-tests.md 即 [unit-tests.md](../testing/unit-tests.md)，buffer-and-concurrency.md 即 [buffer-and-concurrency.md](../engine/buffer-and-concurrency.md)，其余同理（各层入口见本文件顶部的索引）。
 
@@ -170,7 +172,7 @@
 | `uber-124` | unit-tests.md 规则 8 |
 | `uber-128` | go-style.md 规则 23 |
 | `uber-129` | go-style.md 规则 23 |
-#### `ecc-` （11 条）
+#### `ecc-` （13 条）
 
 | 上游编号 | 落点（spec 文件 :: 节） |
 |---|---|
@@ -184,6 +186,8 @@
 | `ecc-030` | code-style.md 第 17 条 |
 | `ecc-031` | index.md 收尾前的自检单 |
 | `ecc-036` | unit-tests.md 规则 11 |
+| `ecc-018` | unit-tests.md 规则 12 |
+| `ecc-032` | unit-tests.md 规则 12 |
 | `ecc-038` | code-style.md 第 3 条 |
 #### `gbp-` （3 条）
 
@@ -192,6 +196,18 @@
 | `gbp-019` | code-style.md 第 14 条 |
 | `gbp-037` | code-style.md 第 20 条 |
 | `gbp-038` | api-surface.md 规则 8 |
+
+#### 第四份来源：`project-layout`（2026-09-22 新增）
+
+[golang-standards/project-layout](https://github.com/golang-standards/project-layout)。**它不在上面那 266 条里** —— 是后续补的一条工程结构规则引入的来源，编号前缀不适用（原文没有编号体系），按下表逐节对应。
+
+| 上游内容 | 落点（spec 文件 :: 节） |
+|---|---|
+| 顶层目录清单与各自定义 | repo-layout.md 规则 1 |
+| 「目录名与可执行文件名一致」「`/src` 不该有」等判据 | repo-layout.md 规则 1 |
+| 新增目录时怎么选 | repo-layout.md 规则 2 |
+
+⚠️ 引用它时必须连带说明**它自称非官方标准**（原文："NOT an official standard defined by the core Go dev team"）—— 本仓库采用它的理由是命名共识广，不是它权威。
 
 ### 已符合、本轮未新增规则（78 条）
 
@@ -306,9 +322,9 @@
 
 | 去向 | 条数 | 在哪 |
 |---|---|---|
-| 已并入 spec | 114 | §三 溯源表 |
+| 已并入 spec | 116 | §三 溯源表 |
 | 已符合，本轮未因此新增规则 | 78 | §三 的上一小节 |
-| 不适用 | 62 | §4.1 – §4.3 |
+| 不适用 | 60 | §4.1 – §4.3 |
 | 判为冲突，维持 taihu 现状 | 10 | §4.4 |
 | 未采纳，但已登记为已知缺口 | 2 | §4.5 |
 
@@ -327,7 +343,7 @@
 | `uber-126` | 并行测试 / 特殊循环必须显式在循环作用域内复制循环变量 | 前提在本项目不成立：全仓 `t.Parallel()` 零命中；且 `go.mod` 声明 `go 1.25.0`，循环变量自 Go 1.22 起已按迭代独立，该规则要防的捕获问题在语言层已消除 |
 | `uber-127` | 用了 `t.Parallel()` 时必须声明作用域限定在本次迭代的 `tt` | 同 `uber-126`：触发条件（`t.Parallel()`）在本仓库不存在 |
 
-### 4.2 `ecc-` —— 36 条
+### 4.2 `ecc-` —— 34 条
 
 #### 指向 ECC 自带制品（本仓库未安装）
 
@@ -345,8 +361,7 @@
 |---|---|---|
 | `ecc-008` | PostToolUse hook：对改动的包跑 `staticcheck` | 本仓库未使用 `staticcheck`（无配置文件、无 CI；[Makefile](../../../Makefile) 的 `check` 只跑 gofmt / 两条分层 grep / `go vet`）。代码里既无正例也无反例 |
 | `ecc-014` | 用 `gosec ./...` 做静态安全扫描 | 工具未使用，无锚点；同 `ecc-008` 的「不引入新工具」约束 |
-| `ecc-018` | 覆盖率用 `go test -cover ./...` | `Makefile` 的 `.PHONY` 无 `test` / `cover` 目标，仓库不按百分比管理覆盖率。无正例也无反例 |
-| `ecc-032` | 最低测试覆盖率 80% | 无覆盖率工具链、无门禁（同 `ecc-018`）。本仓库的验收口径是「`go test ./...` + `make check` + `make check-linux`」（见 [testing/index.md](../testing/index.md) 的 Quality Check），三条命令里没有任何覆盖率参数 |
+（`ecc-018` / `ecc-032` 原列在此处判为不适用，2026-09-22 改判并并入 [unit-tests.md](../testing/unit-tests.md) 规则 12 —— 见 §三 溯源表。）
 
 #### 无 CI、无分支模型的流程条目
 
@@ -378,7 +393,7 @@
 | `ecc-047` | 安全事件响应协议：STOP → security-reviewer agent → 先修 CRITICAL → 轮换密钥 → 全库排查 | 依赖 ECC 的 `security-reviewer` agent 与「已泄露密钥」这一前提；本仓库两者都没有 |
 | `ecc-052` | 严重度分级：CRITICAL 阻断 / HIGH 警告 / MEDIUM 提示 / LOW 可选 | 本仓库没有代码缺陷严重度分级体系。**注意不要混淆**：`.trellis/tasks/archive/2026-09/09-21-spec-upstream-alignment/research/conflicts.md` 里的「A 类 / B 类 / C 类」是**冲突条目的影响面**分级，不是代码评审的缺陷严重度 |
 | `ecc-053` | 通过标准：无 CRITICAL 且无 HIGH 才 approve | 依赖 `ecc-052` 的分级体系，本仓库无 |
-| `ecc-065` | 走 TDD：用 `tdd-guide` agent，RED→GREEN→IMPROVE，验证 80%+ 覆盖 | 依赖 `tdd-guide` subagent 与 80% 覆盖率门槛（后者见 `ecc-032`）。TDD 的**次序**本身已单独裁决并采纳，见 [unit-tests.md](../testing/unit-tests.md) |
+| `ecc-065` | 走 TDD：用 `tdd-guide` agent，RED→GREEN→IMPROVE，验证 80%+ 覆盖 | 依赖 ECC 的 `tdd-guide` subagent，本仓库无此 agent —— **不适用的只剩「交给哪个 agent」这一半**。另外两半都已各自裁决并采纳：TDD 的次序见 [unit-tests.md](../testing/unit-tests.md) 规则 10，80% 覆盖率门槛见同文件规则 12 |
 
 #### agent / harness 编排约定：与本仓库的 Trellis 工作流不是一套
 
@@ -468,9 +483,9 @@
 
 该表同时写明：若将来引入，`errcheck` 应当**最先** —— 它能把 [code-style.md](../architecture/code-style.md) 规则 14 的 96 处 `_ =` 从「靠人守」变成「门禁挡」。
 
-### 4.6 62 条为什么「整块」不适用
+### 4.6 60 条为什么「整块」不适用
 
-按条数看，62 条不是零散的意见不合，而是三块**与本仓库形态无关的领域**：
+按条数看，60 条不是零散的意见不合，而是三块**与本仓库形态无关的领域**：
 
 | 块 | 条数 | 共同前提在本仓库不成立的原因 |
 |---|---|---|

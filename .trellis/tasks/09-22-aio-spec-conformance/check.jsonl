@@ -1,0 +1,9 @@
+{"file": ".trellis/tasks/09-22-aio-spec-conformance/prd.md", "reason": "R1-R13 与 18 条 Acceptance Criteria 的唯一来源；每个 checkbox 都要能指回可复现的命令或 -v 输出"}
+{"file": ".trellis/tasks/09-22-aio-spec-conformance/design.md", "reason": "D1/D2/D3 三条决策的判据；检查 R7 与 R11 的 spec 改写是否偏离决策，以及第 4 大步的覆盖率数字是否被原样抄入 R4"}
+{"file": ".trellis/tasks/09-22-aio-spec-conformance/implement.md", "reason": "第 6 大步的九项 spec 修正清单与 Review Gates；G4 要求核对覆盖率数字、G5 要求逐条复现验收项"}
+{"file": ".trellis/spec/testing/unit-tests.md", "reason": "被改写的规范本身；检查 R4 是否删净「测不到，不是不达标」这类过宽表述、R10 的每处计数是否附了可复现命令"}
+{"file": ".trellis/spec/architecture/code-style.md", "reason": "R5/R6 的落点；检查长函数例外是否都写了可检验理由、_ = 的编译期断言与 error 丢弃是否已分开计数"}
+{"file": ".trellis/spec/architecture/index.md", "reason": "汇总了两处会失效的硬编码：:95 与 :99 的「96 处 _ =」、:77 对规则 14 的转指。R6 改口径后此处必须同步，是最易漏的一致性点"}
+{"file": ".trellis/spec/engine/buffer-and-concurrency.md", "reason": "R7 的新类别必须写明「可预测结束时间 + join 点是公开 API Wait()」，而不是写成「允许不等待」的万能豁免"}
+{"file": ".trellis/spec/platform/file-splitting.md", "reason": "R9 与 R1；检查新门控（哪些测试移出、mode_test.go 为何仍需 tag）与规则的判据一致，且 file:line 锚点可复现"}
+{"file": ".trellis/spec/guides/index.md", "reason": ":49 记着「_ = 严格行首计数是 96」这条历史教训；R6 若改口径，此处的数字与教训条目需一起过一遍，避免两处数字打架"}

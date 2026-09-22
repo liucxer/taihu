@@ -15,7 +15,7 @@
 | 文件 | 用途 |
 |---|---|
 | `index.md` | 本文件：测试分级的边界、两条命令口径、开发前检查与质量校验 |
-| `unit-tests.md` | 同目录同包的约定、断言与表驱动形态、无 tag 契约测试模式、平台 build tag 清单、测试辅助函数命名 |
+| `unit-tests.md` | 同目录同包的约定、断言与表驱动形态、无 tag 契约测试模式、平台 build tag 清单、测试辅助函数命名、**按包统计的覆盖率下限 ≥80% 与 `internal/aio` 例外** |
 | `e2e-tests.md` | `test/e2e/` 的分组宪章、环境变量与门控、租户隔离、禁用 `-race` 的理由、测试名约定、长稳运行方式 |
 
 （两份分文件而非合并：单测的读者是改 `internal/`/`pkg/` 的开发者，e2e 的读者是要上真机的人，两边的「读前必知」完全不相交。）
@@ -37,6 +37,10 @@
 ```bash
 # 单测：全仓。e2e 目录只有 doc.go 不带 tag，其余文件被 //go:build e2e 挡住，不会被误跑
 go test ./...
+
+# 覆盖率：按包统计，目标 ≥80%。两个排除项的理由与 internal/aio 的例外
+# 见 unit-tests.md 规则 12
+go test -cover $(go list ./... | grep -v third_party | grep -v test/e2e)
 
 # 格式 + 分层不变量 + go vet
 make check

@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/testing/unit-tests.md", "reason": "覆盖率规则 12 的落点；须放在规则 1-11 之后、刻意偏离小节之前，风格对齐既有规则"}
+{"file": ".trellis/spec/testing/index.md", "reason": "测试层入口；Quality Check 小节列的是现有验收命令，新规则不得与之矛盾"}
+{"file": ".trellis/spec/architecture/index.md", "reason": "新文件 repo-layout.md 须登记进「本层文件」表"}
+{"file": ".trellis/spec/architecture/layering.md", "reason": "同层邻居：讲依赖方向，新文件的规则不得与之重复（归位原则：一个主题一个家）"}
+{"file": ".trellis/spec/guides/index.md", "reason": "溯源表与不适用附录的落点；ecc-032/ecc-018 须从「不适用」移出并改计数"}

@@ -1,0 +1,9 @@
+{"file": ".trellis/spec/testing/unit-tests.md", "reason": "R1/R3 是测试改动、R4/R10/R11 三条规范修正全落在这一份；规则 7（t.Cleanup）与规则 12（覆盖率）是本任务改写的对象，动手前须先读原文"}
+{"file": ".trellis/spec/testing/index.md", "reason": "测试层入口；:42 引用「规则 12」，R4 重写该节后此处须同步；layer 的验收命令不得与 R3/R12 的新增测试冲突"}
+{"file": ".trellis/spec/platform/file-splitting.md", "reason": "R1 把测试移出 //go:build linux 必须符合本文件的门控规则（_test 后缀排在 GOOS 之后、无 tag 文件的判据）；R9 修正的规则 7 也在本文件"}
+{"file": ".trellis/spec/platform/build-verification.md", "reason": "R8 要修正 :63 的锚点；make check-linux 是 R2/R12 改 .go 后的强制验证命令，其口径在本文件"}
+{"file": ".trellis/spec/engine/buffer-and-concurrency.md", "reason": "R7 的落点：§六 goroutine 全量分类；改类别前须先读 §六.1-6.5 的既有分类判据与抬头引的 uber-048/049 原文"}
+{"file": ".trellis/spec/architecture/code-style.md", "reason": "R5（规则 17 长函数例外）与 R6（规则 14 的 _ = 计数口径）的落点；R12 的五处重构必须符合本文件的规则 3/14/19"}
+{"file": ".trellis/spec/architecture/go-style.md", "reason": "R12 的代码改动（位置式字面量改具名、defer 收尾、mu 注释）的风格判据在规则 18 与命名/注释小节"}
+{"file": ".trellis/spec/architecture/api-surface.md", "reason": "R2 是 aio 包对外契约的行为变更；:232 记着「maxEvents 上界」这条待裁定缺陷，修完须同步为已修"}
+{"file": ".trellis/spec/architecture/commits.md", "reason": "第 7 大步的提交格式；本任务含一条行为变更（R2），提交 body 必须单独写明，不能套用「行为不变」收尾"}
