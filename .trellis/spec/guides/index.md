@@ -38,7 +38,7 @@
 
 ## 二、核对结论时的五种假阳性
 
-本仓库的 spec 是靠「逐条核到 `file:line`」建立的（`.trellis/tasks/09-21-spec-upstream-alignment/design.md` §3.2 的准入条件）。下面五种是这个过程里**真出现过**的误判，不是假想的。
+本仓库的 spec 是靠「逐条核到 `file:line`」建立的（`.trellis/tasks/archive/2026-09/09-21-spec-upstream-alignment/design.md` §3.2 的准入条件）。下面五种是这个过程里**真出现过**的误判，不是假想的。
 
 | # | 形态 | 真实实例 | 判据 |
 |---|------|----------|------|
@@ -376,7 +376,7 @@
 | 上游编号 | 上游主张 | 为什么不适用 |
 |---|---|---|
 | `ecc-047` | 安全事件响应协议：STOP → security-reviewer agent → 先修 CRITICAL → 轮换密钥 → 全库排查 | 依赖 ECC 的 `security-reviewer` agent 与「已泄露密钥」这一前提；本仓库两者都没有 |
-| `ecc-052` | 严重度分级：CRITICAL 阻断 / HIGH 警告 / MEDIUM 提示 / LOW 可选 | 本仓库没有代码缺陷严重度分级体系。**注意不要混淆**：`.trellis/tasks/09-21-spec-upstream-alignment/research/conflicts.md` 里的「A 类 / B 类 / C 类」是**冲突条目的影响面**分级，不是代码评审的缺陷严重度 |
+| `ecc-052` | 严重度分级：CRITICAL 阻断 / HIGH 警告 / MEDIUM 提示 / LOW 可选 | 本仓库没有代码缺陷严重度分级体系。**注意不要混淆**：`.trellis/tasks/archive/2026-09/09-21-spec-upstream-alignment/research/conflicts.md` 里的「A 类 / B 类 / C 类」是**冲突条目的影响面**分级，不是代码评审的缺陷严重度 |
 | `ecc-053` | 通过标准：无 CRITICAL 且无 HIGH 才 approve | 依赖 `ecc-052` 的分级体系，本仓库无 |
 | `ecc-065` | 走 TDD：用 `tdd-guide` agent，RED→GREEN→IMPROVE，验证 80%+ 覆盖 | 依赖 `tdd-guide` subagent 与 80% 覆盖率门槛（后者见 `ecc-032`）。TDD 的**次序**本身已单独裁决并采纳，见 [unit-tests.md](../testing/unit-tests.md) |
 
@@ -442,7 +442,7 @@
 
 ### 4.4 判为冲突、逐条裁决的 10 条
 
-这 10 条与前述「不适用」不同：它们**各有可取之处**，只是与本仓库已成形且有理有据的做法相撞。逐条裁决见 `.trellis/tasks/09-21-spec-upstream-alignment/research/conflicts.md`，下表是结论。
+这 10 条与前述「不适用」不同：它们**各有可取之处**，只是与本仓库已成形且有理有据的做法相撞。逐条裁决见 `.trellis/tasks/archive/2026-09/09-21-spec-upstream-alignment/research/conflicts.md`，下表是结论。
 
 | 上游编号 | 上游主张 | 裁决 | 落地 |
 |---|---|---|---|
