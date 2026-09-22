@@ -4,10 +4,9 @@ import "sync"
 
 // 本文件是「平台无关的包内私有实现」：Probe 的结论缓存。
 //
-// 为什么单独成文件：按 .trellis/spec/architecture/api-surface.md 规则 4，未导出符号
-// 不进对外面文件（aio.go）；按规则 5(a)，平台无关的缓存逻辑也不进 probe_linux.go /
-// probe_other.go —— 那两个文件只留真正的平台差异。对外入口 Probe 在 aio.go，是一层
-// 薄转发。
+// 为什么单独成文件：未导出符号不进对外面文件（aio.go），否则 aio.go 就不再能当作
+// 本包的对外契约整篇读；平台无关的缓存逻辑也不进 probe_linux.go / probe_other.go ——
+// 那两个文件只留真正的平台差异。对外入口 Probe 在 aio.go，是一层薄转发。
 
 var (
 	probeMu   sync.Mutex

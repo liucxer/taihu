@@ -202,8 +202,8 @@ type Info struct {
 // 否则一次偶发失败会把进程永久钉死在 libaio 上。
 //
 // 平台差异收敛在 probe() 内：非 Linux 平台恒为不支持（见 probe_other.go）。
-// 缓存与转发逻辑在 probe_cache.go —— 那部分平台无关，不该进平台文件（见
-// .trellis/spec/architecture/api-surface.md 规则 5(a)）。
+// 缓存与转发逻辑在 probe_cache.go —— 那部分平台无关，不该进平台文件：平台文件只应
+// 放真正的平台差异，混入平台无关逻辑会让「两平台行为是否一致」无法靠 diff 判断。
 func Probe() Info {
 	return probeCached()
 }

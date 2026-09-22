@@ -7,9 +7,9 @@ import (
 
 // 本文件是「平台无关的包内私有实现」：对外面文件 aio.go 之外的常量、变量与辅助函数。
 //
-// 判据见 .trellis/spec/architecture/api-surface.md 规则 4 —— aio.go 里只应有导出名，
-// 任何未导出的顶层声明都挪到这里（平台专有的那部分见 aio_linux.go / aio_other.go /
-// aio_uring_linux.go 与 probe_linux.go / probe_other.go）。
+// 判据：aio.go 里只应有导出名，任何未导出的顶层声明都挪到这里 —— 这样 aio.go 可以
+// 当作本包的对外契约整篇读，不必在实现细节里挑出可导出的部分（平台专有的那部分见
+// aio_linux.go / aio_other.go / aio_uring_linux.go 与 probe_linux.go / probe_other.go）。
 
 // envMode 环境变量兜底开关（仅在 ModeAuto 下生效，便于线上紧急回退；命令行优先）。
 const envMode = "TAIHU_AIO_URING"
