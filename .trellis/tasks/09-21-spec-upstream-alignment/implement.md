@@ -93,7 +93,7 @@ sed -n "<line>p" <file>   # 该行内容必须与规则陈述对得上
 
 ```bash
 make check && make check-linux   # 本轮不碰代码，结果应与改前完全一致
-python3 /tmp/verify_spec_refs.py # 引用检查（脚本见下）
+python3 .trellis/tasks/09-21-spec-upstream-alignment/research/verify_spec_refs.py  # 引用检查
 ```
 
 **回滚点**：每完成一个 spec 文件算一个回滚点；发现并入的规则与既有规则冲突时，回退该文件重做，不留半成品。
@@ -115,8 +115,9 @@ python3 /tmp/verify_spec_refs.py # 引用检查（脚本见下）
 
 ```bash
 # 1. 引用完整性（本轮唯一的机器判据）
-python3 /tmp/verify_spec_refs.py
+python3 .trellis/tasks/09-21-spec-upstream-alignment/research/verify_spec_refs.py
 #    期望：文件不存在 0 条；行号越界 0 条
+#    （脚本原在 /tmp，按 C-11 裁决随任务入库；/tmp 重启即失，别再用那个路径）
 
 # 2. 门禁回归 —— 本轮不碰代码，必须与改动前逐字一致
 make check
@@ -126,6 +127,14 @@ make check-linux
 git status --short
 git diff --stat -- '*.go'          # 期望：空
 ```
+
+> **实测结果（2026-09-22 收尾）**：本任务对 `.go` 零改动，但执行期间工作区里
+> **一直有 5 个与本任务无关的 `internal/aio/` 文件未提交**（`aio.go` / `probe_linux.go` /
+> `probe_other.go` 已改，`aio_internal.go` / `probe_cache.go` 未跟踪，mtime 2026-09-21
+> 17:37–17:39），所以上面这条在跑的时候并非空 —— 原因是既有的未提交重构，不是本任务。
+> 该重构已按人裁决收成独立提交 `6a3b21c`（`refactor(aio)`），它同时补上了 `876b75c`
+> 写的 `api-surface.md` 规则 4 所引用、却从未进过 git 的 `aio_internal.go`。
+> 提交后 `git status --porcelain -- '*.go'` 才真正为空。
 
 ### 人可验证
 
