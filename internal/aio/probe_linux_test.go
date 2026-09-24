@@ -84,13 +84,13 @@ func TestKernelRelease(t *testing.T) {
 
 // TestProbeCached 探测结论被缓存：重复调用返回同一份结果，且字段自洽。
 func TestProbeCached(t *testing.T) {
-	first := Probe()
-	second := Probe()
+	first := probeCached()
+	second := probeCached()
 	if first != second {
-		t.Errorf("Probe 应变缓存：\n%+v\n%+v", first, second)
+		t.Errorf("probeCached 应变缓存：\n%+v\n%+v", first, second)
 	}
 	if first.KernelRelease == "" {
-		t.Error("Probe 应带上内核版本字符串")
+		t.Error("probeCached 应带上内核版本字符串")
 	}
 	if first.Supported {
 		if first.SQEntries == 0 || first.CQEntries == 0 {
@@ -100,9 +100,9 @@ func TestProbeCached(t *testing.T) {
 			t.Errorf("支持时 Reason 应为 ok，得到 %q", first.Reason)
 		}
 		// 探测结论必须与真实建 ring 的结果一致（不能只看 errno 就下结论）。
-		r, err := NewWithOptions(4, Options{Mode: ModeIOUring})
+		r, err := NewWithOptions(Options{Mode: ModeIOUring, MaxEvents: 4}, "")
 		if err != nil {
-			t.Fatalf("Probe 报支持但建 ring 失败: %v", err)
+			t.Fatalf("probeCached 报支持但建 ring 失败: %v", err)
 		}
 		_ = r.Close()
 	} else if first.Reason == "" {

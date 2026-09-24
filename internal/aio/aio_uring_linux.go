@@ -17,8 +17,12 @@ import (
 	"github.com/liucxer/taihu/internal/ierr"
 )
 
-// checkIOPoll 校验目标块设备是否开启了队列级轮询 —— IOPOLL 的前置条件。
-// 导出入口 CheckIOPoll 与其释义在 aio.go。
+// checkIOPoll 校验目标块设备是否开启了队列级轮询 —— IOPOLL 的前置条件
+// （为什么必须有这条前置，见 aio.go 的 Options.IOPoll）。
+//
+// 未开启时内核的 blk_poll 直接返回 0，io_uring 的轮询请求既不完成也不报错，
+// 会永远停在 iopoll_list 上（表现为挂死），故这里提前硬失败并给出开启命令。
+// 由 NewWithOptions 在确实会建 io_uring 环时调用。
 func checkIOPoll(devPath string) error {
 	sysPath := "/sys/class/block/" + filepath.Base(devPath) + "/queue/io_poll"
 	b, err := os.ReadFile(sysPath)

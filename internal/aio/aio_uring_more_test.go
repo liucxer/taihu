@@ -471,7 +471,7 @@ func TestUringCraftedParams(t *testing.T) {
 // TestCheckIOPoll 覆盖 sysfs 读取失败与 io_poll 取值判定；成功分支只在真的有
 // 开启队列轮询的块设备时才会命中。
 func TestCheckIOPoll(t *testing.T) {
-	err := CheckIOPoll("/dev/taihu-no-such-block-device")
+	err := checkIOPoll("/dev/taihu-no-such-block-device")
 	if err == nil {
 		t.Fatal("不存在的块设备应报错")
 	}
@@ -490,12 +490,12 @@ func TestCheckIOPoll(t *testing.T) {
 			continue // 分区没有 queue 目录
 		}
 		on := strings.TrimSpace(string(b)) == "1"
-		got := CheckIOPoll("/dev/" + e.Name())
+		got := checkIOPoll("/dev/" + e.Name())
 		switch {
 		case on && got != nil:
-			t.Errorf("%s io_poll=1，CheckIOPoll 却报错: %v", e.Name(), got)
+			t.Errorf("%s io_poll=1，checkIOPoll 却报错: %v", e.Name(), got)
 		case !on && got == nil:
-			t.Errorf("%s io_poll=%q，CheckIOPoll 却通过", e.Name(), strings.TrimSpace(string(b)))
+			t.Errorf("%s io_poll=%q，checkIOPoll 却通过", e.Name(), strings.TrimSpace(string(b)))
 		}
 		checked++
 	}

@@ -14,8 +14,20 @@ import (
 // envMode 环境变量兜底开关（仅在 ModeAuto 下生效，便于线上紧急回退；命令行优先）。
 const envMode = "TAIHU_AIO_URING"
 
-// errInvalidMaxEvents 表示 NewWithOptions 的 maxEvents 超出内核允许范围。
+// errInvalidMaxEvents 表示 Options.MaxEvents 超出内核允许范围。
 var errInvalidMaxEvents = errors.New("aio: maxEvents must be in [1, 65536]")
+
+// info 描述 io_uring 可用性探测结果。是 probe() 的产出形状，同时被结论缓存
+// （probe_cache.go 的 probeInfo）与选路方（NewWithOptions）消费；
+// 包外只经由 NewWithOptions 的选路间接依赖该结论，故不导出。
+type info struct {
+	Supported     bool   // 当前内核是否可用 io_uring
+	Reason        string // 人类可读原因（供日志与错误信息）
+	KernelRelease string // 内核版本字符串，仅供日志
+	SQEntries     uint32 // 内核回填的提交队列深度
+	CQEntries     uint32 // 内核回填的完成队列深度
+	Features      uint32 // 内核能力位（IORING_FEAT_*）
+}
 
 // iopollSuffix 把 IOPOLL 状态拼进启动日志（仅在启用时出现）。
 func iopollSuffix(on bool) string {

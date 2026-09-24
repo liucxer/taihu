@@ -8,7 +8,7 @@
 //     结构体见 linux/io_uring.h。自 5.1 起可用，完成事件零系统调用收割。
 //
 // 选哪个由 Mode 决定（auto 时按 io_uring_setup 的 errno 运行期探测，不比较版本号），
-// 见 NewWithOptions / Probe。两个后端实现同一个 Ring 接口，调用方无感。
+// 见 NewWithOptions。两个后端实现同一个 Ring 接口，调用方无感。
 //
 // 平台策略：
 //   - Linux：真异步（libaio 或 io_uring），缓冲必须由调用方持有到 Wait 返回
@@ -21,7 +21,7 @@
 //   - Linux + O_DIRECT 时 buf 首地址、偏移、长度需 4K 对齐（由 bufpool/device 层保证）。
 //
 // 本文件集中该包的**全部对外 API**（类型、常量与入口函数），且**只含导出名** ——
-// 未导出的常量、变量与辅助函数在 aio_internal.go，探测结论缓存在 probe_cache.go。
+// 未导出的常量、变量、类型与辅助函数在 aio_internal.go，探测结论缓存在 probe_cache.go。
 // 后端实现按平台分文件：aio_linux.go（libaio）、aio_uring_linux.go（io_uring）、
 // aio_other.go（非 Linux 兜底）；探测的实现细节在 probe_linux.go / probe_other.go。
 package aio
@@ -114,19 +114,27 @@ func ParseMode(s string) (Mode, error) {
 	return ModeAuto, fmt.Errorf("aio: invalid io-uring mode %q (want auto|on|off)", s)
 }
 
-// Options 创建异步 IO 队列的参数。
+// Options 创建异步 IO 队列的参数，只描述队列自身。
+// 设备上下文不在此处 —— 「目标块设备路径」仅 IOPoll 前置校验需要，由 NewWithOptions 的
+// 独立参数提供（校验前它对该队列没有任何意义）。
 type Options struct {
 	// Mode 后端选择，零值为 ModeAuto。
 	Mode Mode
+	// MaxEvents 队列深度上限：libaio 为 io_setup 的 maxEvents，
+	// io_uring 为 SQ entries（内核回填的 CQ 为其 2 倍）；非 Linux 兜底实现忽略该值。
+	// 合法区间 [1, 65536]，越界由各后端构造返回 errInvalidMaxEvents。
+	MaxEvents int
 	// IOPoll 启用 IORING_SETUP_IOPOLL，仅 io_uring 后端有效。
 	// 前置条件：目标块设备队列须开启轮询（/sys/class/block/<dev>/queue/io_poll=1），
 	// 否则请求会永远停在 iopoll_list 上不完成（blk_poll 直接返回 0）。
+	// 该前置条件由 NewWithOptions 在确实会建 io_uring 环时用 devPath 自动校验（见 checkIOPoll）。
 	IOPoll bool
 }
 
 // NewWithOptions 按指定参数创建异步 IO 队列。
-// Linux 上 maxEvents 为队列深度上限（1..65536）；非 Linux 平台忽略上限语义。
-func NewWithOptions(maxEvents int, o Options) (Ring, error) {
+// devPath 为目标块设备路径，仅供 IOPoll 的前置条件校验定位 sysfs；为空则跳过校验。
+// Linux 上 o.MaxEvents 为队列深度上限（1..65536）；非 Linux 平台忽略上限语义。
+func NewWithOptions(o Options, devPath string) (Ring, error) {
 	if o.Mode == ModeAuto {
 		if v := os.Getenv(envMode); v != "" {
 			m, err := ParseMode(v)
@@ -137,16 +145,28 @@ func NewWithOptions(maxEvents int, o Options) (Ring, error) {
 		}
 	}
 
+	// IOPOLL 前置校验：只在确定会建 io_uring 环（强制 on，或 auto 且探测支持）时才校验，
+	// 否则 auto 回退 libaio 的场景会被无谓拦下 —— 那时 IOPoll 本就不生效。
+	// 位置必须在本函数内、env 覆盖之后：TAIHU_AIO_URING=off 把 auto 拨到 libaio 时不该校验，
+	// 而「最终走哪个后端」的决策只有这里知道，故校验归此处而非调用方。
+	// devPath 为空则跳过 —— 纯队列用途的调用方（包内测试、非 IOPOLL 场景）没有设备上下文。
+	if o.IOPoll && devPath != "" &&
+		(o.Mode == ModeIOUring || (o.Mode == ModeAuto && probeCached().Supported)) {
+		if err := checkIOPoll(devPath); err != nil {
+			return nil, err
+		}
+	}
+
 	switch o.Mode {
 	case ModeIOUring:
-		r, err := newIOUringRing(maxEvents, o.IOPoll)
+		r, err := newIOUringRing(o.MaxEvents, o.IOPoll)
 		if err != nil {
 			return nil, err
 		}
 		logBackend(r, "forced on"+iopollSuffix(o.IOPoll))
 		return r, nil
 	case ModeLibAIO:
-		r, err := newLibAIORing(maxEvents)
+		r, err := newLibAIORing(o.MaxEvents)
 		if err != nil {
 			return nil, err
 		}
@@ -154,59 +174,21 @@ func NewWithOptions(maxEvents int, o Options) (Ring, error) {
 		return r, nil
 	}
 
-	// ModeAuto：运行期探测（不比较版本号，见 Probe）。
-	info := Probe()
-	if info.Supported {
-		r, err := newIOUringRing(maxEvents, o.IOPoll)
+	// ModeAuto：运行期探测（不比较版本号，见 probeCached）。
+	pi := probeCached()
+	if pi.Supported {
+		r, err := newIOUringRing(o.MaxEvents, o.IOPoll)
 		if err != nil {
 			return nil, err
 		}
 		logBackend(r, fmt.Sprintf("auto: probe ok, features=0x%x%s",
-			info.Features, iopollSuffix(o.IOPoll)))
+			pi.Features, iopollSuffix(o.IOPoll)))
 		return r, nil
 	}
-	r, err := newLibAIORing(maxEvents)
+	r, err := newLibAIORing(o.MaxEvents)
 	if err != nil {
 		return nil, err
 	}
-	logBackend(r, "auto: io_uring 不可用 — "+info.Reason)
+	logBackend(r, "auto: io_uring 不可用 — "+pi.Reason)
 	return r, nil
-}
-
-// ── io_uring 可用性探测 ──────────────────────────────────────────────
-
-// Info 描述 io_uring 可用性探测结果。
-type Info struct {
-	Supported     bool   // 当前内核是否可用 io_uring
-	Reason        string // 人类可读原因（供日志与错误信息）
-	KernelRelease string // 内核版本字符串，仅供日志
-	SQEntries     uint32 // 内核回填的提交队列深度
-	CQEntries     uint32 // 内核回填的完成队列深度
-	Features      uint32 // 内核能力位（IORING_FEAT_*）
-}
-
-// Probe 探测当前内核是否可用 io_uring。
-//
-// 判定完全基于 io_uring_setup 的 errno，不比较内核版本号 —— 版本号反映不了三类
-// 误判：RHEL 系的 io_uring_disabled sysctl、容器 seccomp 拦截、以及发行版把 io_uring
-// 反向移植进老内核（例如 openEuler/BCLinux 4.19.90 就带完整 backport，能力集约等于 5.8）。
-//
-// 只缓存确定性结论：资源类瞬时错误（ENOMEM/EMFILE 等）下次调用会重新探测，
-// 否则一次偶发失败会把进程永久钉死在 libaio 上。
-//
-// 平台差异收敛在 probe() 内：非 Linux 平台恒为不支持（见 probe_other.go）。
-// 缓存与转发逻辑在 probe_cache.go —— 那部分平台无关，不该进平台文件：平台文件只应
-// 放真正的平台差异，混入平台无关逻辑会让「两平台行为是否一致」无法靠 diff 判断。
-func Probe() Info {
-	return probeCached()
-}
-
-// CheckIOPoll 校验目标块设备是否开启了队列级轮询 —— IOPOLL 的前置条件。
-//
-// 未开启时内核的 blk_poll 直接返回 0，io_uring 的轮询请求既不完成也不报错，
-// 会永远停在 iopoll_list 上（表现为挂死），故这里提前硬失败并给出开启命令。
-//
-// 实现按平台分文件：Linux 读 sysfs 校验，非 Linux 恒报不支持（见 probe_other.go）。
-func CheckIOPoll(devPath string) error {
-	return checkIOPoll(devPath)
 }

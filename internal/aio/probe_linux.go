@@ -15,32 +15,32 @@ import (
 const uringProbeHeaderLen = 16
 
 // probe 实际执行一次探测，第二个返回值表示结论是否确定性（可否缓存）。
-// 导出入口在 aio.go，结论缓存与转发在 probe_cache.go。
-func probe() (Info, bool) {
-	info := Info{KernelRelease: kernelRelease()}
+// 结论缓存与转发在 probe_cache.go。
+func probe() (info, bool) {
+	pi := info{KernelRelease: kernelRelease()}
 
 	// 建一个最小 ring 试跑：成功后立刻关闭，不长期占用 fd 与 memlock 记账
 	// （io_uring_setup 会按 RLIMIT_MEMLOCK 记账）。
 	fd, params, err := uringSetupRaw(64, 0)
 	if err != nil {
-		info.Reason = describeUringErr(err)
-		return info, !transientErrno(err)
+		pi.Reason = describeUringErr(err)
+		return pi, !transientErrno(err)
 	}
 	// 探测用的一次性 ring fd：Close 的 errno 无可挽回动作（此处已拿到结论、
 	// fd 也不再被引用），忽略以免覆盖下面真正要返回的探测结论。
 	defer func() { _ = unix.Close(fd) }()
 
 	if ok, why := uringSupportsRW(fd); !ok {
-		info.Reason = why
-		return info, true
+		pi.Reason = why
+		return pi, true
 	}
 
-	info.Supported = true
-	info.Reason = "ok"
-	info.SQEntries = params.SQEntries
-	info.CQEntries = params.CQEntries
-	info.Features = params.Features
-	return info, true
+	pi.Supported = true
+	pi.Reason = "ok"
+	pi.SQEntries = params.SQEntries
+	pi.CQEntries = params.CQEntries
+	pi.Features = params.Features
+	return pi, true
 }
 
 // uringSupportsRW 用 IORING_REGISTER_PROBE 确认内核确实实现了 IORING_OP_READ/WRITE。

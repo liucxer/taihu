@@ -77,22 +77,16 @@ func NewDevice(ctx context.Context, nvmePath string, segSize int64, opts ...Opti
 		opt(&o)
 	}
 
-	// IOPOLL 前置条件校验：只在确定会走 io_uring 时才校验，否则 auto 回退到
-	// libaio 的场景会被无谓地拦下。
-	if o.aioIOPoll && (o.aioMode == aio.ModeIOUring ||
-		(o.aioMode == aio.ModeAuto && aio.Probe().Supported)) {
-		if err := aio.CheckIOPoll(nvmePath); err != nil {
-			return nil, err
-		}
-	}
-
 	f, err := openDevice(nvmePath)
 	if err != nil {
 		return nil, fmt.Errorf("taihu: open device %q: %w", nvmePath, err)
 	}
 	ring := o.ring // 仅测试注入；生产路径为 nil
 	if ring == nil {
-		ring, err = aio.NewWithOptions(aioDepth, aio.Options{Mode: o.aioMode, IOPoll: o.aioIOPoll})
+		// IOPOLL 的前置条件校验（设备队列轮询）由 aio 层在确实会建 io_uring 环时完成，
+		// 故此处把设备路径一并传入 —— 「最终走哪个后端」的决策只在 aio 层知道。
+		ring, err = aio.NewWithOptions(
+			aio.Options{Mode: o.aioMode, MaxEvents: aioDepth, IOPoll: o.aioIOPoll}, nvmePath)
 		if err != nil {
 			_ = f.Close()
 			return nil, fmt.Errorf("taihu: create aio ring: %w", err)

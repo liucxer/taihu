@@ -43,14 +43,14 @@ func TestParseMode(t *testing.T) {
 	}
 }
 
-// TestNewWithOptionsInvalidMaxEvents maxEvents 越界时三个后端取值都必须报错，不得静默建出队列。
+// TestNewWithOptionsInvalidMaxEvents MaxEvents 越界时三个后端取值都必须报错，不得静默建出队列。
 func TestNewWithOptionsInvalidMaxEvents(t *testing.T) {
 	for _, m := range []Mode{ModeLibAIO, ModeIOUring, ModeAuto} {
 		for _, n := range []int{0, -1, 1<<16 + 1} {
-			r, err := NewWithOptions(n, Options{Mode: m})
+			r, err := NewWithOptions(Options{Mode: m, MaxEvents: n}, "")
 			if err == nil {
 				_ = r.Close()
-				t.Errorf("NewWithOptions(%d, {Mode: %d}) 应报错", n, int(m))
+				t.Errorf("NewWithOptions({Mode: %d, MaxEvents: %d}) 应报错", int(m), n)
 			}
 		}
 	}
@@ -61,7 +61,7 @@ func TestNewWithOptionsInvalidMaxEvents(t *testing.T) {
 func TestNewWithOptionsEnvOverride(t *testing.T) {
 	// off → libaio
 	t.Setenv(envMode, "off")
-	r, err := NewWithOptions(4, Options{})
+	r, err := NewWithOptions(Options{MaxEvents: 4}, "")
 	if err != nil {
 		t.Fatalf("envMode=off: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestNewWithOptionsEnvOverride(t *testing.T) {
 
 	// 非法取值 → 报错（不得静默降级）
 	t.Setenv(envMode, "bogus")
-	if r, err := NewWithOptions(4, Options{}); err == nil {
+	if r, err := NewWithOptions(Options{MaxEvents: 4}, ""); err == nil {
 		_ = r.Close()
 		t.Error("非法 envMode 应报错")
 	} else if !strings.Contains(err.Error(), envMode) {
@@ -80,7 +80,7 @@ func TestNewWithOptionsEnvOverride(t *testing.T) {
 	}
 
 	// 显式指定后端时 env 被忽略（即使取值非法）
-	if r, err := NewWithOptions(4, Options{Mode: ModeLibAIO}); err != nil {
+	if r, err := NewWithOptions(Options{Mode: ModeLibAIO, MaxEvents: 4}, ""); err != nil {
 		t.Errorf("显式 ModeLibAIO 时不应受非法 envMode 影响: %v", err)
 	} else {
 		_ = r.Close()
@@ -88,7 +88,7 @@ func TestNewWithOptionsEnvOverride(t *testing.T) {
 
 	// auto（env 与内核能力都指向 auto）→ 走探测
 	t.Setenv(envMode, "auto")
-	rAuto, err := NewWithOptions(4, Options{})
+	rAuto, err := NewWithOptions(Options{MaxEvents: 4}, "")
 	if err != nil {
 		t.Fatalf("envMode=auto: %v", err)
 	}
@@ -96,9 +96,9 @@ func TestNewWithOptionsEnvOverride(t *testing.T) {
 
 	// on → io_uring（内核不支持时只能报错）
 	t.Setenv(envMode, "on")
-	rOn, err := NewWithOptions(4, Options{})
+	rOn, err := NewWithOptions(Options{MaxEvents: 4}, "")
 	if err != nil {
-		if !Probe().Supported {
+		if !probeCached().Supported {
 			t.Skipf("io_uring 不可用: %v", err)
 		}
 		t.Fatalf("envMode=on: %v", err)
@@ -110,9 +110,9 @@ func TestNewWithOptionsEnvOverride(t *testing.T) {
 
 	// on + IOPoll：只创建不提交（目标块设备未开队列轮询时提交会挂死）
 	t.Setenv(envMode, "on")
-	rPoll, err := NewWithOptions(4, Options{IOPoll: true})
+	rPoll, err := NewWithOptions(Options{MaxEvents: 4, IOPoll: true}, "")
 	if err != nil {
-		if !Probe().Supported {
+		if !probeCached().Supported {
 			t.Skipf("io_uring 不可用: %v", err)
 		}
 		t.Fatalf("envMode=on + IOPoll: %v", err)
@@ -120,10 +120,10 @@ func TestNewWithOptionsEnvOverride(t *testing.T) {
 	_ = rPoll.Close()
 }
 
-// TestNewWithOptionsAuto Probe 结论决定 auto 的落点。真实缓存先固化以便覆盖
+// TestNewWithOptionsAuto 探测结论决定 auto 的落点。真实缓存先固化以便覆盖
 // 「探测成功→io_uring」「探测失败→libaio 回退」两条分支。
 func TestNewWithOptionsAuto(t *testing.T) {
-	real := Probe() // 先触发一次真实探测并固化缓存
+	real := probeCached() // 先触发一次真实探测并固化缓存
 
 	probeMu.Lock()
 	savedInfo, savedDone := probeInfo, probeDone
@@ -134,15 +134,15 @@ func TestNewWithOptionsAuto(t *testing.T) {
 		probeMu.Unlock()
 	})
 
-	setProbe := func(i Info) {
+	setProbe := func(i info) {
 		probeMu.Lock()
 		probeInfo, probeDone = i, true
 		probeMu.Unlock()
 	}
 
 	if real.Supported {
-		setProbe(Info{Supported: true, Reason: "ok", Features: 0xf})
-		r, err := NewWithOptions(4, Options{Mode: ModeAuto})
+		setProbe(info{Supported: true, Reason: "ok", Features: 0xf})
+		r, err := NewWithOptions(Options{Mode: ModeAuto, MaxEvents: 4}, "")
 		if err != nil {
 			t.Fatalf("auto+supported: %v", err)
 		}
@@ -151,8 +151,8 @@ func TestNewWithOptionsAuto(t *testing.T) {
 		}
 		_ = r.Close()
 
-		setProbe(Info{Supported: true, Reason: "ok", Features: 0xf})
-		rp, err := NewWithOptions(4, Options{Mode: ModeAuto, IOPoll: true})
+		setProbe(info{Supported: true, Reason: "ok", Features: 0xf})
+		rp, err := NewWithOptions(Options{Mode: ModeAuto, MaxEvents: 4, IOPoll: true}, "")
 		if err != nil {
 			t.Fatalf("auto+supported+iopoll: %v", err)
 		}
@@ -162,8 +162,8 @@ func TestNewWithOptionsAuto(t *testing.T) {
 	}
 
 	// 探测结论为「不支持」→ 回退 libaio 并记录原因
-	setProbe(Info{Supported: false, Reason: "test: 模拟内核不支持 io_uring"})
-	r2, err := NewWithOptions(4, Options{Mode: ModeAuto})
+	setProbe(info{Supported: false, Reason: "test: 模拟内核不支持 io_uring"})
+	r2, err := NewWithOptions(Options{Mode: ModeAuto, MaxEvents: 4}, "")
 	if err != nil {
 		t.Fatalf("auto+unsupported: %v", err)
 	}
@@ -172,9 +172,9 @@ func TestNewWithOptionsAuto(t *testing.T) {
 	}
 	_ = r2.Close()
 
-	// 回退路径上 maxEvents 越界同样必须报错（不得静默建出队列）。
-	if r3, err := NewWithOptions(0, Options{Mode: ModeAuto}); err == nil {
+	// 回退路径上 MaxEvents 越界同样必须报错（不得静默建出队列）。
+	if r3, err := NewWithOptions(Options{Mode: ModeAuto}, ""); err == nil {
 		_ = r3.Close()
-		t.Error("auto 回退 libaio 时 maxEvents 越界也应报错")
+		t.Error("auto 回退 libaio 时 MaxEvents 越界也应报错")
 	}
 }
