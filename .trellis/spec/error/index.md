@@ -5,13 +5,12 @@
 
 ## 本仓库的错误模型（先读这段）
 
-taihu 的错误只有一个事实源：**`internal/ierr`**。该包的文件头原文写着：
+taihu 的错误只有一个事实源：**`pkg/ierr`**（2026-09-24 自 `pkg/ierr` 迁入，全仓错误统一收敛于此）。该包的文件头原文写着：
 
 > Package ierr 定义 taihu 存储的公共错误 —— **唯一事实源**。
-> 内部各层（aio/device/metastore/storage/transport/protocol）直接使用本包错误；
-> 面向客户端的 re-export 只有一处：`internal/rpcclient/reexport.go`（`pkg/taihu-client/reexport.go` 再转指一层）。**`internal/` 下的包不得自建错误别名层。**
+> 内部各层（aio/device/metastore/storage/transport/protocol）与对外 SDK（pkg/taihu-client）直接使用本包错误；包位于 pkg/ 下，外部调用方可用 errors.Is 判定同一批哨兵。**`internal/` 下的包不得自建错误别名层。**
 
-当前共 8 个 sentinel，全部在 `internal/ierr/ierr.go:10-27`：`ErrNotFound`、`ErrInvalidRange`、`ErrTooLarge`、`ErrNoSpace`、`ErrShortWrite`、`ErrConflict`、`ErrFull`、`ErrTimeout`。
+当前共 26 个 sentinel，全部在 `pkg/ierr/ierr.go`：`ErrNotFound`、`ErrInvalidRange`、`ErrTooLarge`、`ErrNoSpace`、`ErrShortWrite`、`ErrConflict`、`ErrFull`、`ErrTimeout`、`ErrInvalidMaxEvents`、`ErrUringLinuxOnly`、`ErrIOPOLLLinuxOnly`、`ErrInvalidArgument`、`ErrRPCError`、`ErrKeyTooLong`、`ErrConnClosed`、`ErrShmBadFrame`、`ErrShmStreamBroken`、`ErrShmUnsupported`、`ErrShmOnly`、`ErrAdminShmOnly`、`ErrStorageClosed`、`ErrDeviceClosed`、`ErrNoInstances`、`ErrSourceUnset`、`ErrKVRequired`、`ErrNoShmAddr`。
 
 **改动错误时第一条要问的**：这个错误该不该进 `ierr`？如果它要跨包被 `errors.Is` 判断，就进；如果只是本包内部的失败信号，就地 `fmt.Errorf` 包装。
 
@@ -49,7 +48,7 @@ ErrTooLarge = errors.New("taihu: object too large, exceeds segment size")
 
 **规则**：为调用方可判断的错误条件定义包级 sentinel。
 
-**对 taihu：适用，但强于规则本身。** gbp 只说「定义包级 sentinel」，本仓库进一步规定**sentinel 只有一处**：`internal/ierr`。这是比「每个包自己定义」更严的约束——它换来的是**跨层 `errors.Is` 的可判定性**：任何一个包拿到 `error` 都能用同一组 sentinel 判断，不必知道对方内部定义了什么。
+**对 taihu：适用，但强于规则本身。** gbp 只说「定义包级 sentinel」，本仓库进一步规定**sentinel 只有一处**：`pkg/ierr`。这是比「每个包自己定义」更严的约束——它换来的是**跨层 `errors.Is` 的可判定性**：任何一个包拿到 `error` 都能用同一组 sentinel 判断，不必知道对方内部定义了什么。
 
 **因此新增 sentinel 的判据是**：它需要跨包/跨层被判断吗？需要 → 进 `ierr`。不需要 → 不要新建 sentinel，用 `fmt.Errorf` 包装即可。
 
