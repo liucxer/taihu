@@ -2,8 +2,6 @@ package metastore
 
 import (
 	"context"
-	"encoding/binary"
-	"fmt"
 	"sync"
 	"time"
 
@@ -24,6 +22,8 @@ import (
 //   - 后台 GC goroutine：周期扫描，把「无引用」的 Reclaiming 段转 Free 入池。
 //
 // 锁序：allocator.mu → segmentManager.mu（GC / PutMapping 路径只持 segmentManager.mu，无反向）。
+//
+// 段状态与对象映射的磁盘读写经 model.go 的 segment / mapping model 完成。
 type segmentManager struct {
 	mu   sync.Mutex
 	db   *pebble.DB
@@ -39,6 +39,10 @@ type segEntry struct {
 	refCount int64       // 在途读引用计数
 }
 
+// mapping / segment 两个 KV model 的访问器（复用同一 model 层，与 pebbleStore 共享）。
+func (m *segmentManager) mapping() *mappingModel { return &mappingModel{db: m.db} }
+func (m *segmentManager) segment() *segmentModel { return &segmentModel{db: m.db} }
+
 // gcInterval 后台 GC 扫描周期。
 const gcInterval = time.Second
 
@@ -50,24 +54,8 @@ func newSegmentManager(db *pebble.DB) *segmentManager {
 // rebuild 启动恢复：从 seg/ 前缀恢复段状态与空闲池，从 mapping 全量重建存活计数。
 // 全量扫描成本为一次性（与 LoadCache 同量级），换来自洽的计数基准。
 func (m *segmentManager) rebuild(ctx context.Context) error {
-	// 1. 段状态：扫描 s\x00seg/ 前缀。
-	prefix := keyState([]byte(kvSegmentPrefix))
-	upper := append([]byte{}, prefix...)
-	upper[len(upper)-1]++
-	it, err := m.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upper})
-	if err != nil {
-		return err
-	}
-	for it.First(); it.Valid(); it.Next() {
-		if len(it.Key()) != len(prefix)+8 {
-			return fmt.Errorf("taihu: bad segment key %q", it.Key())
-		}
-		id := int64(binary.LittleEndian.Uint64(it.Key()[len(prefix):]))
-		meta, err := decodeSegmentMeta(it.Value())
-		if err != nil {
-			it.Close()
-			return err
-		}
+	// 1. 段状态：扫描 s\x00seg/ 前缀（键区间与编解码由 model 收敛）。
+	if err := m.segment().iter(func(id int64, meta SegmentMeta) error {
 		// AliveCount 以 mapping 全量扫描为准（步骤 2），此处丢弃持久化计数避免双重累加。
 		meta.AliveCount = 0
 		e := &segEntry{meta: meta}
@@ -75,9 +63,8 @@ func (m *segmentManager) rebuild(ctx context.Context) error {
 			m.free = append(m.free, id)
 		}
 		m.segs[id] = e
-	}
-	it.Close()
-	if err := it.Error(); err != nil {
+		return nil
+	}); err != nil {
 		return err
 	}
 
@@ -105,7 +92,7 @@ func (m *segmentManager) rebuild(ctx context.Context) error {
 
 // rebuildMapping 遍历 mapping 重建各段存活计数。
 func (m *segmentManager) rebuildMapping(ctx context.Context) error {
-	return iterateMapping(m.db, func(key string, meta ObjectMeta) error {
+	return m.mapping().iter(func(key string, meta ObjectMeta) error {
 		id := meta.SegmentID
 		e := m.segs[id]
 		if e == nil {
@@ -168,13 +155,13 @@ func (m *segmentManager) ensureLocked(id int64) *segEntry {
 
 // persistLocked 持久化段状态。调用方须持有 m.mu。
 func (m *segmentManager) persistLocked(ctx context.Context, id int64, e *segEntry) error {
-	return m.db.Set(keyState(segmentKey(id)), e.meta.encode(), syncWO)
+	return m.segment().set(id, e.meta)
 }
 
 // putObjectLocked 将对象映射与相关段的存活计数写入 batch（不 Apply）。
 // 调用方须持有 m.mu；batch 由调用方原子提交。
 func (m *segmentManager) putObjectLocked(b *pebble.Batch, key string, meta ObjectMeta, old *ObjectMeta) {
-	b.Set(keyMapping(key), meta.encode(), nil)
+	m.mapping().setBatch(b, key, meta)
 
 	e := m.ensureLocked(meta.SegmentID)
 	oldSame := old != nil && old.SegmentID == meta.SegmentID
@@ -188,7 +175,7 @@ func (m *segmentManager) putObjectLocked(b *pebble.Batch, key string, meta Objec
 		}
 		e.meta.State = SegmentStateActive
 	}
-	b.Set(keyState(segmentKey(meta.SegmentID)), e.meta.encode(), nil)
+	m.segment().setBatch(b, meta.SegmentID, e.meta)
 	if old != nil && !oldSame {
 		if oe := m.segs[old.SegmentID]; oe != nil {
 			oe.meta.AliveCount--
@@ -196,7 +183,7 @@ func (m *segmentManager) putObjectLocked(b *pebble.Batch, key string, meta Objec
 				oe.meta.AliveCount = 0
 				oe.meta.State = SegmentStateReclaiming
 			}
-			b.Set(keyState(segmentKey(old.SegmentID)), oe.meta.encode(), nil)
+			m.segment().setBatch(b, old.SegmentID, oe.meta)
 		}
 	}
 }
@@ -218,14 +205,14 @@ func (m *segmentManager) putObject(ctx context.Context, key string, meta ObjectM
 // delObjectLocked 将对象映射删除与相关段的存活计数减量写入 batch（不 Apply）。
 // 调用方须持有 m.mu；batch 由调用方原子提交。计数归零的段立即转 Reclaiming。
 func (m *segmentManager) delObjectLocked(b *pebble.Batch, key string, meta ObjectMeta) {
-	b.Delete(keyMapping(key), nil)
+	m.mapping().delBatch(b, key)
 	if e := m.segs[meta.SegmentID]; e != nil {
 		e.meta.AliveCount--
 		if e.meta.AliveCount <= 0 {
 			e.meta.AliveCount = 0
 			e.meta.State = SegmentStateReclaiming
 		}
-		b.Set(keyState(segmentKey(meta.SegmentID)), e.meta.encode(), nil)
+		m.segment().setBatch(b, meta.SegmentID, e.meta)
 	}
 }
 
@@ -346,21 +333,19 @@ func (m *segmentManager) reclaimOnce(ctx context.Context) int {
 		m.mu.Unlock()
 		return 0
 	}
-	var keys [][]byte
 	for i, id := range ids {
 		e := cands[i]
 		e.meta.State = SegmentStateFree
 		e.meta.AliveCount = 0
 		e.meta.ReclaimSeq++ // 回收一代，世代号递增
 		m.free = append(m.free, id)
-		keys = append(keys, keyState(segmentKey(id)))
 	}
 	m.mu.Unlock()
 
 	b := m.db.NewBatch()
 	defer b.Close()
 	for i, e := range cands {
-		b.Set(keys[i], e.meta.encode(), nil)
+		m.segment().setBatch(b, ids[i], e.meta)
 	}
 	if err := m.db.Apply(b, syncWO); err != nil {
 		// 持久化失败：段留在 Free（内存态），下轮 GC 重试写入。
@@ -378,26 +363,4 @@ func (m *segmentManager) stats() map[SegmentState]int {
 		out[e.meta.State]++
 	}
 	return out
-}
-
-// iterateMapping 遍历 mapping 命名空间（供 rebuild 复用，避免与 Store 接口耦合）。
-func iterateMapping(db *pebble.DB, fn func(key string, meta ObjectMeta) error) error {
-	prefix := []byte(kvPrefixMapping)
-	upper := append([]byte{}, prefix...)
-	upper[len(upper)-1]++
-	it, err := db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upper})
-	if err != nil {
-		return err
-	}
-	defer it.Close()
-	for it.First(); it.Valid(); it.Next() {
-		meta, err := decodeObjectMeta(it.Value())
-		if err != nil {
-			return err
-		}
-		if err := fn(string(it.Key()[len(prefix):]), meta); err != nil {
-			return err
-		}
-	}
-	return it.Error()
 }
