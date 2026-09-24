@@ -283,7 +283,7 @@ Go 不允许实现导出接口的方法私有。`internal/aio` 的 `Ring` 接口
 | 状态 | 包（E = 包级导出数，U = 未导出顶层声明数） |
 |---|---|
 | ✅ **两条都符合** | `internal/aio`(14E)、`internal/ierr`(8E)、`internal/layout`(5E)、`internal/transport/protocol`(65E) |
-| ⚠️ **单一但不纯** | `internal/bufpool`(4E/11U)、`internal/version`(3E/1U)、`cmd/taihu/cmd`(1E/6U) |
+| ⚠️ **单一但不纯** | `pkg/bufpool`(4E/11U)、`internal/version`(3E/1U)、`cmd/taihu/cmd`(1E/6U) |
 | ⚠️ **按主题拆成多个纯导出文件** | `internal/cluster`(7 文件)、`pkg/taihu-client`(4 文件) |
 | ❌ **导出散在实现文件里** | `internal/storage`(3 文件)、`internal/transport`(8)、`internal/rpcclient`(7)、`internal/metastore`(3)、`internal/device`(4)、`internal/benchkit`(2) |
 
@@ -297,7 +297,7 @@ Go 不允许实现导出接口的方法私有。`internal/aio` 的 `Ring` 接口
 
 - **`internal/cluster`：有意设计，跟着它自己的分法走。** 它把导出面按主题拆进 6 个**纯导出**文件（`capacity.go` 5E / `client.go` 8E / `instance.go` 4E / `kv.go` 6E / `kv_mem.go` 2E / `register.go` 5E），只有实现文件 `kv_tikv.go`（3E/6U）混着未导出名。它牺牲了「一个文件读完全部契约」，换来「按主题定位」。**本规则不要求它改**；新增导出名时**跟着它自己的主题走**，不要混进实现文件。
 - **`internal/storage` 一类：正在往规则方向走，只是没走完。** 判据是它们的**主文件已经是纯导出的**——`internal/storage/storage.go` 有 5 个包级导出、**0 个未导出**。所以这 8 个包的偏差只是**有导出名落在了别的文件里**（`storage` 的导出分在 `storage.go`(5E) / `compact.go`(4E) / `options.go`(3E/2U)）。**新增导出名时放进主文件，不要放进 `compact.go` 这类实现文件**——这是不必返工也能逐步收敛的路径。
-- **`internal/bufpool` / `internal/version` / `cmd/taihu/cmd`：差的只是纯粹性。** 导出已经集中在一个文件，只是该文件里还混着未导出声明。**新增未导出名时不要往那个文件里加**即可。
+- **`pkg/bufpool` / `internal/version` / `cmd/taihu/cmd`：差的只是纯粹性。** 导出已经集中在一个文件，只是该文件里还混着未导出声明。**新增未导出名时不要往那个文件里加**即可。
 
 ## 核查脚本（正则在这里不可靠，必须用 AST）
 

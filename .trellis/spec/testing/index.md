@@ -43,7 +43,7 @@
 | `cmd/taihu/cmd` | 82.7% | | `internal/rpcclient` | 97.2% |
 | `cmd/taihu` | 85.7% | | `pkg/taihu-client` | 97.6% |
 | `internal/device` | 85.9% | | `internal/benchkit` / `internal/layout` / `internal/transport/protocol` / `internal/version` | 100.0% |
-| `internal/bufpool` | 88.4% | | | |
+| `pkg/bufpool` | 88.4% | | | |
 | `internal/transport` | 90.9% | | | |
 | `internal/storage` | 91.4% | | | |
 | `examples/taihu-client` | 91.7% | | | |

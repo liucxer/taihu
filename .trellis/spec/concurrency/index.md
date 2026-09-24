@@ -105,7 +105,7 @@ mu.Unlock()
 
 **要点二（本仓库特有）**：锁字段必须有**保护范围注释**。20 处里已有写法可参照（如 `internal/aio/aio_libaio_linux.go:52` 的 `mu sync.Mutex // 保护 seq 与 iocb 复用`）。**没有注释的锁，下一个人不敢动它**——他无法判断改变临界区是否安全。
 
-**要点三**：`sync.Pool` 在本仓库是**被明确否决过的**——`internal/bufpool/bufpool.go:10-14` 记录了实测依据（GC 清空导致 4M/8M 大缓冲每轮重分配）。若要在这里重新提议 `sync.Pool`，先读那段。
+**要点三**：`sync.Pool` 在本仓库是**被明确否决过的**——`pkg/bufpool/bufpool.go:10-14` 记录了实测依据（GC 清空导致 4M/8M 大缓冲每轮重分配）。若要在这里重新提议 `sync.Pool`，先读那段。
 
 ### gbp-028 · Race Detection（CRITICAL）— **不适用（当前未启用，是已知缺口）**
 

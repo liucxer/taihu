@@ -61,7 +61,7 @@ for id, a := range aggs {
 
 **判据**：过滤后**预期存活比例 > 50%** → 预分配 `len(src)`；否则用 `var` 让它自己长。**不要机械地把这 20 处都加上 `len(src)`。**
 
-**一条本仓库特有的提醒**：`internal/aio` 的缓冲区**不走这条规则的思路**。那里的大缓冲由 `internal/bufpool` 管理，而 `sync.Pool` 是**被实测否决过的**——`internal/bufpool/bufpool.go:10-14` 记录了依据（GC 清空导致 4M/8M 大缓冲每轮重分配）。**要动缓冲策略，先读那段，不要再提 `sync.Pool`。**
+**一条本仓库特有的提醒**：`internal/aio` 的缓冲区**不走这条规则的思路**。那里的大缓冲由 `pkg/bufpool` 管理，而 `sync.Pool` 是**被实测否决过的**——`pkg/bufpool/bufpool.go:10-14` 记录了依据（GC 清空导致 4M/8M 大缓冲每轮重分配）。**要动缓冲策略，先读那段，不要再提 `sync.Pool`。**
 
 ### gbp-048 · Use strconv Instead of fmt（MEDIUM）— **适用，有 1 处真实偏离**
 
@@ -100,7 +100,7 @@ key := prefix + "/" + strconv.Itoa(seq)
 ## 本层与其它层的关系
 
 - **预分配的「什么时候不要用」** 是 [idiomatic/](../idiomatic/index.md) 的 **gbp-036** 没写全的地方——上游那条规则的 slice/map 部分与本条重叠，但它对「过滤循环」的取舍没有讨论。**以本条为准。**
-- **缓冲区池化**（`internal/bufpool`）是性能层最真实的优化点，但它**不属于 gbp 任何一条规则**——它是本仓库自己实测出来的。要看它读 `internal/bufpool/bufpool.go` 的包注释。
+- **缓冲区池化**（`pkg/bufpool`）是性能层最真实的优化点，但它**不属于 gbp 任何一条规则**——它是本仓库自己实测出来的。要看它读 `pkg/bufpool/bufpool.go` 的包注释。
 - **性能测量的正确入口**是 `internal/benchkit` 与 `test/e2e/` 的 F / G 分组，不是 `go test -bench`（原因见 [testing/](../testing/index.md) 的 gbp-044）。
 
 ## 核查脚本

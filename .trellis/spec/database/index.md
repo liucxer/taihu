@@ -44,9 +44,9 @@ gbp 这一类的前提是「你的程序**使用**一个数据库」。taihu **�
 
 **规则**：生产环境显式配置连接池四个参数（`SetMaxIdleConns` / `SetMaxOpenConns` / `SetMaxConnIdleTime` / `SetConnMaxLifetime`）。
 
-**对 taihu：不适用。** 无数据库连接池。形态上最接近的是 `internal/bufpool`，但那是 4K 对齐的**内存缓冲桶**，不是连接池：
+**对 taihu：不适用。** 无数据库连接池。形态上最接近的是 `pkg/bufpool`，但那是 4K 对齐的**内存缓冲桶**，不是连接池：
 
 - 它管的是 `[]byte` 的复用与对齐，没有「连接」这个对象；
-- 它**刻意否决了 `sync.Pool`** —— `internal/bufpool/bufpool.go:10-14` 写明了实测依据（`sync.Pool` 会被 GC 清空，导致 4M/8M 大缓冲每轮重分配）。
+- 它**刻意否决了 `sync.Pool`** —— `pkg/bufpool/bufpool.go:10-14` 写明了实测依据（`sync.Pool` 会被 GC 清空，导致 4M/8M 大缓冲每轮重分配）。
 
 四个 `Set*` 参数在这里没有任何对应物。
