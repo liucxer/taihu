@@ -54,7 +54,8 @@ func checkIOPoll(devPath string) error {
 // 并发约定：Submit* 可由多个 goroutine 并发调用（由 mu 串行化，单生产者填 SQE）；
 // Wait 由单一完成泵 goroutine 持有；两者通过原子读写的 SQ/CQ head/tail 交互。
 type uringRing struct {
-	fd       int
+	fd       int // io_uring_setup 返回的 ring fd（io_uring_enter / register / Close 用）
+	devFD    int // 构造时绑定的目标设备 fd：Submit*/Batch 提交 IO 的落点
 	pfd      unix.PollFd
 	singleMM bool // SQ/CQ 是否共用同一块映射（IORING_FEAT_SINGLE_MMAP）
 
@@ -99,8 +100,9 @@ func uringSetupRaw(entries uint32, flags uint32) (int, ioUringParams, error) {
 	return int(fd), p, nil
 }
 
-// newIOUringRing 建 io_uring ring：io_uring_setup + mmap（SINGLE_MMAP 下只映射一次）。
-func newIOUringRing(maxEvents int, iopoll bool) (Ring, error) {
+// newIOUringRing 建 io_uring ring：io_uring_setup + mmap（SINGLE_MMAP 下只映射一次）,
+// 并把目标设备 fd（devFD）绑定进队列 —— Submit*/Batch 提交 IO 都用它。
+func newIOUringRing(devFD, maxEvents int, iopoll bool) (Ring, error) {
 	if maxEvents <= 0 || maxEvents > 1<<16 {
 		return nil, errInvalidMaxEvents
 	}
@@ -120,6 +122,7 @@ func newIOUringRing(maxEvents int, iopoll bool) (Ring, error) {
 		_ = unix.Close(fd)
 		return nil, err
 	}
+	r.devFD = devFD
 	return r, nil
 }
 
@@ -252,8 +255,8 @@ func (r *uringRing) rewind(to uint32) {
 }
 
 // SubmitRead 实现 Ring.SubmitRead。
-func (r *uringRing) SubmitRead(fd int, buf []byte, off int64) (uint64, error) {
-	seq, n, err := r.submit(fd, []ReadSpec{{Buf: buf, Off: off}}, ioringOpRead)
+func (r *uringRing) SubmitRead(buf []byte, off int64) (uint64, error) {
+	seq, n, err := r.submit([]ReadSpec{{Buf: buf, Off: off}}, ioringOpRead)
 	if err != nil {
 		return 0, err
 	}
@@ -264,13 +267,13 @@ func (r *uringRing) SubmitRead(fd int, buf []byte, off int64) (uint64, error) {
 }
 
 // SubmitReadBatch 实现 Ring.SubmitReadBatch：一次 enter 批量提交，允许部分提交。
-func (r *uringRing) SubmitReadBatch(fd int, specs []ReadSpec) (uint64, int, error) {
-	return r.submit(fd, specs, ioringOpRead)
+func (r *uringRing) SubmitReadBatch(specs []ReadSpec) (uint64, int, error) {
+	return r.submit(specs, ioringOpRead)
 }
 
 // SubmitWrite 实现 Ring.SubmitWrite。
-func (r *uringRing) SubmitWrite(fd int, buf []byte, off int64) (uint64, error) {
-	seq, n, err := r.submit(fd, []ReadSpec{{Buf: buf, Off: off}}, ioringOpWrite)
+func (r *uringRing) SubmitWrite(buf []byte, off int64) (uint64, error) {
+	seq, n, err := r.submit([]ReadSpec{{Buf: buf, Off: off}}, ioringOpWrite)
 	if err != nil {
 		return 0, err
 	}
@@ -282,18 +285,18 @@ func (r *uringRing) SubmitWrite(fd int, buf []byte, off int64) (uint64, error) {
 
 // SubmitWriteBatch 实现 Ring.SubmitWriteBatch：一次 enter 批量提交，允许部分提交。
 // 读写 spec 形状一致，复用 submit 的 SQE 填充逻辑。
-func (r *uringRing) SubmitWriteBatch(fd int, specs []WriteSpec) (uint64, int, error) {
+func (r *uringRing) SubmitWriteBatch(specs []WriteSpec) (uint64, int, error) {
 	rs := make([]ReadSpec, len(specs))
 	for i := range specs {
 		rs[i] = ReadSpec{Buf: specs[i].Buf, Off: specs[i].Off}
 	}
-	return r.submit(fd, rs, ioringOpWrite)
+	return r.submit(rs, ioringOpWrite)
 }
 
 // submit 填 SQE 并一次 io_uring_enter 提交（flags=0，只提交不等待）。
 // 返回首个关联序号与成功排队条数；未排队部分的 SQE 已从 ring 撤销发布，
 // 调用方追加提交时会拿到同一批序号，序号不重叠。
-func (r *uringRing) submit(fd int, specs []ReadSpec, op uint8) (uint64, int, error) {
+func (r *uringRing) submit(specs []ReadSpec, op uint8) (uint64, int, error) {
 	n := len(specs)
 	if n == 0 {
 		return 0, 0, nil
@@ -328,7 +331,7 @@ func (r *uringRing) submit(fd int, specs []ReadSpec, op uint8) (uint64, int, err
 		// 整块覆盖写，避免 flags/ioprio/buf_index 残留（误留 IOSQE_IO_LINK 会改变语义）。
 		*r.sqeAt((tail0 + uint32(i)) & r.sqMask) = ioUringSQE{
 			Opcode:   op,
-			FD:       int32(fd),
+			FD:       int32(r.devFD),
 			Off:      uint64(sp.Off),
 			Addr:     addr,
 			Len:      uint32(len(sp.Buf)),

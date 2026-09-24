@@ -47,6 +47,7 @@ const (
 // ring 基于 Linux 原生 AIO 的真异步实现。
 type ring struct {
 	ctx uint64 // aio_context_t
+	fd  int    // 构造时绑定的目标设备 fd：提交 IO 的落点（Submit*/Batch 不再逐次传 fd）
 
 	mu  sync.Mutex // 保护 seq 与 iocb 复用
 	seq uint64
@@ -54,8 +55,8 @@ type ring struct {
 	events []ioEvent // Wait 复用缓冲
 }
 
-// newLibAIORing 创建内核 AIO 上下文（io_setup）。
-func newLibAIORing(maxEvents int) (Ring, error) {
+// newLibAIORing 创建内核 AIO 上下文（io_setup）并绑定目标设备 fd。
+func newLibAIORing(fd, maxEvents int) (Ring, error) {
 	if maxEvents <= 0 || maxEvents > 1<<16 {
 		return nil, errInvalidMaxEvents
 	}
@@ -64,12 +65,12 @@ func newLibAIORing(maxEvents int) (Ring, error) {
 	if errno != 0 {
 		return nil, errno
 	}
-	return &ring{ctx: ctx, events: make([]ioEvent, 0, 64)}, nil
+	return &ring{ctx: ctx, fd: fd, events: make([]ioEvent, 0, 64)}, nil
 }
 
 // SubmitRead 实现 Ring.SubmitRead。
-func (r *ring) SubmitRead(fd int, buf []byte, off int64) (uint64, error) {
-	return r.submit(fd, buf, off, opcodePread)
+func (r *ring) SubmitRead(buf []byte, off int64) (uint64, error) {
+	return r.submit(buf, off, opcodePread)
 }
 
 // batchSpec 批量提交的内部统一项（读写同构，仅 op 不同）。
@@ -80,38 +81,38 @@ type batchSpec struct {
 
 // SubmitReadBatch 实现 Ring.SubmitReadBatch：一次 io_submit 批量提交多条读。
 // 返回首个序号与成功排队条数（submitted<len(specs) 表示部分截断）。
-func (r *ring) SubmitReadBatch(fd int, specs []ReadSpec) (uint64, int, error) {
+func (r *ring) SubmitReadBatch(specs []ReadSpec) (uint64, int, error) {
 	bs := make([]batchSpec, len(specs))
 	for i := range specs {
 		bs[i] = batchSpec{buf: specs[i].Buf, off: specs[i].Off}
 	}
-	return r.submitBatch(fd, bs, opcodePread)
+	return r.submitBatch(bs, opcodePread)
 }
 
 // SubmitWrite 实现 Ring.SubmitWrite。
-func (r *ring) SubmitWrite(fd int, buf []byte, off int64) (uint64, error) {
-	return r.submit(fd, buf, off, opcodePwrite)
+func (r *ring) SubmitWrite(buf []byte, off int64) (uint64, error) {
+	return r.submit(buf, off, opcodePwrite)
 }
 
 // SubmitWriteBatch 实现 Ring.SubmitWriteBatch：一次 io_submit 批量提交多条写。
 // 返回首个序号与成功排队条数（submitted<len(specs) 表示部分截断）。
-func (r *ring) SubmitWriteBatch(fd int, specs []WriteSpec) (uint64, int, error) {
+func (r *ring) SubmitWriteBatch(specs []WriteSpec) (uint64, int, error) {
 	bs := make([]batchSpec, len(specs))
 	for i := range specs {
 		bs[i] = batchSpec{buf: specs[i].Buf, off: specs[i].Off}
 	}
-	return r.submitBatch(fd, bs, opcodePwrite)
+	return r.submitBatch(bs, opcodePwrite)
 }
 
 // submit 填充 iocb 并 io_submit。内核在 io_submit 内深拷贝 iocb，返回后 iocb 可复用。
-func (r *ring) submit(fd int, buf []byte, off int64, op uint16) (uint64, error) {
+func (r *ring) submit(buf []byte, off int64, op uint16) (uint64, error) {
 	r.mu.Lock()
 	r.seq++
 	seq := r.seq
 	cb := &iocb{
 		Data:   seq,
 		LioOp:  op,
-		Fildes: uint32(fd),
+		Fildes: uint32(r.fd),
 		Nbytes: uint64(len(buf)),
 		Offset: off,
 	}
@@ -131,11 +132,11 @@ func (r *ring) submit(fd int, buf []byte, off int64, op uint16) (uint64, error) 
 	return seq, nil
 }
 
-// submitBatch 一次 io_submit 批量提交 n 个 iocb。整批共用一个 fd。内核在 io_submit
+// submitBatch 一次 io_submit 批量提交 n 个 iocb。整批共用构造时绑定的 fd。内核在 io_submit
 // 内深拷贝 iocb，返回后可复用。成功时返回 count（排队条数），随后以首序号 firstSeq
 // 关联（第 i 项序号 = firstSeq+i）；EAGAIN 返回 ErrFull。seq 递增只在已排队条数上推进，
 // 未排队部分由调用方追加提交，序号不重叠。
-func (r *ring) submitBatch(fd int, specs []batchSpec, op uint16) (uint64, int, error) {
+func (r *ring) submitBatch(specs []batchSpec, op uint16) (uint64, int, error) {
 	n := len(specs)
 	if n == 0 {
 		return 0, 0, nil
@@ -149,7 +150,7 @@ func (r *ring) submitBatch(fd int, specs []batchSpec, op uint16) (uint64, int, e
 		cb := &cbs[i]
 		cb.Data = base + uint64(i+1)
 		cb.LioOp = op
-		cb.Fildes = uint32(fd)
+		cb.Fildes = uint32(r.fd)
 		cb.Nbytes = uint64(len(sp.buf))
 		cb.Offset = sp.off
 		if len(sp.buf) > 0 {

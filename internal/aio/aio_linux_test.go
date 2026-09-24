@@ -64,9 +64,9 @@ func linuxRingBackends(t *testing.T) []backend {
 			name: "libaio",
 			// 内核 ctx 容量上限：满了 io_submit 返回 EAGAIN → ErrFull。
 			depthLimit: true,
-			new: func(t *testing.T, maxEvents int) Ring {
+			new: func(t *testing.T, fd, maxEvents int) Ring {
 				t.Helper()
-				r, err := NewWithOptions(Options{Mode: ModeLibAIO, MaxEvents: maxEvents}, "")
+				r, err := NewWithOptions(Options{Mode: ModeLibAIO, MaxEvents: maxEvents, FD: fd}, "")
 				if err != nil {
 					t.Fatalf("NewWithOptions(libaio): %v", err)
 				}
@@ -77,12 +77,12 @@ func linuxRingBackends(t *testing.T) []backend {
 			name: "io_uring",
 			// 复刻 libaio 的在途上限（见 aio_uring_linux.go 的 inflight）：满了返回 ErrFull。
 			depthLimit: true,
-			new: func(t *testing.T, maxEvents int) Ring {
+			new: func(t *testing.T, fd, maxEvents int) Ring {
 				t.Helper()
 				if pi := probeCached(); !pi.Supported {
 					t.Skipf("io_uring 不可用: %s (kernel=%s)", pi.Reason, pi.KernelRelease)
 				}
-				r, err := NewWithOptions(Options{Mode: ModeIOUring, MaxEvents: maxEvents}, "")
+				r, err := NewWithOptions(Options{Mode: ModeIOUring, MaxEvents: maxEvents, FD: fd}, "")
 				if err != nil {
 					t.Fatalf("NewWithOptions(io_uring): %v", err)
 				}
@@ -291,15 +291,13 @@ func TestLinux510IOUringNative(t *testing.T) {
 // TestLibAIOBatchRoundTrip 批量读写往返：一次 io_submit 排入多条，校验序号连续、
 // 结果长度、数据一致性与部分提交后的重提。
 func TestLibAIOBatchRoundTrip(t *testing.T) {
-	r, err := newLibAIORing(16)
+	const n = 4
+	f := newTestFile(t, int64(n)*testChunk)
+	r, err := newLibAIORing(int(f.Fd()), 16)
 	if err != nil {
 		t.Fatalf("newLibAIORing: %v", err)
 	}
 	defer func() { _ = r.Close() }()
-
-	const n = 4
-	f := newTestFile(t, int64(n)*testChunk)
-	fd := int(f.Fd())
 
 	specs := make([]WriteSpec, n)
 	datas := make([][]byte, n)
@@ -307,7 +305,7 @@ func TestLibAIOBatchRoundTrip(t *testing.T) {
 		datas[i] = pattern(byte(i+1), testChunk)
 		specs[i] = WriteSpec{Buf: datas[i], Off: int64(i) * testChunk}
 	}
-	first, submitted, err := r.SubmitWriteBatch(fd, specs)
+	first, submitted, err := r.SubmitWriteBatch(specs)
 	if err != nil {
 		t.Fatalf("SubmitWriteBatch: %v", err)
 	}
@@ -338,7 +336,7 @@ func TestLibAIOBatchRoundTrip(t *testing.T) {
 		rbufs[i] = make([]byte, testChunk)
 		rspecs[i] = ReadSpec{Buf: rbufs[i], Off: int64(i) * testChunk}
 	}
-	firstR, submittedR, err := r.SubmitReadBatch(fd, rspecs)
+	firstR, submittedR, err := r.SubmitReadBatch(rspecs)
 	if err != nil || submittedR != n {
 		t.Fatalf("SubmitReadBatch: submitted=%d err=%v", submittedR, err)
 	}
@@ -366,38 +364,37 @@ func TestLibAIOBatchRoundTrip(t *testing.T) {
 	}
 
 	// 空批次：不占序号、不报错（n==0 提前返回，不进内核）。
-	if fs, ns, err := r.SubmitReadBatch(fd, nil); err != nil || ns != 0 || fs != 0 {
+	if fs, ns, err := r.SubmitReadBatch(nil); err != nil || ns != 0 || fs != 0 {
 		t.Errorf("空读批次 = (%d, %d, %v), want (0, 0, nil)", fs, ns, err)
 	}
-	if fs, ns, err := r.SubmitWriteBatch(fd, nil); err != nil || ns != 0 || fs != 0 {
+	if fs, ns, err := r.SubmitWriteBatch(nil); err != nil || ns != 0 || fs != 0 {
 		t.Errorf("空写批次 = (%d, %d, %v), want (0, 0, nil)", fs, ns, err)
 	}
 }
 
 // TestLibAIOContextErrors ctx 失效后各入口必须返回 errno 而不是静默成功或崩。
 func TestLibAIOContextErrors(t *testing.T) {
-	r, err := newLibAIORing(4)
+	f := newTestFile(t, testChunk)
+	r, err := newLibAIORing(int(f.Fd()), 4)
 	if err != nil {
 		t.Fatalf("newLibAIORing: %v", err)
 	}
 	l := r.(*ring)
 
-	f := newTestFile(t, testChunk)
-	fd := int(f.Fd())
 	buf := make([]byte, testChunk)
 
 	saved := l.ctx
 	l.ctx = 0 // 内核侧无此上下文：各系统调用返回 EINVAL
-	if _, err := l.SubmitRead(fd, buf, 0); !errors.Is(err, unix.EINVAL) {
+	if _, err := l.SubmitRead(buf, 0); !errors.Is(err, unix.EINVAL) {
 		t.Errorf("SubmitRead(ctx=0) err=%v want EINVAL", err)
 	}
-	if _, err := l.SubmitWrite(fd, buf, 0); !errors.Is(err, unix.EINVAL) {
+	if _, err := l.SubmitWrite(buf, 0); !errors.Is(err, unix.EINVAL) {
 		t.Errorf("SubmitWrite(ctx=0) err=%v want EINVAL", err)
 	}
-	if _, _, err := l.SubmitReadBatch(fd, []ReadSpec{{Buf: buf, Off: 0}}); !errors.Is(err, unix.EINVAL) {
+	if _, _, err := l.SubmitReadBatch([]ReadSpec{{Buf: buf, Off: 0}}); !errors.Is(err, unix.EINVAL) {
 		t.Errorf("SubmitReadBatch(ctx=0) err=%v want EINVAL", err)
 	}
-	if _, _, err := l.SubmitWriteBatch(fd, []WriteSpec{{Buf: buf, Off: 0}}); !errors.Is(err, unix.EINVAL) {
+	if _, _, err := l.SubmitWriteBatch([]WriteSpec{{Buf: buf, Off: 0}}); !errors.Is(err, unix.EINVAL) {
 		t.Errorf("SubmitWriteBatch(ctx=0) err=%v want EINVAL", err)
 	}
 	if _, err := l.Wait(0, 1, nil); !errors.Is(err, unix.EINVAL) {
@@ -422,7 +419,8 @@ func TestLibAIOContextErrors(t *testing.T) {
 // TestLibAIOWaitBounds Wait 的边界参数：max<=0 直接返回；max 超过复用缓冲容量时
 // 重建缓冲；无事件且给超时时返回 ErrTimeout + 空列表。
 func TestLibAIOWaitBounds(t *testing.T) {
-	r, err := newLibAIORing(2)
+	f := newTestFile(t, testChunk)
+	r, err := newLibAIORing(int(f.Fd()), 2)
 	if err != nil {
 		t.Fatalf("newLibAIORing: %v", err)
 	}
@@ -451,15 +449,14 @@ func TestLibAIOWaitBounds(t *testing.T) {
 
 // TestLibAIOSubmitReadBeyondEOF 越界读返回 0（libaio 侧事件归一化）。
 func TestLibAIOSubmitReadBeyondEOF(t *testing.T) {
-	r, err := newLibAIORing(4)
+	f := newTestFile(t, testChunk)
+	r, err := newLibAIORing(int(f.Fd()), 4)
 	if err != nil {
 		t.Fatalf("newLibAIORing: %v", err)
 	}
 	defer func() { _ = r.Close() }()
 
-	f := newTestFile(t, testChunk)
-	fd := int(f.Fd())
-	seq, err := r.SubmitRead(fd, make([]byte, testChunk), 4*testChunk)
+	seq, err := r.SubmitRead(make([]byte, testChunk), 4*testChunk)
 	if err != nil {
 		t.Fatalf("SubmitRead: %v", err)
 	}
@@ -490,7 +487,7 @@ func TestUringSetupRawInvalidEntries(t *testing.T) {
 // 夹取后小于请求值）都必须报错，不得按错误深度建出 ring。
 func TestUringEntryGuards(t *testing.T) {
 	for _, n := range []int{0, -3, 1<<16 + 1} {
-		r, err := newIOUringRing(n, false)
+		r, err := newIOUringRing(0, n, false) // fd 在 maxEvents 校验后才被使用
 		if err == nil {
 			_ = r.Close()
 			t.Errorf("newIOUringRing(%d) 应报错", n)
@@ -503,7 +500,7 @@ func TestUringEntryGuards(t *testing.T) {
 		_ = unix.Close(fd)
 	}
 	// 内核把 entries 夹到 IORING_MAX_ENTRIES(32768) < 请求值 → 参数校验必须拦住。
-	r, err := newIOUringRing(1<<16, false)
+	r, err := newIOUringRing(0, 1<<16, false)
 	if err == nil {
 		_ = r.Close()
 		t.Skip("本机内核未夹取 entries，跳过回填参数不足的分支")
@@ -516,26 +513,24 @@ func TestUringEntryGuards(t *testing.T) {
 // TestUringDepthLimit 在途上限复刻 libaio 队列深度语义：超出的部分被截断，
 // 截断后序号不重叠，全部在途时返回 ErrFull，收割后可继续提交。
 func TestUringDepthLimit(t *testing.T) {
-	r, err := newIOUringRing(4, false)
+	f := newTestFile(t, 8*testChunk)
+	r, err := newIOUringRing(int(f.Fd()), 4, false)
 	if err != nil {
 		t.Skipf("io_uring 不可用: %v", err)
 	}
 	defer func() { _ = r.Close() }()
-
-	f := newTestFile(t, 8*testChunk)
-	fd := int(f.Fd())
 
 	specs := make([]ReadSpec, 6)
 	for i := range specs {
 		specs[i] = ReadSpec{Buf: make([]byte, testChunk), Off: int64(i) * testChunk}
 	}
 
-	first, n, err := r.SubmitReadBatch(fd, specs[:3])
+	first, n, err := r.SubmitReadBatch(specs[:3])
 	if err != nil || n != 3 {
 		t.Fatalf("首批提交 submitted=%d err=%v want 3, nil", n, err)
 	}
 	// depth=4 且已有 3 条在途 → 第二批只能排入 1 条。
-	first2, n2, err := r.SubmitReadBatch(fd, specs[3:])
+	first2, n2, err := r.SubmitReadBatch(specs[3:])
 	if err != nil || n2 != 1 {
 		t.Fatalf("截断提交 submitted=%d err=%v want 1, nil", n2, err)
 	}
@@ -543,10 +538,10 @@ func TestUringDepthLimit(t *testing.T) {
 		t.Errorf("截断后首序号 %d want %d（序号不得重叠）", first2, first+3)
 	}
 	// 在途已达 depth → ErrFull（单条提交同样受限）
-	if _, _, err := r.SubmitReadBatch(fd, specs[:1]); err != ierr.ErrFull {
+	if _, _, err := r.SubmitReadBatch(specs[:1]); err != ierr.ErrFull {
 		t.Errorf("SubmitReadBatch 在途满 err=%v want ErrFull", err)
 	}
-	if _, err := r.SubmitRead(fd, make([]byte, testChunk), 0); err != ierr.ErrFull {
+	if _, err := r.SubmitRead(make([]byte, testChunk), 0); err != ierr.ErrFull {
 		t.Errorf("SubmitRead 在途满 err=%v want ErrFull", err)
 	}
 
@@ -563,7 +558,7 @@ func TestUringDepthLimit(t *testing.T) {
 			t.Errorf("seq=%d res=%d want %d", ev.Data, ev.Res, testChunk)
 		}
 	}
-	seq, err := r.SubmitRead(fd, make([]byte, testChunk), 0)
+	seq, err := r.SubmitRead(make([]byte, testChunk), 0)
 	if err != nil {
 		t.Fatalf("收割后 SubmitRead: %v", err)
 	}
@@ -575,19 +570,18 @@ func TestUringDepthLimit(t *testing.T) {
 // TestUringSubmitEmptyBatchAndAfterClose 空批次不占序号；Close 后所有提交入口返回 EBADF
 // （必须先拦在入口，避免访问已解除映射的内存）。
 func TestUringSubmitEmptyBatchAndAfterClose(t *testing.T) {
-	r, err := newIOUringRing(4, false)
+	f := newTestFile(t, testChunk)
+	r, err := newIOUringRing(int(f.Fd()), 4, false)
 	if err != nil {
 		t.Skipf("io_uring 不可用: %v", err)
 	}
-	if fs, n, err := r.SubmitReadBatch(0, nil); err != nil || n != 0 || fs != 0 {
+	if fs, n, err := r.SubmitReadBatch(nil); err != nil || n != 0 || fs != 0 {
 		t.Errorf("空读批次 = (%d, %d, %v), want (0, 0, nil)", fs, n, err)
 	}
-	if fs, n, err := r.SubmitWriteBatch(0, nil); err != nil || n != 0 || fs != 0 {
+	if fs, n, err := r.SubmitWriteBatch(nil); err != nil || n != 0 || fs != 0 {
 		t.Errorf("空写批次 = (%d, %d, %v), want (0, 0, nil)", fs, n, err)
 	}
 
-	f := newTestFile(t, testChunk)
-	fd := int(f.Fd())
 	if err := r.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -596,16 +590,16 @@ func TestUringSubmitEmptyBatchAndAfterClose(t *testing.T) {
 	}
 
 	buf := make([]byte, testChunk)
-	if _, err := r.SubmitRead(fd, buf, 0); !errors.Is(err, unix.EBADF) {
+	if _, err := r.SubmitRead(buf, 0); !errors.Is(err, unix.EBADF) {
 		t.Errorf("Close 后 SubmitRead err=%v want EBADF", err)
 	}
-	if _, err := r.SubmitWrite(fd, buf, 0); !errors.Is(err, unix.EBADF) {
+	if _, err := r.SubmitWrite(buf, 0); !errors.Is(err, unix.EBADF) {
 		t.Errorf("Close 后 SubmitWrite err=%v want EBADF", err)
 	}
-	if _, _, err := r.SubmitReadBatch(fd, []ReadSpec{{Buf: buf}}); !errors.Is(err, unix.EBADF) {
+	if _, _, err := r.SubmitReadBatch([]ReadSpec{{Buf: buf}}); !errors.Is(err, unix.EBADF) {
 		t.Errorf("Close 后 SubmitReadBatch err=%v want EBADF", err)
 	}
-	if _, _, err := r.SubmitWriteBatch(fd, []WriteSpec{{Buf: buf}}); !errors.Is(err, unix.EBADF) {
+	if _, _, err := r.SubmitWriteBatch([]WriteSpec{{Buf: buf}}); !errors.Is(err, unix.EBADF) {
 		t.Errorf("Close 后 SubmitWriteBatch err=%v want EBADF", err)
 	}
 }
@@ -613,20 +607,18 @@ func TestUringSubmitEmptyBatchAndAfterClose(t *testing.T) {
 // TestUringEnterFailureKeepsRingUsable io_uring_enter 失败（未消费任何 SQE）时必须撤销
 // 发布，ring 仍可继续提交，且 SQE 槽位/序号可复用。
 func TestUringEnterFailureKeepsRingUsable(t *testing.T) {
-	r, err := newIOUringRing(4, false)
+	f := newTestFile(t, testChunk)
+	r, err := newIOUringRing(int(f.Fd()), 4, false)
 	if err != nil {
 		t.Skipf("io_uring 不可用: %v", err)
 	}
 	u := r.(*uringRing)
 	defer func() { _ = r.Close() }()
 
-	f := newTestFile(t, testChunk)
-	fd := int(f.Fd())
-
 	// 把 ring fd 换成非法值，制造 enter 失败（模拟 EINTR/EBADF 类瞬时错误）。
 	saved := u.fd
 	u.fd = -1
-	_, n, err := u.submit(fd, []ReadSpec{{Buf: make([]byte, testChunk)}}, ioringOpRead)
+	_, n, err := u.submit([]ReadSpec{{Buf: make([]byte, testChunk)}}, ioringOpRead)
 	u.fd = saved
 	if err == nil {
 		t.Fatalf("enter 失败时应返回 errno（n=%d）", n)
@@ -636,7 +628,7 @@ func TestUringEnterFailureKeepsRingUsable(t *testing.T) {
 	}
 
 	// 撤销发布后必须能重新提交且序号从 1 开始（失败的那条不占序号）。
-	seq, err := r.SubmitRead(fd, make([]byte, testChunk), 0)
+	seq, err := r.SubmitRead(make([]byte, testChunk), 0)
 	if err != nil {
 		t.Fatalf("失败后重新提交: %v", err)
 	}
@@ -701,16 +693,15 @@ func TestUringWaitNoIO(t *testing.T) {
 
 // TestUringWaitTimedSuccess 定时 Wait 在事件到达时从非超时出口返回（与 libaio 语义对齐）。
 func TestUringWaitTimedSuccess(t *testing.T) {
-	r, err := newIOUringRing(4, false)
+	f := newTestFile(t, testChunk)
+	r, err := newIOUringRing(int(f.Fd()), 4, false)
 	if err != nil {
 		t.Skipf("io_uring 不可用: %v", err)
 	}
 	defer func() { _ = r.Close() }()
 
-	f := newTestFile(t, testChunk)
-	fd := int(f.Fd())
 	buf := make([]byte, testChunk)
-	seq, err := r.SubmitRead(fd, buf, 0)
+	seq, err := r.SubmitRead(buf, 0)
 	if err != nil {
 		t.Fatalf("SubmitRead: %v", err)
 	}
@@ -757,24 +748,22 @@ func TestUringMapReadOnlyFd(t *testing.T) {
 // TestUringWaitTimedBlockingRead 大块 O_DIRECT 读在首次零系统调用收割时通常尚未完成，
 // Wait 必须走 ppoll 等待，事件到达后从「非超时」出口返回，且读回数据要与写入一致。
 func TestUringWaitTimedBlockingRead(t *testing.T) {
-	r, err := newIOUringRing(4, false)
-	if err != nil {
-		t.Skipf("io_uring 不可用: %v", err)
-	}
-	defer func() { _ = r.Close() }()
-
 	f, err := os.OpenFile(filepath.Join(t.TempDir(), "aio-uring-blocking"),
 		os.O_RDWR|os.O_CREATE|syscall.O_DIRECT, 0o600)
 	if err != nil {
 		t.Skipf("O_DIRECT unsupported: %v", err)
 	}
 	defer func() { _ = f.Close() }()
-	fd := int(f.Fd())
+	r, err := newIOUringRing(int(f.Fd()), 4, false)
+	if err != nil {
+		t.Skipf("io_uring 不可用: %v", err)
+	}
+	defer func() { _ = r.Close() }()
 
 	const n = 4 << 20
 	wbuf := alignedBuf(n)
 	copy(wbuf, pattern(0x5A, n))
-	if _, err := r.SubmitWrite(fd, wbuf, 0); err != nil {
+	if _, err := r.SubmitWrite(wbuf, 0); err != nil {
 		t.Fatalf("SubmitWrite: %v", err)
 	}
 	if evs, err := r.Wait(1, 1, nil); err != nil || len(evs) != 1 || evs[0].Res != n {
@@ -782,7 +771,7 @@ func TestUringWaitTimedBlockingRead(t *testing.T) {
 	}
 
 	rbuf := alignedBuf(n)
-	seq, err := r.SubmitRead(fd, rbuf, 0)
+	seq, err := r.SubmitRead(rbuf, 0)
 	if err != nil {
 		t.Fatalf("SubmitRead: %v", err)
 	}
@@ -1194,7 +1183,8 @@ func TestProbeCached(t *testing.T) {
 
 // TestBackendNameAndQueueDepth 日志用的后端名与队列深度判定。
 func TestBackendNameAndQueueDepth(t *testing.T) {
-	lr, err := newLibAIORing(4)
+	testf := newTestFile(t, testChunk)
+	lr, err := newLibAIORing(int(testf.Fd()), 4)
 	if err != nil {
 		t.Fatalf("newLibAIORing: %v", err)
 	}
@@ -1206,7 +1196,7 @@ func TestBackendNameAndQueueDepth(t *testing.T) {
 		t.Errorf("libaio 无 io_uring 队列深度，得到 (%d, %d, %v)", sq, cq, ok)
 	}
 
-	ur, err := newIOUringRing(8, false)
+	ur, err := newIOUringRing(int(testf.Fd()), 8, false)
 	if err != nil {
 		t.Skipf("io_uring 不可用: %v", err)
 	}

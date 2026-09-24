@@ -255,11 +255,11 @@ doc/{README.md, 设计文档/, 性能测试报告/, 部署记录/}
 
 ### 例外一 · 实现导出接口的方法（硬性，无法避免）
 
-Go 不允许实现导出接口的方法私有。`internal/aio` 的 `Ring` 接口（`internal/aio/aio.go:61-88`）声明了 `SubmitRead` / `SubmitWrite` / `Wait` / `Close`，所以三个后端类型上的同名方法**必须**导出：
+Go 不允许实现导出接口的方法私有。`internal/aio` 的 `Ring` 接口（`internal/aio/aio.go:64-91`）声明了 `SubmitRead` / `SubmitWrite` / `Wait` / `Close`，所以三个后端类型上的同名方法**必须**导出：
 
 | 文件 | 导出方法 | **包级导出** |
 |---|---|---|
-| `internal/aio/aio_libaio_linux.go` | 6 个（`SubmitRead:71` … `Close:228`） | **0** |
+| `internal/aio/aio_libaio_linux.go` | 6 个（`SubmitRead:72` … `Close:229`） | **0** |
 | `internal/aio/aio_fallback_other.go` | 6 个 | **0** |
 | `internal/aio/aio_uring_linux.go` | 6 个 | **0** |
 | `internal/aio/aio_uring_params_linux.go` | 1 个（`uringParamError.Error:103`） | **0** |

@@ -59,7 +59,7 @@ ErrTooLarge = errors.New("taihu: object too large, exceeds segment size")
 |---|---|---|---|
 | `ErrNotFound` / `ErrInvalidRange` / `ErrTooLarge` / `ErrNoSpace` / `ErrShortWrite` | ✅ | ✅ | 会作为 `Storage` 方法返回值到达调用方 |
 | `ErrConflict` | ✅ | ❌ | compaction 内部的 CAS 控制信号，客户端收不到（`internal/rpcclient/reexport.go:30` 已注明） |
-| `ErrFull` / `ErrTimeout` | ✅ | ❌ | `device` ↔ `aio` 的流控信号：只在重试判断里被 `==` 比较（`internal/device/device.go:221`、`:521`），从不出现在任何导出签名里 |
+| `ErrFull` / `ErrTimeout` | ✅ | ❌ | `device` ↔ `aio` 的流控信号：只在重试判断里被 `==` 比较（`internal/device/device.go:214`、`:513`），从不出现在任何导出签名里 |
 
 **所以新增 sentinel 要问两步**：内部有没有人跨包判断它（决定进不进 `ierr`）、客户端会不会收到它（决定进不进白名单）。只做第一步，SDK 调用方就 `errors.Is` 不了；只做第二步而不进 `ierr`，内部又立了第二个事实源。
 

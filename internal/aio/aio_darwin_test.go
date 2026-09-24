@@ -53,9 +53,9 @@ func fallbackBackend(t *testing.T) backend {
 	t.Helper()
 	return backend{
 		name: "fallback",
-		new: func(t *testing.T, maxEvents int) Ring {
+		new: func(t *testing.T, fd, maxEvents int) Ring {
 			t.Helper()
-			r, err := NewWithOptions(Options{Mode: ModeLibAIO, MaxEvents: maxEvents}, "")
+			r, err := NewWithOptions(Options{Mode: ModeLibAIO, MaxEvents: maxEvents, FD: fd}, "")
 			if err != nil {
 				t.Fatalf("NewWithOptions(fallback): %v", err)
 			}

@@ -43,7 +43,7 @@ type ReadJob struct {
     Size      int64
 }
 
-// ReadAtIntoBatch 一次 io_submit 批量提交多条段内直读（同一 fd、同一 ring），
+// ReadAtIntoBatch 一次 io_submit 批量提交多条段内直读（同一 ring 及其绑定的 fd），
 // 全部完成后按 jobs 顺序返回各项读入字节数。批内项不满足直读快路径时单项回退，
 // 整批提交失败（队列满/截断）时全量回退逐条。语义与逐条完全等价。
 func (d *Device) ReadAtIntoBatch(ctx context.Context, jobs []ReadJob) ([]int64, error)
@@ -71,7 +71,7 @@ type AppendJob struct {
 func (d *Device) AppendBatch(ctx context.Context, jobs []AppendJob) error
 ```
 
-- **aio 层配套**：`Ring` 需新增 `SubmitWriteBatch(fd int, specs []WriteSpec) (firstSeq uint64, submitted int, err error)`，
+- **aio 层配套**：`Ring` 需新增 `SubmitWriteBatch(specs []WriteSpec) (firstSeq uint64, submitted int, err error)`　（*归档注：fd 已随「fd 下沉」重构移出，绑定在 `Options.FD`*），
   复用现有 `submitBatch`（其已按 `op uint16` 泛化，传 `opcodePwrite` 即可）；`WriteSpec` 与 `ReadSpec` 同构（Buf+Off）。
 - 写完成事件校验沿用 `checkWrite`（Res < 0 → -errno；Res != want → short write）。
 - 数据一致性保证沿用现状：batch 内各项独立落定；全部完成才返回（对外保持同步语义）。
@@ -161,9 +161,9 @@ func (s *Storage) ReadAt(ctx context.Context, key string, off, size int64) ([]by
 
 | 文件 | 改动 |
 |------|------|
-| `aio/aio.go` | 新增 `WriteSpec`（Buf+Off 同构 ReadSpec）；`Ring` 接口新增 `SubmitWriteBatch` |
-| `aio/aio_libaio_linux.go` | `SubmitWriteBatch` = `submitBatch(fd, specs, opcodePwrite)`（复用泛化实现） |
-| `aio/aio_uring_linux.go` | `SubmitWriteBatch` 走 `submit(fd, specs, ioringOpWrite)`（复用已在的 write 提交） |
+| `aio/aio.go` | 新增 `WriteSpec`（Buf+Off 同构 ReadSpec）；`Ring` 接口新增 `SubmitWriteBatch`　（*归档注：后续「fd 下沉」重构后 `SubmitWriteBatch(specs)` 不再带 fd 参数*） |
+| `aio/aio_libaio_linux.go` | `SubmitWriteBatch` = `submitBatch(specs, opcodePwrite)`（复用泛化实现） |
+| `aio/aio_uring_linux.go` | `SubmitWriteBatch` 走 `submit(specs, ioringOpWrite)`（复用已在的 write 提交） |
 | `aio/aio_fallback_other.go` | `SubmitWriteBatch` = goroutine + pwrite 逐条兜底 |
 
 ## 5. 边界与风险

@@ -132,7 +132,7 @@ t.Cleanup(func() {          // 还原，避免污染同包其他用例
 
 | 维度 | 影响 |
 |---|---|
-| **公开 API** | 无变化。`Ring` 接口、`Mode`、`NewWithOptions`、`Probe` 的签名与语义全部不动 |
+| **公开 API** | 无变化。`Ring` 接口、`Mode`、`NewWithOptions`、`Probe` 的签名与语义全部不动　（*归档注：此结论仅对本任务时段成立；后续「fd 下沉到 ring 构造」重构已改动 `Ring` 四个提交方法签名（去 fd）并给 `Options` 增加 `FD` 字段*） |
 | **行为（R2）** | 非 Linux 平台上 `NewWithOptions(65537, …)` 由「成功」变「返回 `errInvalidMaxEvents`」。**是收紧**，且生产路径传 `256`，不可达 |
 | **Linux 生产路径** | 完全不变。R2 只改 `aio_fallback_other.go`（`!linux`）；R1/R3 只动测试；R12 的五处是等价改写 |
 | **测试** | `internal/aio/aio_linux_test.go` 减少两个测试（移走，不是删除）；新增两个测试文件（无 tag） |

@@ -35,13 +35,13 @@ import (
 
 // ── 提交与完成的数据形状 ──────────────────────────────────────────────
 
-// ReadSpec 批读的一个提交项：读 off 处 len(Buf) 字节到 Buf。同一批共享同一 fd。
+// ReadSpec 批读的一个提交项：从 ring 构造时绑定的 fd 上 off 处读 len(Buf) 字节到 Buf。
 type ReadSpec struct {
 	Buf []byte
 	Off int64
 }
 
-// WriteSpec 批写的一个提交项：把 Buf 的前 len(Buf) 字节写到 off 处。同一批共享同一 fd。
+// WriteSpec 批写的一个提交项：把 Buf 的前 len(Buf) 字节写到 ring 构造时绑定的 fd 上 off 处。
 // buf 在 Submit 后、对应完成事件被 Wait 取回前必须保持存活且不被改写（与 ReadSpec 同约束）。
 type WriteSpec struct {
 	Buf []byte
@@ -58,25 +58,28 @@ type Event struct {
 
 // Ring 异步 IO 完成队列。同一 Ring 可被多个 goroutine 并发 Submit，
 // Wait 应串行调用（或由单一完成泵 goroutine 持有）。
+//
+// 提交目标 fd 在构造时绑定（Options.FD），Submit*/Batch 不再逐次传 fd —— 一个 ring
+// 只服务一个设备（taihu 的拓扑：一个设备 1 个 fd、ring 与设备一对一）。
 type Ring interface {
-	// SubmitRead 异步读 fd 上 off 处 len(buf) 字节到 buf，返回关联序号。
+	// SubmitRead 异步读绑定的 fd 上 off 处 len(buf) 字节到 buf，返回关联序号。
 	// 队列满时返回 ErrFull（Wait 回收后重试）。
-	SubmitRead(fd int, buf []byte, off int64) (uint64, error)
+	SubmitRead(buf []byte, off int64) (uint64, error)
 
-	// SubmitReadBatch 一次 io_submit 批量提交多条异步读（同一 fd，摊薄 syscall）。
+	// SubmitReadBatch 一次 io_submit 批量提交多条异步读（摊薄 syscall）。
 	// 返回首个关联序号 firstSeq（第 i 项序号 = firstSeq+i，i∈[0,submitted)）与成功排队
 	// 条数 submitted。submitted 可能 < len(specs)（内核提交队列截断），调用方须把未排队
 	// 部分追加提交；队列满且一条未排入时返回 ErrFull。各 buf 须存活到完成事件被取回。
-	SubmitReadBatch(fd int, specs []ReadSpec) (firstSeq uint64, submitted int, err error)
+	SubmitReadBatch(specs []ReadSpec) (firstSeq uint64, submitted int, err error)
 
-	// SubmitWrite 异步写 buf 到 fd 上 off 处，返回关联序号。语义同 SubmitRead。
-	SubmitWrite(fd int, buf []byte, off int64) (uint64, error)
+	// SubmitWrite 异步写 buf 到绑定的 fd 上 off 处，返回关联序号。语义同 SubmitRead。
+	SubmitWrite(buf []byte, off int64) (uint64, error)
 
-	// SubmitWriteBatch 一次 io_submit 批量提交多条异步写（同一 fd，摊薄 syscall）。
+	// SubmitWriteBatch 一次 io_submit 批量提交多条异步写（摊薄 syscall）。
 	// 返回首个关联序号 firstSeq（第 i 项序号 = firstSeq+i，i∈[0,submitted)）与成功排队
 	// 条数 submitted。submitted 可能 < len(specs)（内核提交队列截断），调用方须把未排队
 	// 部分追加提交；队列满且一条未排入时返回 ErrFull。各 buf 须存活到完成事件被取回。
-	SubmitWriteBatch(fd int, specs []WriteSpec) (firstSeq uint64, submitted int, err error)
+	SubmitWriteBatch(specs []WriteSpec) (firstSeq uint64, submitted int, err error)
 
 	// Wait 取回完成事件：阻塞至至少 min 个事件完成或 timeout 到期（timeout 为 nil 表示无限等待）。
 	// 返回最多 max 个事件；超时时返回已取回的部分事件（可能少于 min，error 为 ErrTimeout）。
@@ -115,9 +118,15 @@ func ParseMode(s string) (Mode, error) {
 }
 
 // Options 创建异步 IO 队列的参数，只描述队列自身。
-// 设备上下文不在此处 —— 「目标块设备路径」仅 IOPoll 前置校验需要，由 NewWithOptions 的
-// 独立参数提供（校验前它对该队列没有任何意义）。
+// 设备上下文分为两部分：「目标块设备路径」仅 IOPoll 前置校验需要，由 NewWithOptions 的
+// 独立参数提供；「目标设备 fd」随队列绑定，放在 FD 字段（校验前它们对队列都没有意义，
+// 但 fd 是本队列提交 IO 的落点，离开它队列无法工作）。
 type Options struct {
+	// FD 该队列绑定的设备文件描述符：Submit*/Batch 提交 IO 时都使用它，不再逐次传入。
+	// 调用方须保证 FD 在 ring 存活期内保持有效（关闭前先 ring.Close）；ring 不负责关闭 FD。
+	// 构造时不校验有效性 —— FD 非法（如 0 或已关闭）时在提交期由内核返回 errno，与
+	// 下沉前的逐次传 fd 语义一致。
+	FD int
 	// Mode 后端选择，零值为 ModeAuto。
 	Mode Mode
 	// MaxEvents 队列深度上限：libaio 为 io_setup 的 maxEvents，
@@ -159,14 +168,14 @@ func NewWithOptions(o Options, devPath string) (Ring, error) {
 
 	switch o.Mode {
 	case ModeIOUring:
-		r, err := newIOUringRing(o.MaxEvents, o.IOPoll)
+		r, err := newIOUringRing(o.FD, o.MaxEvents, o.IOPoll)
 		if err != nil {
 			return nil, err
 		}
 		logBackend(r, "forced on"+iopollSuffix(o.IOPoll))
 		return r, nil
 	case ModeLibAIO:
-		r, err := newLibAIORing(o.MaxEvents)
+		r, err := newLibAIORing(o.FD, o.MaxEvents)
 		if err != nil {
 			return nil, err
 		}
@@ -177,7 +186,7 @@ func NewWithOptions(o Options, devPath string) (Ring, error) {
 	// ModeAuto：运行期探测（不比较版本号，见 probeCached）。
 	pi := probeCached()
 	if pi.Supported {
-		r, err := newIOUringRing(o.MaxEvents, o.IOPoll)
+		r, err := newIOUringRing(o.FD, o.MaxEvents, o.IOPoll)
 		if err != nil {
 			return nil, err
 		}
@@ -185,7 +194,7 @@ func NewWithOptions(o Options, devPath string) (Ring, error) {
 			pi.Features, iopollSuffix(o.IOPoll)))
 		return r, nil
 	}
-	r, err := newLibAIORing(o.MaxEvents)
+	r, err := newLibAIORing(o.FD, o.MaxEvents)
 	if err != nil {
 		return nil, err
 	}

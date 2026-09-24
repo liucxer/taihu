@@ -52,25 +52,25 @@ func (f *fakeRing) enqueue(buf []byte) {
 	f.comps = append(f.comps, aio.Event{Data: f.seq, Res: res})
 }
 
-func (f *fakeRing) SubmitRead(fd int, buf []byte, off int64) (uint64, error) {
+func (f *fakeRing) SubmitRead(buf []byte, off int64) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.enqueue(buf)
 	return f.seq, nil
 }
 
-func (f *fakeRing) SubmitWrite(fd int, buf []byte, off int64) (uint64, error) {
+func (f *fakeRing) SubmitWrite(buf []byte, off int64) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.enqueue(buf)
 	return f.seq, nil
 }
 
-func (f *fakeRing) SubmitReadBatch(fd int, specs []aio.ReadSpec) (uint64, int, error) {
+func (f *fakeRing) SubmitReadBatch(specs []aio.ReadSpec) (uint64, int, error) {
 	return f.batch(len(specs), func(i int) []byte { return specs[i].Buf })
 }
 
-func (f *fakeRing) SubmitWriteBatch(fd int, specs []aio.WriteSpec) (uint64, int, error) {
+func (f *fakeRing) SubmitWriteBatch(specs []aio.WriteSpec) (uint64, int, error) {
 	return f.batch(len(specs), func(i int) []byte { return specs[i].Buf })
 }
 

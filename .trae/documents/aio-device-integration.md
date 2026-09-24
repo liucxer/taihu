@@ -8,7 +8,7 @@
 
 ## 设计
 
-Device 内部持有一个 `aio.Ring` + 一个完成泵 goroutine：
+Device 内部持有一个 `aio.Ring` + 一个完成泵 goroutine：（*归档注：本文记录接入初期的设计；`aio.New` 已被 `NewWithOptions` 取代，且「fd 下沉」重构后 fd 绑定在 `Options.FD`、`ring.Submit*` 不再带 fd 参数*）
 
 - **泵**（唯一调用 `ring.Wait` 者）：`Wait(1, 64, &200ms)` 轮询取回事件，锁内按 `Event.Data`（seq）查 m/pending 分发到提交方通道，锁外发送（chan cap=1 不阻塞）。用 200ms 超时避免「泵阻塞在 Wait 时 Close 被调用、无在途事件导致永不唤醒」的挂起。
 - **提交方**：锁外 `ring.Submit*`（ErrFull 时 100µs 短睡重试、检查 ctx/closed）→ 锁内原子完成「closed 检查 + pending 消费 + 注册 m」，再 `<-ch` 阻塞等事件。`pending` 表解决「io_submit 已返回、泵已取回事件、提交方尚未注册通道」的竞态（事件不丢不重）。

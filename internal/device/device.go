@@ -86,7 +86,7 @@ func NewDevice(ctx context.Context, nvmePath string, segSize int64, opts ...Opti
 		// IOPOLL 的前置条件校验（设备队列轮询）由 aio 层在确实会建 io_uring 环时完成，
 		// 故此处把设备路径一并传入 —— 「最终走哪个后端」的决策只在 aio 层知道。
 		ring, err = aio.NewWithOptions(
-			aio.Options{Mode: o.aioMode, MaxEvents: aioDepth, IOPoll: o.aioIOPoll}, nvmePath)
+			aio.Options{Mode: o.aioMode, MaxEvents: aioDepth, IOPoll: o.aioIOPoll, FD: int(f.Fd())}, nvmePath)
 		if err != nil {
 			_ = f.Close()
 			return nil, fmt.Errorf("taihu: create aio ring: %w", err)
@@ -187,7 +187,6 @@ func (d *Device) submitOp(buf []byte, off int64, read bool) (aio.Event, error) {
 // submitOpN 是 submitOp 的实现；count 为 false 时不计入 IO 尺寸统计
 // （批路径已按逻辑项统计过尺寸，重提不重复计数）。
 func (d *Device) submitOpN(buf []byte, off int64, read bool, count bool) (aio.Event, error) {
-	fd := int(d.f.Fd())
 	var retries int
 	for {
 		d.mu.Lock()
@@ -201,9 +200,9 @@ func (d *Device) submitOpN(buf []byte, off int64, read bool, count bool) (aio.Ev
 		var seq uint64
 		var err error
 		if read {
-			seq, err = d.ring.SubmitRead(fd, buf, off)
+			seq, err = d.ring.SubmitRead(buf, off)
 		} else {
-			seq, err = d.ring.SubmitWrite(fd, buf, off)
+			seq, err = d.ring.SubmitWrite(buf, off)
 		}
 
 		ch := make(chan aio.Event, 1)
@@ -494,7 +493,6 @@ func (d *Device) AppendBatch(ctx context.Context, jobs []WriteJob) error {
 		return nil
 	}
 
-	fd := int(d.f.Fd())
 	var firstErr error
 	remaining := specs
 	for len(remaining) > 0 {
@@ -511,7 +509,7 @@ func (d *Device) AppendBatch(ctx context.Context, jobs []WriteJob) error {
 		for i := range chunk {
 			rs[i] = aio.WriteSpec{Buf: chunk[i].buf, Off: chunk[i].off}
 		}
-		first, n, err := d.ring.SubmitWriteBatch(fd, rs)
+		first, n, err := d.ring.SubmitWriteBatch(rs)
 		if err == ierr.ErrFull || n == 0 {
 			// 队列满且一条未排入：让出后重试整块（未推进 seq，不丢 IO）。
 			d.mu.Lock()
@@ -668,7 +666,6 @@ func (d *Device) ReadAtIntoBatch(ctx context.Context, jobs []ReadJob) ([]int64, 
 		return d.readJobsIndividually(ctx, jobs)
 	}
 
-	fd := int(d.f.Fd())
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()
@@ -677,7 +674,7 @@ func (d *Device) ReadAtIntoBatch(ctx context.Context, jobs []ReadJob) ([]int64, 
 	d.inSubmit += len(specs0)
 	d.mu.Unlock()
 
-	firstSeq, submitted, err := d.ring.SubmitReadBatch(fd, specs0)
+	firstSeq, submitted, err := d.ring.SubmitReadBatch(specs0)
 	if err != nil || submitted == 0 {
 		d.mu.Lock()
 		d.inSubmit -= len(specs0)

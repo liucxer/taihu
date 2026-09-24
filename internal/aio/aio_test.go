@@ -45,11 +45,11 @@ const (
 // 设备未开队列轮询时请求会停在 iopoll_list 上），要报错而不是把测试挂死。
 var ioTimeout = 30 * time.Second
 
-// backend 一个待测的后端实现。new 负责建好队列；后端在当前机器不可用时应 t.Skipf
-// （带上原因，避免「静默跳过」在日志里看起来和「通过」一样）。
+// backend 一个待测的后端实现。new 负责建好队列并绑定目标 fd；后端在当前机器不可用时应
+// t.Skipf（带上原因，避免「静默跳过」在日志里看起来和「通过」一样）。
 type backend struct {
 	name string
-	new  func(t *testing.T, maxEvents int) Ring
+	new  func(t *testing.T, fd int, maxEvents int) Ring
 	// depthLimit 该后端是否有队列深度上限（满了会返回 ErrFull）。
 	// libaio/io_uring 有；非 Linux 兜底实现没有（逐条起 goroutine，永不 ErrFull）。
 	depthLimit bool
@@ -156,16 +156,15 @@ func runRingContract(t *testing.T, b backend, ch testChannel) {
 func contractRoundTrip(t *testing.T, b backend, ch testChannel) {
 	for _, size := range ioSizeTable {
 		t.Run(sizeName(size), func(t *testing.T) {
-			r := b.new(t, contractDepth)
-			defer closeRing(t, r)
 			f, vf := ch.open(t, int64(size))
-			fd := int(f.Fd())
+			r := b.new(t, int(f.Fd()), contractDepth)
+			defer closeRing(t, r)
 
 			// 方向一：ring 写 → 独立读校验
 			want := pattern(0x5A, size)
 			wbuf := ch.buf(size)
 			copy(wbuf, want)
-			if ev := ringWrite(t, r, fd, wbuf, 0); ev.Res != int64(size) {
+			if ev := ringWrite(t, r, wbuf, 0); ev.Res != int64(size) {
 				t.Fatalf("写完成字节数 = %d, want %d", ev.Res, size)
 			}
 			got := ch.buf(size)
@@ -180,7 +179,7 @@ func contractRoundTrip(t *testing.T, b backend, ch testChannel) {
 			copy(wbuf2, want2)
 			fileWriteAt(t, vf, wbuf2, 0)
 			rbuf := ch.buf(size)
-			if ev := ringRead(t, r, fd, rbuf, 0); ev.Res != int64(size) {
+			if ev := ringRead(t, r, rbuf, 0); ev.Res != int64(size) {
 				t.Fatalf("读完成字节数 = %d, want %d", ev.Res, size)
 			}
 			if !bytes.Equal(rbuf, want2) {
@@ -196,10 +195,9 @@ func contractBatch(t *testing.T, b backend, ch testChannel) {
 	for _, size := range ioSizeTable {
 		t.Run(sizeName(size), func(t *testing.T) {
 			n := batchCount(size)
-			r := b.new(t, contractDepth)
-			defer closeRing(t, r)
 			f, vf := ch.open(t, int64(n)*int64(size))
-			fd := int(f.Fd())
+			r := b.new(t, int(f.Fd()), contractDepth)
+			defer closeRing(t, r)
 
 			// 方向一：SubmitWriteBatch → Wait → 独立读校验
 			want := make([][]byte, n)
@@ -216,7 +214,7 @@ func contractBatch(t *testing.T, b backend, ch testChannel) {
 			// firstSeq+i」关联，跨轮不得重复。
 			seqOf := make([]uint64, n)
 			for done := 0; done < n; {
-				first, submitted, err := r.SubmitWriteBatch(fd, specs[done:])
+				first, submitted, err := r.SubmitWriteBatch(specs[done:])
 				if err != nil {
 					t.Fatalf("SubmitWriteBatch（第 %d/%d 条起）: %v", done, n, err)
 				}
@@ -261,7 +259,7 @@ func contractBatch(t *testing.T, b backend, ch testChannel) {
 			rseqOf := make([]uint64, n)
 			var firstR uint64
 			for done := 0; done < n; {
-				first, submitted, errR := r.SubmitReadBatch(fd, rspecs[done:])
+				first, submitted, errR := r.SubmitReadBatch(rspecs[done:])
 				if errR != nil {
 					t.Fatalf("SubmitReadBatch（第 %d/%d 条起）: %v", done, n, errR)
 				}
@@ -324,9 +322,6 @@ func assertBatchEvents(t *testing.T, evs []Event, seqOf []uint64, size int, what
 // Event.Data 关联（Linux 上完成顺序不保证与提交顺序一致），以及混合尺寸下每条的
 // 字节数与内容都对得上。
 func contractInflightMixed(t *testing.T, b backend, ch testChannel) {
-	r := b.new(t, contractDepth)
-	defer closeRing(t, r)
-
 	offs := make([]int64, len(ioSizeTable))
 	var total int64
 	for i, size := range ioSizeTable {
@@ -334,7 +329,8 @@ func contractInflightMixed(t *testing.T, b backend, ch testChannel) {
 		total += int64(size)
 	}
 	f, vf := ch.open(t, total)
-	fd := int(f.Fd())
+	r := b.new(t, int(f.Fd()), contractDepth)
+	defer closeRing(t, r)
 
 	// 写：把各档尺寸全部发出后再统一收割。
 	want := make([][]byte, len(ioSizeTable))
@@ -344,7 +340,7 @@ func contractInflightMixed(t *testing.T, b backend, ch testChannel) {
 		want[i] = pattern(byte(0x10+i), size)
 		bufs[i] = ch.buf(size)
 		copy(bufs[i], want[i])
-		seq, err := r.SubmitWrite(fd, bufs[i], offs[i])
+		seq, err := r.SubmitWrite(bufs[i], offs[i])
 		if err != nil {
 			t.Fatalf("SubmitWrite(size=%s): %v", sizeName(size), err)
 		}
@@ -386,7 +382,7 @@ func contractInflightMixed(t *testing.T, b backend, ch testChannel) {
 	rseqs := make([]uint64, len(ioSizeTable))
 	for i, size := range ioSizeTable {
 		rbufs[i] = ch.buf(size)
-		seq, err := r.SubmitRead(fd, rbufs[i], offs[i])
+		seq, err := r.SubmitRead(rbufs[i], offs[i])
 		if err != nil {
 			t.Fatalf("SubmitRead(size=%s): %v", sizeName(size), err)
 		}
@@ -415,16 +411,15 @@ func contractInflightMixed(t *testing.T, b backend, ch testChannel) {
 // contractWaitSemantics 覆盖 Wait 的三种出口：按 max 截断、max<=0 立即返回、超时
 // （零超时与到期超时都必须返回 ErrTimeout，不得提前返回，也不得挂死）。
 func contractWaitSemantics(t *testing.T, b backend, ch testChannel) {
-	r := b.new(t, contractDepth)
-	defer closeRing(t, r)
-
 	const n = 4
 	f, _ := ch.open(t, int64(n)*int64(testChunk))
-	fd := int(f.Fd())
+	r := b.new(t, int(f.Fd()), contractDepth)
+	defer closeRing(t, r)
+
 	bufs := make([][]byte, n)
 	for i := 0; i < n; i++ {
 		bufs[i] = ch.buf(testChunk)
-		if _, err := r.SubmitRead(fd, bufs[i], int64(i)*int64(testChunk)); err != nil {
+		if _, err := r.SubmitRead(bufs[i], int64(i)*int64(testChunk)); err != nil {
 			t.Fatalf("SubmitRead#%d: %v", i, err)
 		}
 	}
@@ -489,11 +484,11 @@ func contractWaitSemantics(t *testing.T, b backend, ch testChannel) {
 
 // contractReadBeyondEOF 越过文件末尾的读返回 0 字节，而不是错误。
 func contractReadBeyondEOF(t *testing.T, b backend, ch testChannel) {
-	r := b.new(t, 4)
+	f, _ := ch.open(t, testChunk)
+	r := b.new(t, int(f.Fd()), 4)
 	defer closeRing(t, r)
 
-	f, _ := ch.open(t, testChunk)
-	ev := ringRead(t, r, int(f.Fd()), ch.buf(testChunk), 2*testChunk)
+	ev := ringRead(t, r, ch.buf(testChunk), 2*testChunk)
 	if ev.Res != 0 {
 		t.Fatalf("越界读完成字节数 = %d, want 0", ev.Res)
 	}
@@ -502,9 +497,8 @@ func contractReadBeyondEOF(t *testing.T, b backend, ch testChannel) {
 // contractSubmitAfterClose Close 之后四个提交入口都必须报错（具体 errno 各后端不同：
 // libaio 走 io_submit 的 EINVAL、io_uring 与兜底在入口拦下返回 EBADF），且 Close 幂等。
 func contractSubmitAfterClose(t *testing.T, b backend, ch testChannel) {
-	r := b.new(t, 4)
 	f, _ := ch.open(t, testChunk)
-	fd := int(f.Fd())
+	r := b.new(t, int(f.Fd()), 4)
 	buf := ch.buf(testChunk)
 
 	if err := r.Close(); err != nil {
@@ -513,16 +507,16 @@ func contractSubmitAfterClose(t *testing.T, b backend, ch testChannel) {
 	if err := r.Close(); err != nil {
 		t.Fatalf("二次 Close 应幂等: %v", err)
 	}
-	if _, err := r.SubmitRead(fd, buf, 0); err == nil {
+	if _, err := r.SubmitRead(buf, 0); err == nil {
 		t.Error("Close 后 SubmitRead 应报错")
 	}
-	if _, err := r.SubmitWrite(fd, buf, 0); err == nil {
+	if _, err := r.SubmitWrite(buf, 0); err == nil {
 		t.Error("Close 后 SubmitWrite 应报错")
 	}
-	if _, _, err := r.SubmitReadBatch(fd, []ReadSpec{{Buf: buf}}); err == nil {
+	if _, _, err := r.SubmitReadBatch([]ReadSpec{{Buf: buf}}); err == nil {
 		t.Error("Close 后 SubmitReadBatch 应报错")
 	}
-	if _, _, err := r.SubmitWriteBatch(fd, []WriteSpec{{Buf: buf}}); err == nil {
+	if _, _, err := r.SubmitWriteBatch([]WriteSpec{{Buf: buf}}); err == nil {
 		t.Error("Close 后 SubmitWriteBatch 应报错")
 	}
 }
@@ -533,18 +527,17 @@ func contractSubmitAfterClose(t *testing.T, b backend, ch testChannel) {
 // os.NewFile，包装对象成垃圾后 GC 会 close 掉**调用方持有的同一个 fd** —— 轻则随机
 // EBADF，重则 kevent 报 EBADF 触发 runtime fatal（netpoll failed）整进程退出。
 func contractFdSurvivesGC(t *testing.T, b backend, ch testChannel) {
-	r := b.new(t, 8)
+	f, vf := ch.open(t, 2*int64(testChunk))
+	r := b.new(t, int(f.Fd()), 8)
 	defer closeRing(t, r)
 
-	f, vf := ch.open(t, 2*int64(testChunk))
-	fd := int(f.Fd())
 	want := pattern(0x33, testChunk)
 	wbuf := ch.buf(testChunk)
 	copy(wbuf, want)
 
 	roundTrip := func() {
 		t.Helper()
-		if ev := ringWrite(t, r, fd, wbuf, 0); ev.Res != testChunk {
+		if ev := ringWrite(t, r, wbuf, 0); ev.Res != testChunk {
 			t.Fatalf("写完成字节数 = %d, want %d", ev.Res, testChunk)
 		}
 		got := ch.buf(testChunk)
@@ -577,18 +570,16 @@ func contractQueueFull(t *testing.T, b backend, ch testChannel) {
 		depth = 4   // 建环深度：越小越容易占满
 		cap   = 512 // 填充次数上限：仍未报满说明本后端容量未被占满
 	)
-	r := b.new(t, depth)
-	defer closeRing(t, r)
-
 	f, _ := ch.open(t, int64(depth)*int64(testChunk))
-	fd := int(f.Fd())
+	r := b.new(t, int(f.Fd()), depth)
+	defer closeRing(t, r)
 
 	bufs := make([][]byte, 0, cap)
 	pending := 0
 	var fullErr error
 	for i := 0; i < cap; i++ {
 		buf := ch.buf(testChunk)
-		if _, err := r.SubmitRead(fd, buf, int64(i%depth)*int64(testChunk)); err != nil {
+		if _, err := r.SubmitRead(buf, int64(i%depth)*int64(testChunk)); err != nil {
 			fullErr = err
 			break
 		}
@@ -603,7 +594,7 @@ func contractQueueFull(t *testing.T, b backend, ch testChannel) {
 	}
 
 	// 批量入口同样受深度上限约束：只能是 ErrFull 或成功，不得报别的错。
-	if _, n, err := r.SubmitReadBatch(fd, []ReadSpec{{Buf: ch.buf(testChunk), Off: 0}}); err != nil && err != ierr.ErrFull {
+	if _, n, err := r.SubmitReadBatch([]ReadSpec{{Buf: ch.buf(testChunk), Off: 0}}); err != nil && err != ierr.ErrFull {
 		t.Fatalf("占满时 SubmitReadBatch err=%v, want ErrFull 或 nil", err)
 	} else {
 		pending += n
@@ -618,7 +609,7 @@ func contractQueueFull(t *testing.T, b backend, ch testChannel) {
 		t.Fatal("占满后 Wait 未取回任何事件")
 	}
 	pending -= len(evs)
-	if _, err := r.SubmitRead(fd, ch.buf(testChunk), 0); err != nil {
+	if _, err := r.SubmitRead(ch.buf(testChunk), 0); err != nil {
 		t.Fatalf("Wait 回收 %d 条后 SubmitRead 仍失败: %v", len(evs), err)
 	}
 	pending++
@@ -641,9 +632,9 @@ func contractQueueFull(t *testing.T, b backend, ch testChannel) {
 // ── 契约内部的小工具 ─────────────────────────────────────────────────
 
 // ringWrite 用 ring 把 data 写到 off 并等待其完成，返回完成事件（Data 即提交序号）。
-func ringWrite(t *testing.T, r Ring, fd int, data []byte, off int64) Event {
+func ringWrite(t *testing.T, r Ring, data []byte, off int64) Event {
 	t.Helper()
-	seq, err := r.SubmitWrite(fd, data, off)
+	seq, err := r.SubmitWrite(data, off)
 	if err != nil {
 		t.Fatalf("SubmitWrite(off=%d, len=%d): %v", off, len(data), err)
 	}
@@ -658,9 +649,9 @@ func ringWrite(t *testing.T, r Ring, fd int, data []byte, off int64) Event {
 }
 
 // ringRead 用 ring 从 off 读 len(buf) 字节到 buf 并等待其完成，返回完成事件。
-func ringRead(t *testing.T, r Ring, fd int, buf []byte, off int64) Event {
+func ringRead(t *testing.T, r Ring, buf []byte, off int64) Event {
 	t.Helper()
-	seq, err := r.SubmitRead(fd, buf, off)
+	seq, err := r.SubmitRead(buf, off)
 	if err != nil {
 		t.Fatalf("SubmitRead(off=%d, len=%d): %v", off, len(buf), err)
 	}

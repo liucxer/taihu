@@ -33,7 +33,7 @@
 
 **「删掉无信息量的注释」在本仓库的具体含义**：`// 增加 i` 这类复述代码的注释不要；但**解释约束、时序、陷阱的注释必须有**。判据是：**删掉这行注释，下一个人会不会踩坑？** 会 → 留着。
 
-本仓库最该留的那类注释的例子：`internal/aio/aio_fallback_other.go:103-107` 那一段（解释为什么**绝不能**用 `os.NewFile(fd)` 包装后再丢——会给调用方持有的同一个 fd 挂 finalizer，GC 一跑就关掉别人的 fd）。
+本仓库最该留的那类注释的例子：`internal/aio/aio_fallback_other.go:105-109` 那一段（解释为什么**绝不能**用 `os.NewFile(fd)` 包装后再丢——会给调用方持有的同一个 fd 挂 finalizer，GC 一跑就关掉别人的 fd）。
 
 ### gbp-031 · Interface Design (Small Interfaces First)（HIGH）— **适用**
 
@@ -124,7 +124,7 @@ examples/taihu-client/main.go:40         var _ clusterClient = (*taihuclient.Sto
 
 上游原文断言「**边遍历边 `delete` 是未定义行为**，需先收集 key」。**这是错的**：Go 语言规范明确允许在 `range` 期间删除元素（只是**新增**的条目不保证被遍历到）。
 
-**为什么必须剔除**：照抄这半句会把本仓库**正确**的代码判成违规——`internal/cluster/kv_mem.go:52`、`internal/aio/aio_fallback_other.go:159`、`internal/device/device.go:161` 都有在 `range` 中 `delete` 的正确写法。
+**为什么必须剔除**：照抄这半句会把本仓库**正确**的代码判成违规——`internal/cluster/kv_mem.go:52`、`internal/aio/aio_fallback_other.go:161`、`internal/device/device.go:161` 都有在 `range` 中 `delete` 的正确写法。
 
 **保留的是前半**：预分配。见 [performance/](../performance/index.md) 的 gbp-048。
 
@@ -163,7 +163,7 @@ examples/taihu-client/main.go:40         var _ clusterClient = (*taihuclient.Sto
 | 类别 | 数量 | 位置 |
 |---|---|---|
 | 编译期断言 | 6 | `internal/aio/aio_uring_uapi_linux.go:112-117`，形态 `_ = [1]byte{}[unsafe.Sizeof(ioUringSQE{})-ioUringSQESize]` |
-| error 丢弃 | 6 | `unix.Close` ×2：`internal/aio/probe_linux.go:31`、`internal/aio/aio_uring_linux.go:120`。`unix.Munmap` ×4：`internal/aio/aio_uring_linux.go:170`、`internal/aio/aio_uring_linux.go:211`、`internal/aio/aio_uring_linux.go:214`、`internal/aio/aio_uring_linux.go:217` |
+| error 丢弃 | 6 | `unix.Close` ×2：`internal/aio/probe_linux.go:31`、`internal/aio/aio_uring_linux.go:122`。`unix.Munmap` ×4：`internal/aio/aio_uring_linux.go:173`、`internal/aio/aio_uring_linux.go:214`、`internal/aio/aio_uring_linux.go:217`、`internal/aio/aio_uring_linux.go:220` |
 
 **断言那 6 处的形态要注意**：它**不是** `_ = unsafe.Sizeof(...)`（那样写不构成断言，编译器会直接优化掉），而是 `_ = [1]byte{}[size - want]` ——**用数组下标越界把「结构体大小不符」变成编译错误**。用 `grep '_ = unsafe.Sizeof'` 找它们是找不到的（命中 0）。
 

@@ -16,6 +16,7 @@ import (
 // ring 非 Linux 平台（macOS 开发/自测）兜底实现：每个提交起一个 goroutine
 // 执行同步 pread/pwrite，完成后唤醒 Wait。接口语义与 Linux 版一致。
 type ring struct {
+	fd       int        // 构造时绑定的目标设备 fd：Submit*/Batch 提交 IO 的落点
 	mu       sync.Mutex // 保护 seq / inflight / closed
 	seq      uint64
 	inflight map[uint64]*op
@@ -29,32 +30,33 @@ type op struct {
 	done chan struct{}
 }
 
-// newLibAIORing 构建兜底队列。非 Linux 平台没有 libaio，落到这里。
-func newLibAIORing(maxEvents int) (Ring, error) {
+// newLibAIORing 构建兜底队列并绑定目标设备 fd。非 Linux 平台没有 libaio，落到这里。
+func newLibAIORing(fd, maxEvents int) (Ring, error) {
 	if maxEvents <= 0 || maxEvents > 1<<16 {
 		return nil, errInvalidMaxEvents
 	}
 	return &ring{
+		fd:       fd,
 		inflight: make(map[uint64]*op),
 		wake:     make(chan struct{}, 1),
 	}, nil
 }
 
 // newIOUringRing 非 Linux 平台没有 io_uring。
-func newIOUringRing(int, bool) (Ring, error) {
+func newIOUringRing(devFD, maxEvents int, iopoll bool) (Ring, error) {
 	return nil, errors.New("aio: io_uring 仅 Linux 支持")
 }
 
 // SubmitRead 实现 Ring.SubmitRead。
-func (r *ring) SubmitRead(fd int, buf []byte, off int64) (uint64, error) {
-	return r.submit(fd, buf, off, true)
+func (r *ring) SubmitRead(buf []byte, off int64) (uint64, error) {
+	return r.submit(buf, off, true)
 }
 
 // SubmitReadBatch 实现 Ring.SubmitReadBatch：非 Linux 兜底逐条 submit（编号连续）。
-func (r *ring) SubmitReadBatch(fd int, specs []ReadSpec) (uint64, int, error) {
+func (r *ring) SubmitReadBatch(specs []ReadSpec) (uint64, int, error) {
 	var first uint64
 	for i := range specs {
-		seq, err := r.submit(fd, specs[i].Buf, specs[i].Off, true)
+		seq, err := r.submit(specs[i].Buf, specs[i].Off, true)
 		if err != nil {
 			return first, i, err
 		}
@@ -66,15 +68,15 @@ func (r *ring) SubmitReadBatch(fd int, specs []ReadSpec) (uint64, int, error) {
 }
 
 // SubmitWrite 实现 Ring.SubmitWrite。
-func (r *ring) SubmitWrite(fd int, buf []byte, off int64) (uint64, error) {
-	return r.submit(fd, buf, off, false)
+func (r *ring) SubmitWrite(buf []byte, off int64) (uint64, error) {
+	return r.submit(buf, off, false)
 }
 
 // SubmitWriteBatch 实现 Ring.SubmitWriteBatch：非 Linux 兜底逐条 submit（编号连续）。
-func (r *ring) SubmitWriteBatch(fd int, specs []WriteSpec) (uint64, int, error) {
+func (r *ring) SubmitWriteBatch(specs []WriteSpec) (uint64, int, error) {
 	var first uint64
 	for i := range specs {
-		seq, err := r.submit(fd, specs[i].Buf, specs[i].Off, false)
+		seq, err := r.submit(specs[i].Buf, specs[i].Off, false)
 		if err != nil {
 			return first, i, err
 		}
@@ -85,7 +87,7 @@ func (r *ring) SubmitWriteBatch(fd int, specs []WriteSpec) (uint64, int, error) 
 	return first, len(specs), nil
 }
 
-func (r *ring) submit(fd int, buf []byte, off int64, read bool) (uint64, error) {
+func (r *ring) submit(buf []byte, off int64, read bool) (uint64, error) {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -107,10 +109,10 @@ func (r *ring) submit(fd int, buf []byte, off int64, read bool) (uint64, error) 
 		// 这是 macOS 侧测试随机「bad file descriptor」的根因。
 		var res int64
 		if read {
-			n, err := unix.Pread(fd, buf, off)
+			n, err := unix.Pread(r.fd, buf, off)
 			res = result(n, err)
 		} else {
-			n, err := unix.Pwrite(fd, buf, off)
+			n, err := unix.Pwrite(r.fd, buf, off)
 			res = result(n, err)
 		}
 		o.ev = Event{Data: seq, Res: res}
