@@ -30,3 +30,27 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: 错误收敛 pkg/ierr + bufpool 迁 pkg + aio/device 分层重构收口
+<!-- trellis-session: v=2 fp=bee9e2167450177a -->
+
+**Date**: 2026-09-24
+**Task**: 错误收敛 pkg/ierr + bufpool 迁 pkg + aio/device 分层重构收口
+**Branch**: `main`
+
+### Summary
+
+ierr 迁 pkg 并为全仓错误唯一事实源(26 哨兵)；bufpool 迁 pkg；aio/device 文件收敛+共享设备文件测试+O_DIRECT 目录探测
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `69d5abd` | refactor(ierr): 错误唯一事实源迁至 pkg/ierr，全仓 errors.New 收敛入哨兵 |
+| `94e9171` | docs(spec): error/index 同步 pkg/ierr 路径与 26 哨兵清单 |
+| `37981e5` | refactor(bufpool): 迁移 internal/bufpool → pkg/bufpool |
+
+### Status
+
+[OK] **Completed**

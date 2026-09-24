@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 1
-- **Last Active**: 2026-09-22
+- **Total Sessions**: 2
+- **Last Active**: 2026-09-24
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~32 | Active |
+| `journal-1.md` | ~56 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 2 | 2026-09-24 | 错误收敛 pkg/ierr + bufpool 迁 pkg + aio/device 分层重构收口 | `69d5abd`, `94e9171`, `37981e5` | `main` |
 | 1 | 2026-09-22 | 对照三份上游 Go 规范完善 spec | `ad24b1f`, `0aa489c`, `01f1c84`, `6a3b21c` | `main` |
 <!-- @@@/auto:session-history -->
 
