@@ -1,6 +1,7 @@
 // Package bufpool 提供按 2 的幂分桶（4KB~8GB）的 4K 对齐缓冲池，供各层热路径复用，
 // 消除每次 make 大块缓冲带来的高频堆分配与 GC 压力（设计 v3 中 server/rpcclient 的 IO 缓冲
-// 与 device 的 O_DIRECT 对齐缓冲共用本池）。
+// 与 device 的 O_DIRECT 对齐缓冲共用本池）。包位于 pkg/ 下，SDK/外部调用方可复用同一套
+// 对齐缓冲与 bufpool.Put 归还契约。
 //
 // 约定：
 //   - Get 返回 4K 对齐、len>=n 的切片，len 为 2 的幂（分桶容量）；n<=0 返回 nil；

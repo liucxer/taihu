@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
+	"github.com/liucxer/taihu/pkg/bufpool"
 )
 
 // putAligned 写入 n 个 4KB 对象（key 形如 k%02d），返回负载。

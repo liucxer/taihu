@@ -11,10 +11,10 @@ import (
 	"testing"
 
 	"github.com/liucxer/taihu/internal/aio"
-	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/device"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
+	"github.com/liucxer/taihu/pkg/bufpool"
 	"github.com/liucxer/taihu/pkg/ierr"
 )
 

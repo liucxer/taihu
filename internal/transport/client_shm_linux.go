@@ -15,8 +15,8 @@ import (
 
 	"github.com/liucxer/taihu/third_party/shmipc-go"
 
-	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/transport/protocol"
+	"github.com/liucxer/taihu/pkg/bufpool"
 	"github.com/liucxer/taihu/pkg/ierr"
 )
 

@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/metastore"
+	"github.com/liucxer/taihu/pkg/bufpool"
 	"github.com/liucxer/taihu/pkg/ierr"
 )
 

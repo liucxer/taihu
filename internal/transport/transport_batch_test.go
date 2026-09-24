@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/device"
 	"github.com/liucxer/taihu/internal/transport/protocol"
+	"github.com/liucxer/taihu/pkg/bufpool"
 	"github.com/liucxer/taihu/pkg/ierr"
 )
 

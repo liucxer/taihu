@@ -12,8 +12,8 @@ import (
 	"github.com/liucxer/taihu/pkg/ierr"
 	"github.com/liucxer/taihu/third_party/netpoll"
 
-	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/transport/protocol"
+	"github.com/liucxer/taihu/pkg/bufpool"
 )
 
 // init 使 netpoll 接收缓冲改用 bufpool 对齐分配：收流帧载荷落在单个对齐节点内时，
