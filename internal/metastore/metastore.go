@@ -2,7 +2,7 @@
 // 两个逻辑命名空间：mapping（key → ObjectMeta）、state（cursor / seg/<id>）。
 //
 // 本文件是包内**唯一导出文件**：全部 public 顶层声明（Store 接口、值类型与状态常量、
-// Open 等）集中于此；其余文件（meta.go / model.go / kv_pebble.go / segments.go /
+// Open 等）集中于此；其余文件（model.go / kv_pebble.go / segments.go /
 // cache.go）只保留私有实现与内部辅助。新增对外符号一律收敛到本文件，避免导出面散落。
 package metastore
 
@@ -29,7 +29,7 @@ type AllocResult struct {
 
 // ObjectMeta 存放在 mapping 列族：key = 用户 key。
 // SegmentID 所在 segment；Offset 段内起始偏移（恒 4K 对齐）；Size 逻辑大小（不含 4K 填充）。
-// value 编码见 meta.go（本层磁盘格式的唯一事实源，字段与 encode/decode 一一对应）。
+// value 编码见 model.go（本层磁盘格式的唯一事实源，字段与 encode/decode 一一对应）。
 type ObjectMeta struct {
 	SegmentID int64
 	Offset    int64
@@ -49,7 +49,7 @@ const (
 
 // SegmentMeta 存放在 state 列族，key = "seg/<segmentID>"。
 // 用于 segment 生命周期管理 / GC（v1 预留字段，物理回收后续实现）。
-// value 编码见 meta.go。
+// value 编码见 model.go。
 type SegmentMeta struct {
 	State      SegmentState
 	AliveCount int64

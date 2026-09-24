@@ -11,19 +11,104 @@ import (
 	"github.com/liucxer/taihu/pkg/ierr"
 )
 
-// 底层存储（CockroachDB Pebble）操作的对象化封装。
+// 模型层（Model）：底层存储（CockroachDB Pebble）的对象化封装，含三部分：
+//  1. 值编码：mapping / segment / cursor 三类记录的 value 布局与编解码，
+//     是本层「磁盘格式」的唯一事实源（值类型声明见 metastore.go）。
+//     任何格式演进都从这里开始。
+//  2. 键编码：两个逻辑命名空间前缀（m\x00 / s\x00）+ 内部关键字（cursor / seg/），
+//     收拢散落的「前缀 + 裸 key 拼接」写法。
+//  3. CRUD 对象：mapping / segment / cursor 每类记录一个结构体，各自封装键编解码
+//     与 set / get / delete（含批量变体、getMany、iter）方法，呈面向对象形态。
 //
-// pebble 为单 keyspace、无列族，本包用 key 前缀隔离两个逻辑命名空间：
+// pebble 为单 keyspace、无列族，用 key 前缀隔离两个逻辑命名空间：
 //   - mapping 命名空间（m\x00...）：用户 key → ObjectMeta
 //   - state 命名空间（s\x00...）：cursor 与 seg/<id> 段状态
 //
-// 本文件把散落各处的「前缀 + 裸 key 拼接 + db.Set/Get/NewIter」写法收敛为三个
-// 私有 model：mapping / segment / cursor 每类记录一个结构体，各自封装键编解码
-// 与所需的 set / get / delete（含批量变体）与迭代方法，呈面向对象形态。
 // 事务（WriteBatch）与 CAS 提交的编排仍在顶层（pebbleStore / segmentManager /
 // allocator）负责，不在此下沉。
 //
-// 磁盘键格式与 v1 完全兼容（旧数据可继续读），仅操作形态从散落函数收敛为对象。
+// 磁盘键/值格式与 v1 完全兼容（旧数据可继续读），仅操作形态从散落函数收敛为对象。
+// 编码规则：固定字段 binary little-endian（int64 占 8 字节），每个 value 头部
+// 预留 1 字节 version（当前为 0），便于版本演进。
+
+// ---- 值编码（磁盘格式唯一事实源）----
+
+const (
+	metaVersion    = byte(0)
+	objectMetaLen  = 1 + 8*3     // version + SegmentID + Offset + Size
+	writeCursorLen = 1 + 8*2     // version + SegmentID + Offset
+	segmentMetaLen = 1 + 1 + 8*2 // version + State + AliveCount + ReclaimSeq
+)
+
+// ObjectMeta 的 value 编码（SegmentID 所在 segment；Offset 段内起始偏移恒 4K 对齐；
+// Size 逻辑大小不含 4K 填充）。
+func (m ObjectMeta) encode() []byte {
+	b := make([]byte, objectMetaLen)
+	b[0] = metaVersion
+	binary.LittleEndian.PutUint64(b[1:], uint64(m.SegmentID))
+	binary.LittleEndian.PutUint64(b[9:], uint64(m.Offset))
+	binary.LittleEndian.PutUint64(b[17:], uint64(m.Size))
+	return b
+}
+
+func decodeObjectMeta(b []byte) (ObjectMeta, error) {
+	if len(b) != objectMetaLen {
+		return ObjectMeta{}, fmt.Errorf("taihu: bad ObjectMeta length %d", len(b))
+	}
+	return ObjectMeta{
+		SegmentID: int64(binary.LittleEndian.Uint64(b[1:9])),
+		Offset:    int64(binary.LittleEndian.Uint64(b[9:17])),
+		Size:      int64(binary.LittleEndian.Uint64(b[17:25])),
+	}, nil
+}
+
+// writeCursor 顺序写游标（state 命名空间，key = "cursor"）：全局唯一，记录下一个
+// object 的落点（Offset 4K 对齐）。类型私有：仅 allocator 内部使用，不参与对外导出面。
+type writeCursor struct {
+	SegmentID int64
+	Offset    int64
+}
+
+func (c writeCursor) encode() []byte {
+	b := make([]byte, writeCursorLen)
+	b[0] = metaVersion
+	binary.LittleEndian.PutUint64(b[1:], uint64(c.SegmentID))
+	binary.LittleEndian.PutUint64(b[9:], uint64(c.Offset))
+	return b
+}
+
+func decodeWriteCursor(b []byte) (writeCursor, error) {
+	if len(b) != writeCursorLen {
+		return writeCursor{}, fmt.Errorf("taihu: bad WriteCursor length %d", len(b))
+	}
+	return writeCursor{
+		SegmentID: int64(binary.LittleEndian.Uint64(b[1:9])),
+		Offset:    int64(binary.LittleEndian.Uint64(b[9:17])),
+	}, nil
+}
+
+// SegmentMeta 的 value 编码（用于 segment 生命周期管理 / GC）。
+func (m SegmentMeta) encode() []byte {
+	b := make([]byte, segmentMetaLen)
+	b[0] = metaVersion
+	b[1] = byte(m.State)
+	binary.LittleEndian.PutUint64(b[2:], uint64(m.AliveCount))
+	binary.LittleEndian.PutUint64(b[10:], uint64(m.ReclaimSeq))
+	return b
+}
+
+func decodeSegmentMeta(b []byte) (SegmentMeta, error) {
+	if len(b) != segmentMetaLen {
+		return SegmentMeta{}, fmt.Errorf("taihu: bad SegmentMeta length %d", len(b))
+	}
+	return SegmentMeta{
+		State:      SegmentState(b[1]),
+		AliveCount: int64(binary.LittleEndian.Uint64(b[2:10])),
+		ReclaimSeq: int64(binary.LittleEndian.Uint64(b[10:18])),
+	}, nil
+}
+
+// ---- 键编码 ----
 
 // 两个逻辑命名空间的前缀。用户 key 会被整体映射到 mapping 前缀之下，
 // 因此即便用户 key 恰好以 state 前缀开头也不会与内部键冲突。
