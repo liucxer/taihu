@@ -1,36 +1,254 @@
+//go:build !linux
+
+// 本文件是 internal/device 的**全部非 Linux（macOS 开发/自测）测试**，按「一个平台
+// 一个文件」组织。跨平台中立用例（原 device_test.go / device_more_test.go /
+// device_compl_retry_test.go 合并）都在此；Linux 侧全部测试在 device_linux_test.go。
 package device
 
 import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/liucxer/taihu/internal/aio"
 	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/ierr"
+	"github.com/liucxer/taihu/internal/layout"
 )
+
+func TestDeviceAppendAlignment(t *testing.T) {
+	devPath := newDevBackingFile(t)
+
+	dev, err := NewDevice(context.Background(), devPath, layout.DefaultSegmentSizeBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dev.Close()
+
+	if err := dev.Append(context.Background(), 0, 0, 3, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	// off 须推进到 4K 对齐
+	if err := dev.Append(context.Background(), 0, 4096, 10, make([]byte, 10)); err != nil {
+		t.Fatalf("aligned append: %v", err)
+	}
+	// 非 4K 对齐 offset 应报错
+	if err := dev.Append(context.Background(), 0, 100, 10, make([]byte, 10)); err == nil {
+		t.Fatalf("unaligned offset should error")
+	}
+	// 数据不足 size 应报错
+	if err := dev.Append(context.Background(), 0, 8192, 10, make([]byte, 5)); err == nil {
+		t.Fatalf("short data should error")
+	}
+
+	// 对齐整块读回：4096 字节里前 3 字节应为 "abc"，其余为补零（ReadAt 返回池化对齐缓冲）
+	data, err := dev.ReadAt(context.Background(), 0, 0, 4096)
+	if err != nil {
+		t.Fatalf("device read: %v", err)
+	}
+	defer bufpool.Put(data)
+	if len(data) != 4096 {
+		t.Fatalf("device read got %dB want 4096", len(data))
+	}
+	if string(data[:3]) != "abc" {
+		t.Fatalf("device read prefix got %q", data[:3])
+	}
+	for _, v := range data[3:] {
+		if v != 0 {
+			t.Fatalf("device read non-zero padding at byte 3: %d", v)
+		}
+	}
+	// 读第二段（偏移 4096 处的 10 字节内容）
+	data2, err := dev.ReadAt(context.Background(), 0, 4096, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bufpool.Put(data2)
+	for _, v := range data2[:10] {
+		if v != 0 {
+			t.Fatalf("second append misalign: %d", v)
+		}
+	}
+}
+
+func TestDeviceAppendAlignedFastPath(t *testing.T) {
+	devPath := newDevBackingFile(t)
+
+	dev, err := NewDevice(context.Background(), devPath, layout.DefaultSegmentSizeBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dev.Close()
+
+	// 4K 对齐地址 + 4K 倍数长度 → 命中直写快路径（bufpool.Get 保证首地址 4K 对齐）。
+	data := bufpool.Get(int(4096))
+	defer bufpool.Put(data)
+	for i := range data[:4096] {
+		data[i] = byte(i)
+	}
+	if err := dev.Append(context.Background(), 0, 0, 4096, data[:4096]); err != nil {
+		t.Fatalf("aligned fast-path append: %v", err)
+	}
+
+	// 读回对比：快路径直写内容须与源一致（无补零、无错位）。
+	got, err := dev.ReadAt(context.Background(), 0, 0, 4096)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	defer bufpool.Put(got)
+	if !bytes.Equal(got[:4096], data[:4096]) {
+		t.Fatal("aligned fast-path round trip mismatch")
+	}
+
+	// 非快路径（地址/长度不同时为 4K 对齐）仍走拷贝兜底，数据须一致。
+	unaligned := make([]byte, 4096)
+	for i := range unaligned {
+		unaligned[i] = byte(0xff - i)
+	}
+	if err := dev.Append(context.Background(), 0, 8192, 4096, unaligned); err != nil {
+		t.Fatalf("fallback append: %v", err)
+	}
+	got2, err := dev.ReadAt(context.Background(), 0, 8192, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bufpool.Put(got2)
+	if !bytes.Equal(got2[:4096], unaligned) {
+		t.Fatal("fallback round trip mismatch")
+	}
+
+	// 对齐地址 + 非 4K 倍数长度（"4M+1k" 缩小版）：主体直写 + 仅 4K 尾块缓冲，数据与补零须正确。
+	obj := bufpool.Get(16384)
+	defer bufpool.Put(obj)
+	payload := obj[:12288+100] // 12388 B：12288 对齐主体 + 100 字节尾块
+	for i := range payload {
+		payload[i] = byte(i * 7)
+	}
+	if err := dev.Append(context.Background(), 0, 16384, int64(len(payload)), payload); err != nil {
+		t.Fatalf("aligned bulk+tail append: %v", err)
+	}
+	got3, err := dev.ReadAt(context.Background(), 0, 16384, 16384)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bufpool.Put(got3)
+	if !bytes.Equal(got3[:len(payload)], payload) {
+		t.Fatal("aligned bulk+tail payload mismatch")
+	}
+	for _, v := range got3[len(payload):16384] {
+		if v != 0 {
+			t.Fatal("aligned bulk+tail tail padding not zero")
+		}
+	}
+}
+
+// TestDeviceConcurrent 多 goroutine 异偏移并发 Append/ReadAt，校验完成泵分发正确性（-race）。
+func TestDeviceConcurrent(t *testing.T) {
+	devPath := newDevBackingFile(t)
+
+	dev, err := NewDevice(context.Background(), devPath, layout.DefaultSegmentSizeBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dev.Close()
+
+	const n = 32
+	const chunk = 4096
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			data := bufpool.Get(chunk)
+			defer bufpool.Put(data)
+			for j := range data {
+				data[j] = byte(i)
+			}
+			if err := dev.Append(context.Background(), 0, int64(i)*chunk, chunk, data); err != nil {
+				errs[i] = err
+				return
+			}
+			got, err := dev.ReadAt(context.Background(), 0, int64(i)*chunk, chunk)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer bufpool.Put(got)
+			if !bytes.Equal(got, data) {
+				errs[i] = fmt.Errorf("chunk %d mismatch", i)
+			}
+		}(i)
+	}
+	wg.Wait()
+	for i, e := range errs {
+		if e != nil {
+			t.Fatalf("worker %d: %v", i, e)
+		}
+	}
+}
+
+// TestDeviceCloseInflight 在途请求存在时 Close 须排空完成事件后返回，不挂起。
+func TestDeviceCloseInflight(t *testing.T) {
+	devPath := newDevBackingFile(t)
+
+	dev, err := NewDevice(context.Background(), devPath, layout.DefaultSegmentSizeBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 4MB 写：O_SYNC（非 Linux 打开方式）下耗时足够，可稳定被观测为在途。
+	data := bufpool.Get(4 << 20)
+	defer bufpool.Put(data)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = dev.Append(context.Background(), 0, 0, 4<<20, data)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+poll:
+	for {
+		select {
+		case <-done:
+			break poll // 已完成也直接测 Close
+		default:
+		}
+		dev.mu.Lock()
+		inflight := len(dev.m) > 0
+		dev.mu.Unlock()
+		if inflight {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("submit never registered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := dev.Close(); err != nil {
+		t.Fatalf("close with inflight: %v", err)
+	}
+	<-done
+}
 
 // covSegSize 本文件各测试用的段大小（64MiB）：既容得下 4MiB 整块 IO 与多段偏移，
 // 又让临时目录下的稀疏测试文件保持小体积。
 const covSegSize int64 = 64 << 20
 
-// newCovDevice 在 t.TempDir() 上建一个空文件作为段容器并创建 Device。
-// 临时目录由 TMPDIR 决定（测试须指向支持 O_DIRECT 的 xfs，而非 tmpfs），
-// 测试结束自动 Close。
+// newCovDevice 建一个空模拟设备文件（目录经 devBackingDir 选择，Linux 需支持
+// O_DIRECT）并创建 Device，测试结束自动 Close。
 func newCovDevice(t *testing.T, opts ...Option) *Device {
 	t.Helper()
-	devPath := filepath.Join(t.TempDir(), "nvme.img")
-	f, err := os.Create(devPath)
-	if err != nil {
-		t.Fatalf("create backing file: %v", err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("close backing file: %v", err)
-	}
+	devPath := newDevBackingFile(t)
 	dev, err := NewDevice(context.Background(), devPath, covSegSize, opts...)
 	if err != nil {
 		t.Fatalf("NewDevice: %v", err)
@@ -76,14 +294,7 @@ func TestNewDeviceOpenError(t *testing.T) {
 }
 
 func TestNewDeviceOptions(t *testing.T) {
-	devPath := filepath.Join(t.TempDir(), "nvme.img")
-	f, err := os.Create(devPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
+	devPath := newDevBackingFile(t)
 
 	// libaio 后端 + 打开 IOPOLL：IOPOLL 只对 io_uring 生效，libaio 下被忽略，应打开成功。
 	dev, err := NewDevice(context.Background(), devPath, covSegSize,
@@ -433,11 +644,6 @@ func TestDeviceStatsAndDelete(t *testing.T) {
 	if ioOther != 1 || bytesOther != 4096 {
 		t.Fatalf("其他档统计 ioOther=%d bytesOther=%d, want 1/4096", ioOther, bytesOther)
 	}
-
-	// append-only：Delete 为占位，须返回 nil。
-	if err := dev.Delete(ctx, 0); err != nil {
-		t.Fatalf("Delete: %v", err)
-	}
 }
 
 // TestSegmentBaseAndBufAligned 覆盖段基址换算与 4K 对齐判定（含空切片/错位切片）。
@@ -474,4 +680,269 @@ func TestCheckWrite(t *testing.T) {
 	if err := checkWrite(aio.Event{Res: 10}, 4096); err == nil {
 		t.Fatal("短写应返回错误")
 	}
+}
+
+// fakeRing 是 aio.Ring 的测试替身：按提交顺序把「完成结果」写成事件交给完成泵，
+// 用于构造真实设备难以稳定复现的瞬时完成结果（如 -EAGAIN）。
+//
+// overrides 以提交序号（0 起，批内每个 spec 各占一个序号）为键覆盖该次提交的完成结果；
+// 未覆盖的提交按自然成功上报（写/读的长度即 buf 长度）。
+type fakeRing struct {
+	mu        sync.Mutex
+	seq       uint64
+	nSub      int
+	overrides map[int]int64
+	comps     []aio.Event
+	closed    bool
+}
+
+func newFakeRing(overrides map[int]int64) *fakeRing {
+	return &fakeRing{overrides: overrides}
+}
+
+// overall 返回累计提交次数（含批内各项与重试提交）。
+func (f *fakeRing) overall() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nSub
+}
+
+// enqueue 追加一条完成事件（调用方须持有 f.mu）。
+func (f *fakeRing) enqueue(buf []byte) {
+	f.seq++
+	res := int64(len(buf))
+	if v, ok := f.overrides[f.nSub]; ok {
+		res = v
+	}
+	f.nSub++
+	f.comps = append(f.comps, aio.Event{Data: f.seq, Res: res})
+}
+
+func (f *fakeRing) SubmitRead(buf []byte, off int64) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.enqueue(buf)
+	return f.seq, nil
+}
+
+func (f *fakeRing) SubmitWrite(buf []byte, off int64) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.enqueue(buf)
+	return f.seq, nil
+}
+
+func (f *fakeRing) SubmitReadBatch(specs []aio.ReadSpec) (uint64, int, error) {
+	return f.batch(len(specs), func(i int) []byte { return specs[i].Buf })
+}
+
+func (f *fakeRing) SubmitWriteBatch(specs []aio.WriteSpec) (uint64, int, error) {
+	return f.batch(len(specs), func(i int) []byte { return specs[i].Buf })
+}
+
+func (f *fakeRing) batch(n int, bufAt func(int) []byte) (uint64, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var first uint64
+	for i := 0; i < n; i++ {
+		if i == 0 {
+			first = f.seq + 1
+		}
+		f.enqueue(bufAt(i))
+	}
+	return first, n, nil
+}
+
+// Wait 立即取回已就绪事件；无事件时短暂让出后再返回 ErrTimeout，避免完成泵空转烧 CPU。
+func (f *fakeRing) Wait(min, max int, timeout *time.Duration) ([]aio.Event, error) {
+	f.mu.Lock()
+	if len(f.comps) == 0 {
+		f.mu.Unlock()
+		time.Sleep(time.Millisecond)
+		return nil, ierr.ErrTimeout
+	}
+	n := len(f.comps)
+	if n > max {
+		n = max
+	}
+	out := f.comps[:n]
+	f.comps = f.comps[n:]
+	f.mu.Unlock()
+	return out, nil
+}
+
+func (f *fakeRing) Close() error {
+	f.mu.Lock()
+	f.closed = true
+	f.mu.Unlock()
+	return nil
+}
+
+// withRing 注入测试替身 ring（仅测试使用；生产路径恒为真实 aio ring）。
+func withRing(r aio.Ring) Option {
+	return func(o *options) { o.ring = r }
+}
+
+// newFakeDevice 建一个挂 fakeRing 的 Device（文件真实存在即可，IO 由替身接管）。
+func newFakeDevice(t *testing.T, fr *fakeRing) *Device {
+	t.Helper()
+	devPath := newDevBackingFile(t)
+	dev, err := NewDevice(context.Background(), devPath, layout.DefaultSegmentSizeBytes, withRing(fr))
+	if err != nil {
+		t.Fatalf("NewDevice: %v", err)
+	}
+	t.Cleanup(func() { _ = dev.Close() })
+	return dev
+}
+
+// TestRetriableErrno 瞬时错误判定：EAGAIN/EINTR 可重试，其余（含成功）不可。
+func TestRetriableErrno(t *testing.T) {
+	cases := []struct {
+		res  int64
+		want syscall.Errno
+		ok   bool
+	}{
+		{0, 0, false},
+		{4096, 0, false},
+		{-int64(syscall.EAGAIN), syscall.EAGAIN, true},
+		{-int64(syscall.EINTR), syscall.EINTR, true},
+		{-int64(syscall.EIO), 0, false},
+		{-int64(syscall.ENOSPC), 0, false},
+	}
+	for _, c := range cases {
+		got, ok := retriableErrno(c.res)
+		if ok != c.ok || got != c.want {
+			t.Errorf("retriableErrno(%d) = (%v,%v), want (%v,%v)", c.res, got, ok, c.want, c.ok)
+		}
+	}
+	// 退避从 submitRetry 起逐次翻倍且不超上限。
+	if d := complRetryBackoff(1); d != submitRetry {
+		t.Errorf("complRetryBackoff(1)=%v want %v", d, submitRetry)
+	}
+	if d := complRetryBackoff(2); d != 2*submitRetry {
+		t.Errorf("complRetryBackoff(2)=%v want %v", d, 2*submitRetry)
+	}
+	if d := complRetryBackoff(complRetryMax); d > complRetryCap {
+		t.Errorf("complRetryBackoff(%d)=%v 超过上限 %v", complRetryMax, d, complRetryCap)
+	}
+}
+
+// TestDeviceComplRetryTransientWrite 写完成首次返回 -EAGAIN 时必须按原参数重提并最终成功。
+func TestDeviceComplRetryTransientWrite(t *testing.T) {
+	fr := newFakeRing(map[int]int64{0: -int64(syscall.EAGAIN)})
+	dev := newFakeDevice(t, fr)
+
+	data := make([]byte, layout.BlockSize)
+	if err := dev.Append(context.Background(), 0, 0, layout.BlockSize, data); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if n := fr.overall(); n != 2 {
+		t.Fatalf("提交次数=%d, want 2（1 次 EAGAIN + 1 次重提）", n)
+	}
+}
+
+// TestDeviceComplRetryExhausted 完成侧持续瞬时错误时，重试到上限后仍按原语义上抛 errno。
+func TestDeviceComplRetryExhausted(t *testing.T) {
+	over := make(map[int]int64, complRetryMax+1)
+	for i := 0; i <= complRetryMax; i++ {
+		over[i] = -int64(syscall.EAGAIN)
+	}
+	fr := newFakeRing(over)
+	dev := newFakeDevice(t, fr)
+
+	err := dev.Append(context.Background(), 0, 0, layout.BlockSize, make([]byte, layout.BlockSize))
+	if !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("Append err=%v, want EAGAIN", err)
+	}
+	if n := fr.overall(); n != 1+complRetryMax {
+		t.Fatalf("提交次数=%d, want %d（首次 + 上限次重试）", n, 1+complRetryMax)
+	}
+}
+
+// TestDeviceComplRetryBatchWrite 批写中单条完成瞬时错误时，应只重提该条且不重复计入尺寸统计。
+func TestDeviceComplRetryBatchWrite(t *testing.T) {
+	fr := newFakeRing(map[int]int64{1: -int64(syscall.EAGAIN)}) // 批内第 2 条
+	dev := newFakeDevice(t, fr)
+
+	jobs := []WriteJob{
+		{SegmentID: 0, Off: 0, Data: make([]byte, layout.BlockSize), Size: layout.BlockSize},
+		{SegmentID: 0, Off: layout.BlockSize, Data: make([]byte, layout.BlockSize), Size: layout.BlockSize},
+	}
+	if err := dev.AppendBatch(context.Background(), jobs); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	if n := fr.overall(); n != 3 {
+		t.Fatalf("提交次数=%d, want 3（批内 2 条 + 重提 1 条）", n)
+	}
+	// 重提不重复统计：两次 4K 逻辑 IO 应记为 ioOther=2。
+	_, ioOther, _, _ := dev.Stats()
+	if ioOther != 2 {
+		t.Fatalf("ioOther=%d, want 2（重提不得重复计入尺寸统计）", ioOther)
+	}
+}
+
+// TestDeviceComplRetryTransientRead 读完成首次返回 -EAGAIN 时同样重提并成功返回。
+func TestDeviceComplRetryTransientRead(t *testing.T) {
+	fr := newFakeRing(map[int]int64{0: -int64(syscall.EAGAIN)})
+	dev := newFakeDevice(t, fr)
+
+	buf, err := dev.ReadAt(context.Background(), 0, 0, layout.BlockSize)
+	if err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	if int64(len(buf)) != layout.BlockSize {
+		t.Fatalf("ReadAt 返回 %d 字节, want %d", len(buf), layout.BlockSize)
+	}
+	if n := fr.overall(); n != 2 {
+		t.Fatalf("提交次数=%d, want 2（1 次 EAGAIN + 1 次重提）", n)
+	}
+}
+
+// TestDeviceComplRetryBatchRead 批读中单条完成瞬时错误时，应重提该条并返回请求窗口。
+func TestDeviceComplRetryBatchRead(t *testing.T) {
+	fr := newFakeRing(map[int]int64{1: -int64(syscall.EAGAIN)}) // 批内第 2 条
+	dev := newFakeDevice(t, fr)
+
+	jobs := []ReadJob{
+		{SegmentID: 0, Off: 0, Buf: bufpool.Get(int(layout.BlockSize)), Size: layout.BlockSize},
+		{SegmentID: 0, Off: layout.BlockSize, Buf: bufpool.Get(int(layout.BlockSize)), Size: layout.BlockSize},
+	}
+	t.Cleanup(func() {
+		for i := range jobs {
+			bufpool.Put(jobs[i].Buf)
+		}
+	})
+	ns, err := dev.ReadAtIntoBatch(context.Background(), jobs)
+	if err != nil {
+		t.Fatalf("ReadAtIntoBatch: %v", err)
+	}
+	for i, n := range ns {
+		if n != layout.BlockSize {
+			t.Fatalf("jobs[%d] 读入 %d 字节, want %d", i, n, layout.BlockSize)
+		}
+	}
+	if n := fr.overall(); n != 3 {
+		t.Fatalf("提交次数=%d, want 3（批内 2 条 + 重提 1 条）", n)
+	}
+}
+
+// devBackingDir 返回测试设备文件所在目录。非 Linux 平台无 O_DIRECT 约束，直接
+// t.TempDir()；Linux 侧（device_linux_test.go）会探测支持 O_DIRECT 的文件系统。
+func devBackingDir(t *testing.T) string {
+	t.Helper()
+	return t.TempDir()
+}
+
+// newDevBackingFile 建一个模拟设备文件（空）并返回路径。
+func newDevBackingFile(t *testing.T) string {
+	t.Helper()
+	devPath := filepath.Join(devBackingDir(t), "nvme.img")
+	f, err := os.Create(devPath)
+	if err != nil {
+		t.Fatalf("create backing file: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close backing file: %v", err)
+	}
+	return devPath
 }
