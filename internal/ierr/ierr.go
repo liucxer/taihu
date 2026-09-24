@@ -24,4 +24,10 @@ var (
 	ErrFull = errors.New("taihu: submission queue full")
 	// ErrTimeout 表示 Wait 在超时时间内未取够 min 个事件。
 	ErrTimeout = errors.New("taihu: wait timeout")
+	// ErrInvalidMaxEvents 表示 aio 队列深度 Options.MaxEvents 超出合法区间 [1, 65536]。
+	ErrInvalidMaxEvents = errors.New("aio: maxEvents must be in [1, 65536]")
+	// ErrUringLinuxOnly 表示 io_uring 后端仅在 Linux 上可用。
+	ErrUringLinuxOnly = errors.New("aio: io_uring 仅 Linux 支持")
+	// ErrIOPOLLLinuxOnly 表示 IOPOLL 仅在 Linux 上可用。
+	ErrIOPOLLLinuxOnly = errors.New("aio: IOPOLL 仅 Linux 支持")
 )

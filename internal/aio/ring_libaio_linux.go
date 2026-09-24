@@ -58,7 +58,7 @@ type ring struct {
 // newLibAIORing 创建内核 AIO 上下文（io_setup）并绑定目标设备 fd。
 func newLibAIORing(fd, maxEvents int) (Ring, error) {
 	if maxEvents <= 0 || maxEvents > 1<<16 {
-		return nil, errInvalidMaxEvents
+		return nil, ierr.ErrInvalidMaxEvents
 	}
 	var ctx uint64
 	_, _, errno := unix.Syscall(unix.SYS_IO_SETUP, uintptr(maxEvents), uintptr(unsafe.Pointer(&ctx)), 0)

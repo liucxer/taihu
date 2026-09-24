@@ -1,3 +1,15 @@
+// io_uring 后端的全部实现集中在本文件，按三段组织：
+//
+//   - UAPI 声明：常量、结构体与编译期布局断言 —— 纯声明、零逻辑。
+//     内容按 include/uapi/linux/io_uring.h（v5.10）手工拷贝：golang.org/x/sys
+//     只提供 io_uring 的三个系统调用号，没有任何 IORING_* 常量或结构体。
+//   - 参数校验：内核在 io_uring_setup 里回填的结构体布局与队列深度，若与上面的
+//     UAPI 声明不符，这些值会是垃圾 —— 在这里尽早拦住，而不是等到踩坏内存。
+//   - 运行时：建环（io_uring_setup + mmap）、提交、收割、关闭。
+//
+// 与 ring_libaio_linux.go 手写 iocb 的做法一致：不依赖 cgo，结构体按 UAPI 手工声明、
+// 编译期断言钉死布局。
+
 package aio
 
 import (
@@ -5,6 +17,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +28,214 @@ import (
 
 	"github.com/liucxer/taihu/internal/ierr"
 )
+
+// ── UAPI 声明：常量、结构体与编译期布局断言 ──────────────────────────
+
+// 字段顺序不可调整：这些结构体是与内核共享的二进制布局，顺序或宽度一旦偏离 UAPI，
+// 内核回填的数据就会错位。下面的编译期断言把「结构体大小 / 关键字段偏移」与 UAPI
+// 钉死，不一致时索引越界、直接编译失败（零运行时代价）。
+
+const (
+	ioringOpRead  uint8 = 22
+	ioringOpWrite uint8 = 23
+
+	ioringSetupIOPoll uint32 = 1 << 0
+	ioringSetupClamp  uint32 = 1 << 4
+
+	ioringFeatSingleMmap uint32 = 1 << 0
+
+	// ioringSQCQOverflow 内核因 CQ 满而把完成事件挤到溢出链表的标志位。
+	ioringSQCQOverflow uint32 = 1 << 1
+
+	ioringEnterGetEvents uint32 = 1 << 0
+
+	ioringOffSQRing uint64 = 0
+	ioringOffCQRing uint64 = 0x8000000
+	ioringOffSQEs   uint64 = 0x10000000
+
+	ioringRegisterProbe uint32 = 8
+
+	ioUringSQESize = 64
+	ioUringCQESize = 16
+
+	// 内核回填的各字段偏移都在 ring 首部（实测 <1KiB）。用这个宽松上界拦住
+	// 「解析错位后的垃圾偏移」进入 mmap 长度计算；精确的段内边界在 mmap 后校验。
+	ioUringMaxFieldOffset = 64 << 10
+)
+
+// ioUringSQE 提交队列项（struct io_uring_sqe，64 字节）。字段顺序不可调整。
+type ioUringSQE struct {
+	Opcode   uint8
+	Flags    uint8
+	IOPrio   uint16
+	FD       int32
+	Off      uint64 // 联合 off / addr2
+	Addr     uint64 // 联合 addr / splice_off_in
+	Len      uint32
+	RWFlags  uint32 // 联合 rw_flags / fsync_flags / ...
+	UserData uint64
+	BufIndex uint16 // 联合 buf_index / buf_group（本实现用不到，保持 0）
+	Person   uint16
+	SpliceFD int32 // 联合 splice_fd_in / file_index
+	Addr3    uint64
+	Pad2     uint64
+}
+
+// ioUringCQE 完成队列项（struct io_uring_cqe，16 字节）。
+type ioUringCQE struct {
+	UserData uint64
+	Res      int32 // >=0 字节数；<0 为 -errno
+	Flags    uint32
+}
+
+// ioUringSQOffsets 提交环内各字段相对映射基址的字节偏移。
+type ioUringSQOffsets struct {
+	Head        uint32
+	Tail        uint32
+	RingMask    uint32
+	RingEntries uint32
+	Flags       uint32
+	Dropped     uint32
+	Array       uint32
+	Resv1       uint32
+	Resv2       uint64
+}
+
+// ioUringCQOffsets 完成环内各字段相对映射基址的字节偏移。
+type ioUringCQOffsets struct {
+	Head        uint32
+	Tail        uint32
+	RingMask    uint32
+	RingEntries uint32
+	Overflow    uint32
+	CQEs        uint32
+	Flags       uint32
+	Resv1       uint32
+	Resv2       uint64
+}
+
+// ioUringParams 内核回填的 ring 参数（struct io_uring_params，120 字节）。
+type ioUringParams struct {
+	SQEntries    uint32
+	CQEntries    uint32
+	Flags        uint32
+	SQThreadCPU  uint32
+	SQThreadIdle uint32
+	Features     uint32
+	WQFD         uint32
+	Resv         [3]uint32
+	SQOff        ioUringSQOffsets
+	CQOff        ioUringCQOffsets
+}
+
+// 编译期布局断言：与内核 UAPI 不一致时索引越界，直接编译失败（零运行时代价）。
+var (
+	_ = [1]byte{}[unsafe.Sizeof(ioUringParams{})-120]
+	_ = [1]byte{}[unsafe.Sizeof(ioUringSQE{})-ioUringSQESize]
+	_ = [1]byte{}[unsafe.Sizeof(ioUringCQE{})-ioUringCQESize]
+	_ = [1]byte{}[unsafe.Offsetof(ioUringSQE{}.UserData)-32]
+	_ = [1]byte{}[unsafe.Offsetof(ioUringSQE{}.BufIndex)-40]
+	_ = [1]byte{}[unsafe.Offsetof(ioUringCQE{}.Res)-8]
+)
+
+// ── 内核回填参数与 mmap 结果的校验 ──────────────────────────────────
+
+// uringRingField ring 映射内的一个字段：所在段（SQ/CQ）、相对该段基址的字节偏移、宽度。
+type uringRingField struct {
+	name  string
+	sq    bool
+	off   uint32
+	width uintptr
+}
+
+// uringRingFields 列出 sq_off / cq_off 中需要校验的字段。
+//
+// 关键语义：这两个结构体里的每个成员都是「相对本段 ring 映射基址的**字节偏移**」，
+// 而不是字段的取值。例如 sq_off.ring_mask == 256 表示「掩码那个 u32 在偏移 256 处」，
+// 掩码本身为 7 需要用该偏移读出来（见 verifyUringRing）。把偏移当值来比是错的。
+func uringRingFields(p *ioUringParams) []uringRingField {
+	return []uringRingField{
+		{name: "sq_off.head", sq: true, off: p.SQOff.Head, width: 4},
+		{name: "sq_off.tail", sq: true, off: p.SQOff.Tail, width: 4},
+		{name: "sq_off.ring_mask", sq: true, off: p.SQOff.RingMask, width: 4},
+		{name: "sq_off.ring_entries", sq: true, off: p.SQOff.RingEntries, width: 4},
+		{name: "sq_off.flags", sq: true, off: p.SQOff.Flags, width: 4},
+		{name: "sq_off.dropped", sq: true, off: p.SQOff.Dropped, width: 4},
+		{name: "sq_off.array", sq: true, off: p.SQOff.Array, width: 4},
+		{name: "cq_off.head", sq: false, off: p.CQOff.Head, width: 4},
+		{name: "cq_off.tail", sq: false, off: p.CQOff.Tail, width: 4},
+		{name: "cq_off.ring_mask", sq: false, off: p.CQOff.RingMask, width: 4},
+		{name: "cq_off.ring_entries", sq: false, off: p.CQOff.RingEntries, width: 4},
+		{name: "cq_off.overflow", sq: false, off: p.CQOff.Overflow, width: 4},
+		{name: "cq_off.cqes", sq: false, off: p.CQOff.CQEs, width: 4},
+	}
+}
+
+// validateUringParams 校验内核回填的参数，使调用方能安全地据此计算 mmap 长度。
+// 布局若写错，这些值会是垃圾值 —— 在此尽早拦住，而不是等到踩坏内存。
+func validateUringParams(p *ioUringParams, want int) error {
+	if p.SQEntries == 0 || p.SQEntries&(p.SQEntries-1) != 0 || p.SQEntries < uint32(want) {
+		return &uringParamError{field: "sq_entries", got: p.SQEntries}
+	}
+	if p.CQEntries == 0 || p.CQEntries&(p.CQEntries-1) != 0 || p.CQEntries < p.SQEntries {
+		return &uringParamError{field: "cq_entries", got: p.CQEntries}
+	}
+	for _, f := range uringRingFields(p) {
+		if f.off%4 != 0 || f.off >= ioUringMaxFieldOffset {
+			return &uringParamError{field: f.name, got: f.off}
+		}
+	}
+	return nil
+}
+
+// verifyUringRing 在 mmap 之后核对布局：每个字段的「偏移 + 宽度」必须落在所在段内，
+// 且 ring_mask / ring_entries 的**取值**要与内核回填的 entries 自洽。
+//
+// 这是真正能发现「结构体布局与内核 UAPI 不符」的检查 —— 布局错位时读到的掩码或
+// 条目数会对不上。段长要到 mmap 之后才知道，所以放在这里而不是参数校验里。
+func verifyUringRing(r *uringRing, p *ioUringParams) error {
+	for _, f := range uringRingFields(p) {
+		seg := r.cqRing
+		if f.sq {
+			seg = r.sqRing
+		}
+		if uintptr(f.off)+f.width > uintptr(len(seg)) {
+			return &uringParamError{field: f.name, got: f.off}
+		}
+	}
+	u32At := func(seg []byte, off uint32) uint32 {
+		return *(*uint32)(unsafe.Pointer(&seg[off]))
+	}
+	checks := []struct {
+		name string
+		got  uint32
+		want uint32
+	}{
+		{name: "sq_off.ring_mask", got: u32At(r.sqRing, p.SQOff.RingMask), want: p.SQEntries - 1},
+		{name: "sq_off.ring_entries", got: u32At(r.sqRing, p.SQOff.RingEntries), want: p.SQEntries},
+		{name: "cq_off.ring_mask", got: u32At(r.cqRing, p.CQOff.RingMask), want: p.CQEntries - 1},
+		{name: "cq_off.ring_entries", got: u32At(r.cqRing, p.CQOff.RingEntries), want: p.CQEntries},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			return &uringParamError{field: c.name, got: c.got}
+		}
+	}
+	return nil
+}
+
+// uringParamError 内核回填的 ring 参数不合理（通常意味着结构体布局与 UAPI 不符）。
+type uringParamError struct {
+	field string
+	got   uint32
+}
+
+func (e *uringParamError) Error() string {
+	return "aio: io_uring 参数校验失败: " + e.field + "=" +
+		strconv.FormatUint(uint64(e.got), 10) + " 非法（布局与内核 UAPI 不一致？）"
+}
+
+// ── io_uring 运行时：建环 / 提交 / 收割 ─────────────────────────────
 
 // checkIOPoll 校验目标块设备是否开启了队列级轮询 —— IOPOLL 的前置条件
 // （为什么必须有这条前置，见 aio.go 的 Options.IOPoll）。
@@ -35,10 +256,6 @@ func checkIOPoll(devPath string) error {
 	return nil
 }
 
-// io_uring 实现。结构与常量按 include/uapi/linux/io_uring.h（v5.10）手工声明
-// （见 aio_uring_uapi_linux.go），与 aio_libaio_linux.go 手写 iocb 的做法一致：
-// golang.org/x/sys 只提供三个系统调用号，没有任何 IORING_* 常量或结构体。
-//
 // 与 libaio 的三处关键语义差异（决定了下面的实现形状）：
 //
 //  1. io_uring_enter 没有超时参数（带超时的 EXT_ARG 是 5.11+）。第 5/6 个参数是
@@ -104,7 +321,7 @@ func uringSetupRaw(entries uint32, flags uint32) (int, ioUringParams, error) {
 // 并把目标设备 fd（devFD）绑定进队列 —— Submit*/Batch 提交 IO 都用它。
 func newIOUringRing(devFD, maxEvents int, iopoll bool) (Ring, error) {
 	if maxEvents <= 0 || maxEvents > 1<<16 {
-		return nil, errInvalidMaxEvents
+		return nil, ierr.ErrInvalidMaxEvents
 	}
 	var flags uint32
 	if iopoll {

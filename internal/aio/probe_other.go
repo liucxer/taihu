@@ -2,10 +2,10 @@
 
 package aio
 
-import "errors"
+import "github.com/liucxer/taihu/internal/ierr"
 
 // probe 探测 io_uring 可用性。非 Linux 平台恒不支持，且结论是确定性的（可缓存）。
-// 结论缓存与转发在 aio_internal.go。
+// 结论缓存与转发在 aio.go 的「包内私有」节。
 func probe() (info, bool) {
 	return info{Reason: "io_uring 仅 Linux 支持", KernelRelease: kernelRelease()}, true
 }
@@ -15,7 +15,7 @@ func kernelRelease() string { return "n/a" }
 
 // checkIOPoll 非 Linux 平台没有 io_uring，也就没有 IOPOLL。调用方在 NewWithOptions（aio.go）。
 func checkIOPoll(string) error {
-	return errors.New("aio: IOPOLL 仅 Linux 支持")
+	return ierr.ErrIOPOLLLinuxOnly
 }
 
 // backendName 返回队列实际生效的后端名（仅用于日志）。

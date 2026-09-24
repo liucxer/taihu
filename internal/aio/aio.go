@@ -20,16 +20,19 @@
 //   - buf 在 Submit 后、对应完成事件被 Wait 取回前必须保持存活且不被改写；
 //   - Linux + O_DIRECT 时 buf 首地址、偏移、长度需 4K 对齐（由 bufpool/device 层保证）。
 //
-// 本文件集中该包的**全部对外 API**（类型、常量与入口函数），且**只含导出名** ——
-// 未导出的常量、变量、类型与辅助函数在 aio_internal.go（探测结论缓存也在该文件）。
-// 后端实现按平台分文件：aio_libaio_linux.go（libaio）、aio_uring_linux.go（io_uring）、
-// aio_fallback_other.go（非 Linux 兜底）；探测的实现细节在 probe_linux.go / probe_other.go。
+// 本文件为包的总入口：对外 API（类型、常量与入口函数）与包内私有的探测结论缓存
+// （envMode / info / probeCached / iopollSuffix / logBackend，见文末「包内私有」节）都
+// 集中在这里。后端实现按平台分文件：ring_libaio_linux.go（libaio）、ring_uring_linux.go
+// （io_uring）、ring_fallback_other.go（非 Linux 兜底）；探测的具体实现（配合 probeCached
+// 的平台部分）在 probe_linux.go / probe_other.go。
 package aio
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -131,7 +134,7 @@ type Options struct {
 	Mode Mode
 	// MaxEvents 队列深度上限：libaio 为 io_setup 的 maxEvents，
 	// io_uring 为 SQ entries（内核回填的 CQ 为其 2 倍）；非 Linux 兜底实现忽略该值。
-	// 合法区间 [1, 65536]，越界由各后端构造返回 errInvalidMaxEvents。
+	// 合法区间 [1, 65536]，越界由各后端构造返回 ierr.ErrInvalidMaxEvents。
 	MaxEvents int
 	// IOPoll 启用 IORING_SETUP_IOPOLL，仅 io_uring 后端有效。
 	// 前置条件：目标块设备队列须开启轮询（/sys/class/block/<dev>/queue/io_poll=1），
@@ -200,4 +203,71 @@ func NewWithOptions(o Options, devPath string) (Ring, error) {
 	}
 	logBackend(r, "auto: io_uring 不可用 — "+pi.Reason)
 	return r, nil
+}
+
+// ── 包内私有：探测缓存与启动日志 ────────────────────────────────────
+
+// envMode 环境变量兜底开关（仅在 ModeAuto 下生效，便于线上紧急回退；命令行优先）。
+const envMode = "TAIHU_AIO_URING"
+
+// info 描述 io_uring 可用性探测结果。是 probe() 的产出形状，同时被结论缓存
+// （本文件的 probeInfo）与选路方（NewWithOptions）消费；
+// 包外只经由 NewWithOptions 的选路间接依赖该结论，故不导出。
+type info struct {
+	Supported     bool   // 当前内核是否可用 io_uring
+	Reason        string // 人类可读原因（供日志与错误信息）
+	KernelRelease string // 内核版本字符串，仅供日志
+	SQEntries     uint32 // 内核回填的提交队列深度
+	CQEntries     uint32 // 内核回填的完成队列深度
+	Features      uint32 // 内核能力位（IORING_FEAT_*）
+}
+
+// 探测结论缓存是平台无关的，平台差异在 probe_linux.go / probe_other.go。
+var (
+	probeMu   sync.Mutex // 保护 probeInfo / probeDone
+	probeInfo info
+	probeDone bool
+)
+
+// probeCached 探测当前内核是否可用 io_uring（包内唯一入口，不导出：包外只经
+// NewWithOptions 的选路间接依赖结论）。
+//
+// 判定完全基于 io_uring_setup 的 errno，不比较内核版本号 —— 版本号反映不了三类
+// 误判：RHEL 系的 io_uring_disabled sysctl、容器 seccomp 拦截、以及发行版把 io_uring
+// 反向移植进老内核（例如 openEuler/BCLinux 4.19.90 就带完整 backport，能力集约等于 5.8）。
+//
+// 只缓存确定性结论 —— 第二个返回值 deterministic 为真才落缓存。资源类瞬时错误
+// （ENOMEM/EMFILE 等）不缓存，否则一次偶发失败会把进程永久钉死在 libaio 上。
+// deterministic 由平台实现给出（见 probe_linux.go / probe_other.go）。
+func probeCached() info {
+	probeMu.Lock()
+	defer probeMu.Unlock()
+	if probeDone {
+		return probeInfo
+	}
+	info, deterministic := probe()
+	if info.Supported || deterministic {
+		probeInfo, probeDone = info, true
+	}
+	return info
+}
+
+// iopollSuffix 把 IOPOLL 状态拼进启动日志（仅在启用时出现）。
+func iopollSuffix(on bool) string {
+	if on {
+		return " iopoll=on"
+	}
+	return ""
+}
+
+// logBackend 打一行启动日志标明实际生效的后端与判定原因。双内核并存期，
+// 这行是排障时唯一能确定「跑的是哪个后端」的证据，故队列深度取自**实际建出的
+// ring**，而不是探测时的临时 ring（探测用 64 条，与真实深度无关）。
+func logBackend(r Ring, why string) {
+	if sq, cq, ok := ringQueueDepth(r); ok {
+		log.Printf("taihu: aio backend=%s sq=%d cq=%d kernel=%s (%s)",
+			backendName(r), sq, cq, kernelRelease(), why)
+		return
+	}
+	log.Printf("taihu: aio backend=%s kernel=%s (%s)", backendName(r), kernelRelease(), why)
 }

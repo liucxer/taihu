@@ -33,7 +33,7 @@ type op struct {
 // newLibAIORing 构建兜底队列并绑定目标设备 fd。非 Linux 平台没有 libaio，落到这里。
 func newLibAIORing(fd, maxEvents int) (Ring, error) {
 	if maxEvents <= 0 || maxEvents > 1<<16 {
-		return nil, errInvalidMaxEvents
+		return nil, ierr.ErrInvalidMaxEvents
 	}
 	return &ring{
 		fd:       fd,
@@ -44,7 +44,7 @@ func newLibAIORing(fd, maxEvents int) (Ring, error) {
 
 // newIOUringRing 非 Linux 平台没有 io_uring。
 func newIOUringRing(devFD, maxEvents int, iopoll bool) (Ring, error) {
-	return nil, errors.New("aio: io_uring 仅 Linux 支持")
+	return nil, ierr.ErrUringLinuxOnly
 }
 
 // SubmitRead 实现 Ring.SubmitRead。
