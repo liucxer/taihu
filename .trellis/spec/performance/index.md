@@ -71,7 +71,7 @@ for id, a := range aggs {
 
 | 项 | 数量 | 说明 |
 |---|---|---|
-| `strconv.*` | 4 | `strconv.Itoa` 3 处：`cmd/taihu/cmd/server.go:101`、`cmd/taihu/cmd/server.go:176`、`cmd/taihu/cmd/server.go:306`。`strconv.FormatUint` 1 处：`internal/aio/aio_uring_linux.go:413` |
+| `strconv.*` | 4 | `strconv.Itoa` 3 处：`cmd/taihu/cmd/server.go:101`、`cmd/taihu/cmd/server.go:176`、`cmd/taihu/cmd/server.go:306`。`strconv.FormatUint` 1 处：`internal/aio/aio_uring_params_linux.go:105` |
 | `fmt.Sprintf` | 15 | 其中 **14 处是复杂格式化**（多参数、`%v` 包错误、`%.2f GB`），属规则的豁免范围 |
 
 14 处豁免的都符合规则的「When to Use fmt」：`fmt.Sprintf("io_uring_setup 失败: %v", err)`、`fmt.Sprintf("%.2f GB", ...)`、`fmt.Sprintf("%d/%s", r.CursorSeg, off)` 这类**多值拼接**用 `strconv` 反而更难读。

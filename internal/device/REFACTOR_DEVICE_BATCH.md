@@ -162,9 +162,9 @@ func (s *Storage) ReadAt(ctx context.Context, key string, off, size int64) ([]by
 | 文件 | 改动 |
 |------|------|
 | `aio/aio.go` | 新增 `WriteSpec`（Buf+Off 同构 ReadSpec）；`Ring` 接口新增 `SubmitWriteBatch` |
-| `aio/aio_linux.go` | `SubmitWriteBatch` = `submitBatch(fd, specs, opcodePwrite)`（复用泛化实现） |
+| `aio/aio_libaio_linux.go` | `SubmitWriteBatch` = `submitBatch(fd, specs, opcodePwrite)`（复用泛化实现） |
 | `aio/aio_uring_linux.go` | `SubmitWriteBatch` 走 `submit(fd, specs, ioringOpWrite)`（复用已在的 write 提交） |
-| `aio/aio_other.go` | `SubmitWriteBatch` = goroutine + pwrite 逐条兜底 |
+| `aio/aio_fallback_other.go` | `SubmitWriteBatch` = goroutine + pwrite 逐条兜底 |
 
 ## 5. 边界与风险
 

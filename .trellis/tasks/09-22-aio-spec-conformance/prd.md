@@ -24,39 +24,39 @@ go test -coverprofile=/tmp/aio_base.cover ./internal/aio/
 |---|---|---|---|
 | `aio.go` | 6/36 | 16.7% | **无 gate（平台无关）** |
 | `aio_internal.go` | 2/7 | 28.6% | **无 gate** |
-| `probe_cache.go` | **0/8** | **0.0%** | **无 gate** |
-| `aio_other.go` | 55/81 | 67.9% | `//go:build !linux` |
+| `aio_internal.go` | **0/8** | **0.0%** | **无 gate** |
+| `aio_fallback_other.go` | 55/81 | 67.9% | `//go:build !linux` |
 | `probe_other.go` | 3/5 | 60.0% | `//go:build !linux` |
 
-**平台无关三文件合计 8/51 = 15.7%。** Linux 专属的 1017 行（`aio_linux.go` 237 + `aio_uring_linux.go` 662 + `probe_linux.go` 118）在 macOS 上不编译、不进分母。
+**平台无关三文件合计 8/51 = 15.7%。** Linux 专属的 1017 行（`aio_libaio_linux.go` 237 + `aio_uring_linux.go` 662 + `probe_linux.go` 118）在 macOS 上不编译、不进分母。
 
 ### 关键事实（每条都已复现）
 
 | # | 事实 | 证据 |
 |---|---|---|
-| F1 | `TestParseMode` 测的 `ParseMode` **平台无关**，但测试文件带 `//go:build linux` | `aio.go:112` 定义；`mode_test.go:1` 是 `//go:build linux`，`TestParseMode` 在 `:11-44`；调用方只有 `aio.go:139`（env 覆盖）与 `cmd/taihu/cmd/root.go:118` |
+| F1 | `TestParseMode` 测的 `ParseMode` **平台无关**，但测试文件带 `//go:build linux` | `aio.go:112` 定义；`internal/aio/aio_linux_test.go:1` 是 `//go:build linux`，`TestParseMode` 在 `:11-44`；调用方只有 `aio.go:139`（env 覆盖）与 `cmd/taihu/cmd/root.go:118` |
 | F2 | `ParseMode` 占 5 条语句，macOS 上 0 命中 | profile 中该函数所有块 count=0 |
-| F3 | `probe_cache.go` 在 macOS 上是 **0/8** | 消费方 `Probe()` 的 **8 个调用点全部**落在 linux 门控文件：`mode_test.go:101,115,126`、`probe_linux_test.go:87,88`、`aio_backends_linux_test.go:30`（测试侧），`aio.go:165`、`device.go:83`（生产侧） |
+| F3 | `aio_internal.go` 在 macOS 上是 **0/8** | 消费方 `Probe()` 的 **8 个调用点全部**落在 linux 门控文件：`internal/aio/aio_linux_test.go:101,115,126`、`internal/aio/aio_linux_test.go:87,88`、`aio_backends_linux_test.go:30`（测试侧），`aio.go:165`、`device.go:83`（生产侧） |
 | F4 | `AppendBatch` 实际 **126 行**（`:439-564`），规范写「133 行（至 `:571`）」 | 花括号配平：声明 `:439`、闭合 `:564`；`:565` 空行、`:566-571` 是**下一个函数 `ReadAt`（`:572-599`）的文档注释**，被算进去了 |
 | F5 | 全仓非测试代码有 **21 个**函数超 50 行，规则 17 的例外表只登记 **1 个** | 花括号配平扫描；最长 `device.go:439 AppendBatch` 126 行 |
 | F6 | 规则 14 记的 `internal/aio \| 11` 里 **6 处是 `unsafe.Sizeof` 编译期断言**，真 error 丢弃 5 处 | `aio_uring_linux.go:141-146` 六条断言 vs `:215,263,303,306,309` 五处真丢弃 |
 | F7 | 规则 14 的 grep 口径**漏掉一种形态** | `probe_linux.go:29` 的 `defer func() { _ = unix.Close(fd) }()` 中 `_ =` 不在行首，被 `^[[:space:]]*_ =` 漏掉 → 真丢弃实为 **6 处** |
-| F8 | §六 自称「实测 35 处 `go` 语句」，**总数准确**，但按锚点只能重建 20 处 | 精算 35 处完全吻合；未被点名的 11 处里 `client.go:28`、`registry.go:74`、`storage.go:94` 形态可归入已有类别，`aio_other.go:98` **连形态都归不进 6.1–6.5** |
+| F8 | §六 自称「实测 35 处 `go` 语句」，**总数准确**，但按锚点只能重建 20 处 | 精算 35 处完全吻合；未被点名的 11 处里 `client.go:28`、`registry.go:74`、`storage.go:94` 形态可归入已有类别，`aio_fallback_other.go:98` **连形态都归不进 6.1–6.5** |
 | F9 | §六 末尾自定：「不在这节里的『不遵守』不是偏离，是遗漏 —— 按缺陷处理」 | `buffer-and-concurrency.md:320` |
 | F10 | 规则 3 的 7 个计数**混用了两种口径** | 声明范围是「五目录、排除 `third_party`」（`unit-tests.md:57`），但 `t.Run(` 65 / `t.Helper()` 155 / `t.TempDir()` 97 / `t.Cleanup(` 64 都是**含 `third_party` 的整仓数**（五目录实为 55/132/81/57）；同一张表的 `func Benchmark` 写 0、备注说 16 个全在 `third_party` —— **那一行用的是五目录口径** |
 | F11 | 规则 7「资源用 `t.Cleanup` 而不是 `defer`」与仓库主流相反 | `defer X.Close()` **90 处** vs `t.Cleanup(` **57 处**（五目录，`*_test.go`）；`internal/aio` 内 18 处 `defer …Close()`、3 处 `t.Cleanup`，同一文件两种风格并存 |
-| F12 | 两处锚点 off-by-N | `build-verification.md:63` 引 `aio_linux.go:10-13` → 实际 `:11-14`；`unit-tests.md:324` 引 `aio_backends_linux_test.go:9-13` → 实际 `:9-11` |
+| F12 | 两处锚点 off-by-N | `build-verification.md:63` 引 `aio_libaio_linux.go:10-13` → 实际 `:11-14`；`unit-tests.md:324` 引 `aio_backends_linux_test.go:9-13` → 实际 `:9-11` |
 | F13 | 规则 7 的单侧理由不完整 | `file-splitting.md:140` 只说 `aio_uring_linux.go` 被 `newIOUringRing`/`probe` 挡住，漏了该文件另提供 `checkIOPoll`（`:20`）与 `ringQueueDepth`（`:411`），对手在 `probe_other.go:17`/`:25` |
 | F14 | 规则 12 的 aio 例外叙述过宽 | `unit-tests.md:321,327` 写「本机根本量不到这个包」「测不到，不是不达标」「不要把 48.2% 当成待补的缺口去追」—— 但平台无关的 51 条语句在 macOS 上**可测**，实测 15.7% |
-| F15 | **`maxEvents` 上界在非 Linux 平台上不被拦截** —— 实测 `NewWithOptions(65537, {Mode: ModeLibAIO})` 与 `{Mode: ModeAuto}` **返回 nil error** | `aio_other.go:32` 只判 `maxEvents <= 0`，而 Linux 两侧（`aio_linux.go:57`、`aio_uring_linux.go:201`）判 `maxEvents <= 0 \|\| maxEvents > 1<<16`。文档声明的合法区间是 `[1, 65536]`（`aio_internal.go:18`、`aio.go:135`）。临时探针实测后已删 |
-| F16 | `mode_test.go` **整体**无法脱离 linux 门控 | 摘掉 tag 后编译失败：`undefined: uringRing`（`:104`、`:147` 引 `*uringRing`，该类型定义在 `aio_uring_linux.go`）。而**单独**摘出 `TestParseMode` 到无 tag 文件则 **PASS** |
-| F17 | 修掉 F15 后，`TestNewWithOptionsInvalidMaxEvents` **也能脱离门控** | 临时给 `aio_other.go:32` 补上界后，把该测试摘到无 tag 文件，macOS 上 **PASS**；补丁已还原，工作区确认干净 |
+| F15 | **`maxEvents` 上界在非 Linux 平台上不被拦截** —— 实测 `NewWithOptions(65537, {Mode: ModeLibAIO})` 与 `{Mode: ModeAuto}` **返回 nil error** | `aio_fallback_other.go:32` 只判 `maxEvents <= 0`，而 Linux 两侧（`aio_libaio_linux.go:57`、`aio_uring_linux.go:201`）判 `maxEvents <= 0 \|\| maxEvents > 1<<16`。文档声明的合法区间是 `[1, 65536]`（`aio_internal.go:18`、`aio.go:135`）。临时探针实测后已删 |
+| F16 | `internal/aio/aio_linux_test.go` **整体**无法脱离 linux 门控 | 摘掉 tag 后编译失败：`undefined: uringRing`（`:104`、`:147` 引 `*uringRing`，该类型定义在 `aio_uring_linux.go`）。而**单独**摘出 `TestParseMode` 到无 tag 文件则 **PASS** |
+| F17 | 修掉 F15 后，`TestNewWithOptionsInvalidMaxEvents` **也能脱离门控** | 临时给 `aio_fallback_other.go:32` 补上界后，把该测试摘到无 tag 文件，macOS 上 **PASS**；补丁已还原，工作区确认干净 |
 
 ## Requirements
 
 ### R1 —— 平台门控纠正（代码）
 
-依据 F1/F2/F16：`mode_test.go` 的 `//go:build linux` 现在是**一刀切**，既关住了真需要门控的测试，也关住了平台无关的测试。按实测结论逐个处置：
+依据 F1/F2/F16：`internal/aio/aio_linux_test.go` 的 `//go:build linux` 现在是**一刀切**，既关住了真需要门控的测试，也关住了平台无关的测试。按实测结论逐个处置：
 
 | 测试 | 处置 | 依据 |
 |---|---|---|
@@ -65,13 +65,13 @@ go test -coverprofile=/tmp/aio_base.cover ./internal/aio/
 | `TestNewWithOptionsEnvOverride`（`:61-121`） | **留在 linux 门控内** | 引 `*uringRing`（`:106`），该类型 macOS 上不存在 |
 | `TestNewWithOptionsAuto`（`:125-`） | **留在 linux 门控内** | 引 `*uringRing`（`:147`） |
 
-- `mode_test.go` 在移走前两个测试后**必须保留文件头注释**，写明「本文件仍需 linux 门控，因为剩余两个测试引用 `*uringRing`（定义在 `aio_uring_linux.go`）」—— 现无任何说明，下一个人会以为它和 `TestParseMode` 一样是误门控。
+- `internal/aio/aio_linux_test.go` 在移走前两个测试后**必须保留文件头注释**，写明「本文件仍需 linux 门控，因为剩余两个测试引用 `*uringRing`（定义在 `aio_uring_linux.go`）」—— 现无任何说明，下一个人会以为它和 `TestParseMode` 一样是误门控。
 - 移出的测试放进**新的不带 tag 的文件**，文件名沿用仓内 `<subject>_test.go` 惯例。
 - 目标：`aio.go` 覆盖率由 6/36 升到 **≥11/36**（`ParseMode` 的 5 条语句被覆盖），全包 ≥51.8%（R2 完成后更高）。
 
 ### R2 —— `maxEvents` 上界的平台一致性（代码，行为变更）
 
-- 修 F15：`aio_other.go:32` 的 `if maxEvents <= 0` → `if maxEvents <= 0 || maxEvents > 1<<16`，与 `aio_linux.go:57`、`aio_uring_linux.go:201` 对齐，也与文档声明的 `[1, 65536]` 对齐。
+- 修 F15：`aio_fallback_other.go:32` 的 `if maxEvents <= 0` → `if maxEvents <= 0 || maxEvents > 1<<16`，与 `aio_libaio_linux.go:57`、`aio_uring_linux.go:201` 对齐，也与文档声明的 `[1, 65536]` 对齐。
 - **这是本任务唯一的行为变更**，必须单独说清影响面：
   - 非 Linux 平台上，`NewWithOptions(65537, …)` 由「静默建出队列」变为「返回 `errInvalidMaxEvents`」；
   - 唯一生产调用方传编译期常量 `aioDepth = 256`（`internal/device/device.go:33,95`），**无生产影响**；
@@ -79,18 +79,18 @@ go test -coverprofile=/tmp/aio_base.cover ./internal/aio/
 - 该条在 `api-surface.md:232` 被登记为「待裁定的代码缺陷」。本任务裁定为**修**，并把该处登记同步改为「已修，见本任务」。
 - 此修复是 R1 中 `TestNewWithOptionsInvalidMaxEvents` 移出门控的**前置条件**，顺序不可颠倒。
 
-### R3 —— `probe_cache.go` 补测（代码）
+### R3 —— `aio_internal.go` 补测（代码）
 
 - 该文件平台无关（无 gate），但当前 **0/8**，成因是 F3：`Probe()` 的全部调用点都落在 linux 门控文件里。
-- 补一个**不带 build tag** 的测试，覆盖缓存的真实语义（`probe_cache.go:12-16` 的三件套 + `:23` 的 `probeCached`）：冷缓存穿透、热缓存命中、并发调用。
-- **不得为便于测试而改动 `probe_cache.go` 的生产逻辑。** 该文件也**没有**测试缝隙（`probe()` 是平台文件里的函数，不是可替换的包级变量），所以断言必须走仓内**既有的白盒手法**：`mode_test.go:128-139` 已经开了先例 —— 在 `probeMu` 保护下直接读写 `probeInfo`/`probeDone`，用 `t.Cleanup` 还原。本条沿用该手法，不新造缝隙。
+- 补一个**不带 build tag** 的测试，覆盖缓存的真实语义（`aio_internal.go:12-16` 的三件套 + `:23` 的 `probeCached`）：冷缓存穿透、热缓存命中、并发调用。
+- **不得为便于测试而改动 `aio_internal.go` 的生产逻辑。** 该文件也**没有**测试缝隙（`probe()` 是平台文件里的函数，不是可替换的包级变量），所以断言必须走仓内**既有的白盒手法**：`internal/aio/aio_linux_test.go:128-139` 已经开了先例 —— 在 `probeMu` 保护下直接读写 `probeInfo`/`probeDone`，用 `t.Cleanup` 还原。本条沿用该手法，不新造缝隙。
 - 断言必须**平台无关**（该文件无 gate，测试会在两个平台都跑）：例如「热缓存下预置的哨兵值必须被原样返回」——它同时证明了「没有发生穿透」。
 
 ### R4 —— 规则 12 的 `internal/aio` 例外叙述收窄（spec）
 
 - 改写 `unit-tests.md:321-327` 的例外小节，把「本机根本量不到这个包」拆成两半：
   - **Linux 专属的 1017 行**（66%）在 macOS 上不编译、不进分母 —— 这部分确实量不到，属例外，保留；
-  - **平台无关的 51 条语句**（`aio.go` + `aio_internal.go` + `probe_cache.go`）**在 macOS 上可测**，当前 8/51 = 15.7%，**受 ≥80% 规则约束，不是例外**。
+  - **平台无关的 51 条语句**（`aio.go` + `aio_internal.go` + `aio_internal.go`）**在 macOS 上可测**，当前 8/51 = 15.7%，**受 ≥80% 规则约束，不是例外**。
 - 删除或改写「测不到，不是不达标」「不要把 48.2% 当成待补的缺口去追」这类**无限定的**句子 —— 它们与同文件规则 12 的「≥80%」直接矛盾，会压制合理的工作。
 - 保留「48.2% 这个数字不能读成测试写得少」这一层意思，但必须把「哪些部分可测」写清楚。
 - 本轮 R1/R2/R3 完成后，把实测的新数字回填进该小节与规则 12 的包表。
@@ -110,22 +110,22 @@ go test -coverprofile=/tmp/aio_base.cover ./internal/aio/
 
 ### R7 —— `engine` §六 goroutine 归类补全（spec）
 
-- F8/F9：§六 的 35 处总数是对的，但按锚点只能重建 20 处；其中 **`internal/aio/aio_other.go:98` 是唯一连形态都归不进 6.1–6.5 的一处**（每次 `Submit` 起一个 goroutine，`Close()`（`:190-196`）只置 `closed = true`、`nil` 掉 `inflight`，**无 join 点**）。
+- F8/F9：§六 的 35 处总数是对的，但按锚点只能重建 20 处；其中 **`internal/aio/aio_fallback_other.go:98` 是唯一连形态都归不进 6.1–6.5 的一处**（每次 `Submit` 起一个 goroutine，`Close()`（`:190-196`）只置 `closed = true`、`nil` 掉 `inflight`，**无 join 点**）。
 - 二选一，在 `design.md` 里定案并说明取舍：
   - **(a) 归类** —— 在 §6 追加一类，给出可检验理由；
-  - **(b) 补 join 点** —— 给 `aio_other.go` 的 `ring` 加 `sync.WaitGroup`，`Close` 里 `wg.Wait()`，使其落回 6.1 的表。
+  - **(b) 补 join 点** —— 给 `aio_fallback_other.go` 的 `ring` 加 `sync.WaitGroup`，`Close` 里 `wg.Wait()`，使其落回 6.1 的表。
 - 无论选哪条，**顺便点名** `internal/transport/client.go:28`、`pkg/taihu-client/registry.go:74`、`pkg/taihu-client/storage.go:94` 三处 —— 它们形态上可归入已有类别（6.1 / 6.1 / 6.4）却没被点名。
 - §六 的锚点约定要统一或写明：现在 6.1 的表锚在 `go` 那一行，紧随其后的 WaitGroup 段落锚在 `WaitGroup` **声明**行（`segments.go:34`、`compact.go:43`、`server_shm_linux.go:46,660`、`run.go:168`、`storage.go:222`、`server.go:270`），两种锚法混用导致「35 处」无法从锚点重建。
 
 ### R8 —— 两处锚点 off-by-N（spec）
 
-- F12：`build-verification.md:63` 的 `internal/aio/aio_linux.go:10-13` → **`:11-14`**。
+- F12：`build-verification.md:63` 的 `internal/aio/aio_libaio_linux.go:10-13` → **`:11-14`**。
 - F12：`unit-tests.md:324` 的 `aio_backends_linux_test.go:9-13` → **`:9-11`**。
 - 修完用 `verify_spec_refs.py` 复验，确认 0 不存在 / 0 越界。该脚本是上一任务 `09-21-spec-upstream-alignment` 的 research 产物（`.trellis/tasks/archive/2026-09/09-21-spec-upstream-alignment/research/verify_spec_refs.py`），**R13 禁止把它提升为仓库工具**，原地调用即可。
 
 ### R9 —— 规则 7 的单侧理由补全（spec）
 
-- F13：`file-splitting.md:140` 补上 `checkIOPoll`（`aio_uring_linux.go:20`）与 `ringQueueDepth`（`:411`），并写明它们的对手**不在 `aio_other.go` 而在 `probe_other.go:17`/`:25`** —— 即「单侧文件的符号可以由**另一个** `_other.go` 兜底」，这层容易被下一个读者误读成「单侧文件可以随便加符号」。
+- F13：`file-splitting.md:140` 补上 `checkIOPoll`（`aio_uring_linux.go:20`）与 `ringQueueDepth`（`:411`），并写明它们的对手**不在 `aio_fallback_other.go` 而在 `probe_other.go:17`/`:25`** —— 即「单侧文件的符号可以由**另一个** `_other.go` 兜底」，这层容易被下一个读者误读成「单侧文件可以随便加符号」。
 
 ### R10 —— 规则 3 的计数口径（spec）
 
@@ -149,9 +149,9 @@ go test -coverprofile=/tmp/aio_base.cover ./internal/aio/
 |---|---|---|
 | `_ =` 无理由 | `aio_uring_linux.go:215`（本文件第一处）、`probe_linux.go:29` | 在第一处上方加一行**通用理由**（清理路径的 `Close`/`Munmap` 失败无补救动作，错误已由主返回值表达），后续同类可省 —— 这正是规则 14 的要求 |
 | 位置式结构体字面量 | `aio_uring_linux.go:329-342`（4 字段 × 13 条）、`:385-389`（3 字段 × 4 条） | 改为具名字段。17 条位置式字面量一旦字段顺序调整会**静默错位**，而同包其余 8 处结构体字面量全部具名 |
-| 手写 `Unlock` | `aio_linux.go:121,160,168,174` | 改 `defer r.mu.Unlock()`。同包 `aio_uring_linux.go:489-490` 与 `probe_cache.go:24-25` 已是 `defer` 写法；规则 5 明写「不要以 defer 慢为由回避」 |
-| `if/else` 两分支赋同一变量 | `aio_other.go:107-113` | 让 `if` 只选 syscall，`res = result(n, err)` 提到分支外。规则 18 / `uber-084` 的反例形态一字不差 |
-| `mu` 无保护范围注释 | `aio_other.go:17` | 加 `// 保护 seq / inflight / closed`。同包另两把锁（`aio_linux.go:49`、`aio_uring_linux.go:158`）都写了 |
+| 手写 `Unlock` | `aio_libaio_linux.go:121,160,168,174` | 改 `defer r.mu.Unlock()`。同包 `aio_uring_linux.go:489-490` 与 `aio_internal.go:24-25` 已是 `defer` 写法；规则 5 明写「不要以 defer 慢为由回避」 |
+| `if/else` 两分支赋同一变量 | `aio_fallback_other.go:107-113` | 让 `if` 只选 syscall，`res = result(n, err)` 提到分支外。规则 18 / `uber-084` 的反例形态一字不差 |
+| `mu` 无保护范围注释 | `aio_fallback_other.go:17` | 加 `// 保护 seq / inflight / closed`。同包另两把锁（`aio_libaio_linux.go:49`、`aio_uring_linux.go:158`）都写了 |
 
 ### R13 —— 范围约束
 
@@ -174,17 +174,17 @@ go test -coverprofile=/tmp/aio_base.cover ./internal/aio/
 ## Acceptance Criteria
 
 - [ ] `TestParseMode` 位于**不带 build tag** 的测试文件；`TestNewWithOptionsInvalidMaxEvents` 在 R2 完成后同样移出
-- [ ] `mode_test.go` 保留文件头注释，写明剩余测试为何仍需 linux 门控（引 `*uringRing`）
-- [ ] `aio_other.go:32` 已加上界校验，与 `aio_linux.go:57` / `aio_uring_linux.go:201` 一致；`api-surface.md:232` 的「待裁定」已同步改为「已修」
-- [ ] `go test -cover ./internal/aio/` 的全包覆盖率由 48.2% 上升；`probe_cache.go` 由 0/8 变为非零；`aio.go` ≥ 11/36
-- [ ] `probe_cache.go` 的新测试**不带 build tag**，且在 macOS 与 linux 两个平台上都通过（`make check` + `make check-linux` 覆盖判据）
-- [ ] `probe_cache.go` 的生产逻辑**未被改动**（`git diff` 中该文件只有测试文件的新增，没有实现改动）
+- [ ] `internal/aio/aio_linux_test.go` 保留文件头注释，写明剩余测试为何仍需 linux 门控（引 `*uringRing`）
+- [ ] `aio_fallback_other.go:32` 已加上界校验，与 `aio_libaio_linux.go:57` / `aio_uring_linux.go:201` 一致；`api-surface.md:232` 的「待裁定」已同步改为「已修」
+- [ ] `go test -cover ./internal/aio/` 的全包覆盖率由 48.2% 上升；`aio_internal.go` 由 0/8 变为非零；`aio.go` ≥ 11/36
+- [ ] `aio_internal.go` 的新测试**不带 build tag**，且在 macOS 与 linux 两个平台上都通过（`make check` + `make check-linux` 覆盖判据）
+- [ ] `aio_internal.go` 的生产逻辑**未被改动**（`git diff` 中该文件只有测试文件的新增，没有实现改动）
 - [ ] 规则 12 的 aio 例外小节明确区分「Linux 专属 1017 行（量不到）」与「平台无关 51 条语句（可测，受 ≥80% 约束）」，无「不要把 48.2% 当成待补的缺口去追」这类无限定句
 - [ ] 规则 12 的包表中的 `internal/aio` 数字与 R1/R2/R3 后的实测一致
 - [ ] `code-style.md` 的 `AppendBatch` 记为 **126 行**，且规则正文写明跨度的测量口径（花括号配平、含端行、不含下一函数的文档注释）
 - [ ] 规则 17 的例外表覆盖全仓 21 个超 50 行函数，每条有可检验理由，并写明「什么样的理由算合格」的判据
 - [ ] 规则 14 的分布表把「编译期断言」与「error 丢弃」分开；正文写明 `^[[:space:]]*_ =` 口径的盲区（漏 `defer func() { _ = ... }()`）
-- [ ] `engine/buffer-and-concurrency.md` §六：`aio_other.go:98` 已归类或已补 join 点；`client.go:28`、`registry.go:74`、`storage.go:94` 已被点名；锚点约定不统一一事已在正文写明
+- [ ] `engine/buffer-and-concurrency.md` §六：`aio_fallback_other.go:98` 已归类或已补 join 点；`client.go:28`、`registry.go:74`、`storage.go:94` 已被点名；锚点约定不统一一事已在正文写明
 - [ ] 两处 off-by-N 锚点已改（`build-verification.md:63` → `:11-14`；`unit-tests.md:324` → `:9-11`）
 - [ ] `file-splitting.md` 规则 7 已补 `checkIOPoll` / `ringQueueDepth` 与其对手位置
 - [ ] `unit-tests.md` 规则 3 的表格口径自洽，附可复现命令

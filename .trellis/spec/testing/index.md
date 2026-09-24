@@ -55,7 +55,7 @@
 
 **这条命令在本机退出码是 1**，因为 `cmd/taihu/cmd` 有 2 个已知平台性失败（见本层末节）。**读输出里的数字，不要只看退出码。**
 
-**`internal/aio` 的 48.2% 是怎么来的**：它的分母只有 137 条语句，而该包非测试代码 1529 行中 **1017 行（66%）是 Linux 专属**（`aio_linux.go` / `aio_uring_linux.go` / `probe_linux.go`）。在 macOS 上：
+**`internal/aio` 的 48.2% 是怎么来的**：它的分母只有 137 条语句，而该包非测试代码 1529 行中 **1017 行（66%）是 Linux 专属**（`aio_libaio_linux.go` / `aio_uring_linux.go` / `probe_linux.go`）。在 macOS 上：
 
 1. Linux 专属文件**不编译，也就不进统计**——占该包 66% 的实现连分母都没进。
 2. 平台测试带 `_linux_test` 后缀，本机**不运行**。
@@ -128,7 +128,7 @@
 - `//go:build e2e` —— `test/e2e/` 的端到端套件。不设 `E2E_PD` 环境变量时**全部 Skip**。
 - `//go:build linux` —— 平台专有测试（io_uring / libaio 路径）。
 
-**注意 `_test` 后缀必须排在 GOOS 之后**（`aio_linux_test.go`，不是 `aio_test_linux.go`）。
+**注意 `_test` 后缀必须排在 GOOS 之后**（`internal/aio/aio_linux_test.go`，不是 `aio_test_linux.go`）。
 
 **不适用的一半（testcontainers）**：正例是起真实 MySQL 容器 + `httptest.NewServer`；本仓库无 MySQL、无 HTTP 服务端（见 [framework/](../framework/index.md)）。本仓库的集成测试起的是**真实块设备与真实集群**，靠环境变量（`E2E_PD` / `E2E_WORKDIR`）而不是容器编排。
 

@@ -21,7 +21,7 @@ go test -cover ./internal/aio/ 2>&1 | tail -1     # 期望 48.2%
 
 # 0.3 逐文件覆盖率（供第 3 大步比对）
 #     解析口径：loc,st,c = l.rsplit(' ',2)；命中时累加 **st**（语句数），不是 c
-#     基期结果：aio.go 6/36、aio_internal.go 2/7、probe_cache.go 0/8、aio_other.go 55/81、probe_other.go 3/5
+#     基期结果：aio.go 6/36、aio_internal.go 2/7、aio_internal.go 0/8、aio_fallback_other.go 55/81、probe_other.go 3/5
 
 # 0.4 spec 引用基线
 #     注意：这个脚本是上一个任务（09-21-spec-upstream-alignment）的 research 产物，
@@ -40,7 +40,7 @@ git status --porcelain
 
 ## 第 1 大步 · R2 修上界（行为变更，必须先做）
 
-**文件**：`internal/aio/aio_other.go`
+**文件**：`internal/aio/aio_fallback_other.go`
 
 1.1 把 `:32` 的
 ```go
@@ -51,24 +51,24 @@ if maxEvents <= 0 {
 if maxEvents <= 0 || maxEvents > 1<<16 {
 ```
 
-1.2 在 `newLibAIORing` 的文档注释里补一句，说明上界与 Linux 侧一致（对齐 `aio_linux.go:57` / `aio_uring_linux.go:201` 的判据），避免下一个人以为非 Linux 侧可以放宽。
+1.2 在 `newLibAIORing` 的文档注释里补一句，说明上界与 Linux 侧一致（对齐 `aio_libaio_linux.go:57` / `aio_uring_linux.go:201` 的判据），避免下一个人以为非 Linux 侧可以放宽。
 
 **验证**：
 ```bash
 go vet ./internal/aio/
 make check-linux
 # 三处判据必须字面一致：
-grep -n 'maxEvents <= 0 || maxEvents > 1<<16' internal/aio/aio_linux.go \
-  internal/aio/aio_uring_linux.go internal/aio/aio_other.go    # 期望 3 行
+grep -n 'maxEvents <= 0 || maxEvents > 1<<16' internal/aio/aio_libaio_linux.go \
+  internal/aio/aio_uring_linux.go internal/aio/aio_fallback_other.go    # 期望 3 行
 ```
 
-**回滚点**：1 行改动，`git checkout -- internal/aio/aio_other.go` 即回到原状。
+**回滚点**：1 行改动，`git checkout -- internal/aio/aio_fallback_other.go` 即回到原状。
 
 ---
 
 ## 第 2 大步 · R1 纠正平台门控（依赖第 1 大步）
 
-**文件**：`internal/aio/mode_test.go`（改）、新增一个不带 tag 的测试文件
+**文件**：`internal/aio/aio_linux_test.go`（改）、新增一个不带 tag 的测试文件
 
 2.1 **先做 `TestParseMode`**（独立，不依赖第 1 大步）：
 - 把 `TestParseMode`（`:11-44`）整体移到一个**不带 build tag** 的新文件（建议 `internal/aio/mode_parse_test.go`，沿用 `<subject>_test.go` 惯例）。
@@ -79,7 +79,7 @@ grep -n 'maxEvents <= 0 || maxEvents > 1<<16' internal/aio/aio_linux.go \
 - 但**必须先完成第 1 大步**，否则 macOS 上会 FAIL（PRD F17）。
 - 移到同一个无 tag 文件（或另建 `<subject>_test.go`，与 2.1 保持一致）。
 
-2.3 **给 `mode_test.go` 加文件头注释**，写明它为何仍需门控：
+2.3 **给 `internal/aio/aio_linux_test.go` 加文件头注释**，写明它为何仍需门控：
 ```
 //go:build linux
 //
@@ -95,7 +95,7 @@ grep -n 'maxEvents <= 0 || maxEvents > 1<<16' internal/aio/aio_linux.go \
 # 移出的测试在 macOS 上必须过
 go test -run '^(TestParseMode|TestNewWithOptionsInvalidMaxEvents)$' -count=1 -v ./internal/aio/
 
-# mode_test.go 剩余部分在 linux 视角下仍能编译
+# internal/aio/aio_linux_test.go 剩余部分在 linux 视角下仍能编译
 make check-linux
 
 # 全仓测试的失败集合不许变
@@ -107,17 +107,17 @@ go test -coverprofile=/tmp/aio_step2.cover ./internal/aio/
 # 用 0.3 的口径解析 aio.go 那一行
 ```
 
-**回滚点**：`git checkout -- internal/aio/mode_test.go` 并删除新文件。
+**回滚点**：`git checkout -- internal/aio/aio_linux_test.go` 并删除新文件。
 
 ---
 
-## 第 3 大步 · R3 补 `probe_cache.go` 的测试
+## 第 3 大步 · R3 补 `aio_internal.go` 的测试
 
-**文件**：新增一个不带 tag 的测试文件（建议 `internal/aio/probe_cache_test.go`）；**`probe_cache.go` 本身不许改**。
+**文件**：新增一个不带 tag 的测试文件（建议 `internal/aio/probe_cache_test.go`）；**`aio_internal.go` 本身不许改**。
 
 3.1 按 `design.md` §3 的三个用例写：热缓存命中（哨兵值）、冷缓存穿透（断言第二次**不**穿透）、并发安全（全部返回同一 `Info`）。
 
-3.2 每个用例都要在 `probeMu` 保护下**保存并还原** `probeInfo`/`probeDone`（照 `mode_test.go:128-135` 的手法），避免污染同包其他用例。
+3.2 每个用例都要在 `probeMu` 保护下**保存并还原** `probeInfo`/`probeDone`（照 `internal/aio/aio_linux_test.go:128-135` 的手法），避免污染同包其他用例。
 
 3.3 **断言必须平台无关** —— 不许断言 `Probe().Supported` 的具体取值。
 
@@ -125,10 +125,10 @@ go test -coverprofile=/tmp/aio_step2.cover ./internal/aio/
 ```bash
 go test -run '^TestProbe' -count=1 -v ./internal/aio/
 go test -coverprofile=/tmp/aio_step3.cover ./internal/aio/
-# probe_cache.go 必须由 0/8 变为非零
+# aio_internal.go 必须由 0/8 变为非零
 
 # 该文件确实没被改动
-git diff --stat -- internal/aio/probe_cache.go    # 必须无输出
+git diff --stat -- internal/aio/aio_internal.go    # 必须无输出
 
 # 两个平台都要过
 make check && make check-linux
@@ -146,7 +146,7 @@ go test -cover ./internal/aio/ 2>&1 | tail -1
 # 按 0.3 的口径逐文件解析，记录：
 #   - 全包新百分比
 #   - aio.go 新值（应 ≥ 11/36）
-#   - probe_cache.go 新值（应 > 0/8）
+#   - aio_internal.go 新值（应 > 0/8）
 #   - 平台无关三文件合计（基期 8/51 = 15.7%）
 ```
 
@@ -166,16 +166,16 @@ go test -cover ./internal/aio/ 2>&1 | tail -1
 - 逐条补字段名。**先确认 `uringRingField` 的字段定义与顺序**，别按猜的写。
 - 改完 `go vet ./internal/aio/` 必须无输出。
 
-5.3 **手写 `Unlock` 改 `defer`** —— `aio_linux.go:121,160,168,174`
+5.3 **手写 `Unlock` 改 `defer`** —— `aio_libaio_linux.go:121,160,168,174`
 - ⚠️ **这是本任务唯一有争议的一处**：`submitBatch` 在 `errno != 0` 分支里是「先 `Unlock` 再判 errno 分派」。若复查认为「先解锁再处理 errno」是刻意意图，**则不改 `defer`，改为补注释说明该意图** —— 两条路选一条，不能两者都不做。
 - 若改 `defer`：`defer r.mu.Unlock()` 紧跟在 `Lock()` 之后。`submitBatch` 末尾的 `r.seq = base + uint64(submitted)` 必须在锁内，`defer` 的语义正好满足。
 - 改完必须跑 `make check-linux`。
 
-5.4 **`if/else` 两分支赋同一变量** —— `aio_other.go:107-113`
+5.4 **`if/else` 两分支赋同一变量** —— `aio_fallback_other.go:107-113`
 - 让 `if` 只选 syscall，`res = result(n, err)` 提到分支外。
 - 注意：两条分支的 `n, err` 变量作用域要调整，别让 `n`/`err` 泄漏到分支外产生新的编译错误（`go vet` 会抓）。
 
-5.5 **`mu` 加保护范围注释** —— `aio_other.go:17`
+5.5 **`mu` 加保护范围注释** —— `aio_fallback_other.go:17`
 - `mu sync.Mutex // 保护 seq / inflight / closed`
 
 **验证（每小步都做）**：
@@ -198,8 +198,8 @@ go test -count=1 ./internal/aio/
 | 6.2 | R5 | `architecture/code-style.md` | `:318` 的 AppendBatch 改 **126 行（`:439-564`）**；正文写明跨度的测量口径（花括号配平、`end - start + 1`、不含下一函数的文档注释）。把全仓 21 个超 50 行函数**逐条登记**并写可检验理由（含 aio 三处：`mapUringRing:222-298`、`submit:483-559`、`Wait:589-644`），写明「什么样的理由算合格」 |
 | 6.3 | R6 | `architecture/code-style.md` | `_ =` 分布表把「编译期断言」与「error 丢弃」分开（aio 的 11 处里 6 处是断言、5 处真丢弃）；正文写明 `^[[:space:]]*_ =` 口径的盲区（漏 `defer func() { _ = ... }()`，`probe_linux.go:29`） |
 | 6.4 | R7 | `engine/buffer-and-concurrency.md` | 按 `design.md` D1 走**归类**：在 §6 追加一类，写明「存活期由一次同步 syscall 限死 + join 点是公开 API `Wait()`（`:155` 阻塞于 `<-o.done`，`:117` 关闭它）」。同时点名 `client.go:28`、`registry.go:74`、`storage.go:94`；在正文写明 §6.1 表锚在 `go` 行、WaitGroup 段锚在声明行这一锚法差异 |
-| 6.5 | R8 | `platform/build-verification.md`、`testing/unit-tests.md` | 两处 off-by-N：`:63` 的 `aio_linux.go:10-13` → `:11-14`；`:324` 的 `aio_backends_linux_test.go:9-13` → `:9-11` |
-| 6.6 | R9 | `platform/file-splitting.md` | `:140` 规则 7 补 `checkIOPoll`（`aio_uring_linux.go:20`）与 `ringQueueDepth`（`:411`），写明对手在 `probe_other.go:17`/`:25` 而非 `aio_other.go` |
+| 6.5 | R8 | `platform/build-verification.md`、`testing/unit-tests.md` | 两处 off-by-N：`:63` 的 `aio_libaio_linux.go:10-13` → `:11-14`；`:324` 的 `aio_backends_linux_test.go:9-13` → `:9-11` |
+| 6.6 | R9 | `platform/file-splitting.md` | `:140` 规则 7 补 `checkIOPoll`（`aio_uring_linux.go:20`）与 `ringQueueDepth`（`:411`），写明对手在 `probe_other.go:17`/`:25` 而非 `aio_fallback_other.go` |
 | 6.7 | R10 | `testing/unit-tests.md` | `:57-70` 的表格口径统一（按声明范围重算为 0/0/0/0/55/132/81/57，或保留整仓数并改范围句 + 说明两个口径都给了）；写清 `func Benchmark` 的 0 与整仓 16 的关系；**补可复现命令** |
 | 6.8 | R11 | `testing/unit-tests.md` | 按 `design.md` D2 **收窄** `:176` 的措辞为「helper 里借出并返回给调用方的资源用 `t.Cleanup`」，并引用 `aio_test.go:31`（`newTestFile` 的正例）与 `transport_shm_test.go:71-79`（原范例）两处锚点 |
 | 6.9 | — | `architecture/api-surface.md` | `:232` 的「待裁定的代码缺陷」（maxEvents 上界）同步改为「已修，见本任务」，保持与第 1 大步一致 |
@@ -264,8 +264,8 @@ git status --porcelain -- '*.go' | grep -v '^ M internal/aio/\|^?? internal/aio/
 
 | 步 | 回滚方式 | 代价 |
 |---|---|---|
-| 1 | `git checkout -- internal/aio/aio_other.go` | 零 |
-| 2 | `git checkout -- internal/aio/mode_test.go` + 删新文件 | 零 |
+| 1 | `git checkout -- internal/aio/aio_fallback_other.go` | 零 |
+| 2 | `git checkout -- internal/aio/aio_linux_test.go` + 删新文件 | 零 |
 | 3 | 删新测试文件 | 零 |
 | 5 | `git checkout -- internal/aio/` | 零（行为不变） |
 | 6 | `git checkout -- .trellis/spec/` | 零（纯 markdown） |

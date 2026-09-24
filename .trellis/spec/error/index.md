@@ -71,7 +71,7 @@ ErrTooLarge = errors.New("taihu: object too large, exceeds segment size")
 
 **规则**：需要携带额外信息时定义自定义错误类型，用 `errors.As` 提取。
 
-**对 taihu：部分适用——机制适用，形态少见。** 本仓库全仓只有**一个**自定义 error 类型：`internal/aio/aio_uring_linux.go:406-409` 的 `uringParamError`（`:411` 是它的 `Error()` 方法）。
+**对 taihu：部分适用——机制适用，形态少见。** 本仓库全仓只有**一个**自定义 error 类型：`internal/aio/aio_uring_params_linux.go:98-101` 的 `uringParamError`（`:103` 是它的 `Error()` 方法）。
 
 这不是「还没做」。本仓库的绝大多数错误信息走**包装链**（`fmt.Errorf("op: %w", err)` 层层加前缀）而不是**携带字段的错误类型**，因为：
 

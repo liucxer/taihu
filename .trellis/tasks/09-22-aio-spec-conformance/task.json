@@ -2,7 +2,7 @@
   "id": "aio-spec-conformance",
   "name": "aio-spec-conformance",
   "title": "修正 internal/aio 审计发现的规范偏差",
-  "description": "对 internal/aio 做逐条规范符合性审计后发现的偏差修正：规则 12 的 aio 例外叙述过宽（平台无关部分实测 15.7% 却被判为「测不到」）、TestParseMode 被无关的 //go:build linux 挡住、probe_cache.go 覆盖率 0%、code-style 规则 17 的 AppendBatch 行数写错（126 而非 133）、长函数例外登记只覆盖 1/20、_ = 计数口径混入 unsafe.Sizeof 编译期断言。",
+  "description": "对 internal/aio 做逐条规范符合性审计后发现的偏差修正：规则 12 的 aio 例外叙述过宽（平台无关部分实测 15.7% 却被判为「测不到」）、TestParseMode 被无关的 //go:build linux 挡住、aio_internal.go 覆盖率 0%、code-style 规则 17 的 AppendBatch 行数写错（126 而非 133）、长函数例外登记只覆盖 1/20、_ = 计数口径混入 unsafe.Sizeof 编译期断言。",
   "status": "planning",
   "dev_type": null,
   "scope": null,

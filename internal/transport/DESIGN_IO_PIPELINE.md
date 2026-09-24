@@ -205,7 +205,7 @@ func (q *TaskQueue[T]) takeN() []T {                 // drain：清空当前队�
 
 | 层 | 改动 |
 |----|------|
-| `internal/aio` | 新增 `SubmitWriteBatch(fd, specs) (firstSeq, submitted, err)`，复用 `submitBatch`（传 `opcodePwrite`）；`aio_other.go` goroutine+pwrite 兜底 |
+| `internal/aio` | 新增 `SubmitWriteBatch(fd, specs) (firstSeq, submitted, err)`，复用 `submitBatch`（传 `opcodePwrite`）；`aio_fallback_other.go` goroutine+pwrite 兜底 |
 | `internal/device` | 新增 `AppendBatch(ctx, []AppendJob) error`（对齐直写 + 尾块补零逻辑逐项保留，批量排空）；待 device 重构落地后成为两个批量接口之一 |
 | `internal/storage` | 新增 `BatchPutBegin(ctx, items)` / `BatchPutCommit(ctx, items)`（对齐 `PutBegin`/`PutCommit` 语义的批量版） |
 

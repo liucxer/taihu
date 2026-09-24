@@ -36,7 +36,7 @@
 
 **这张表的第一版是错的，2026-09-22 复核时才发现并订正**：原版漏了 `cmd/taihu/cmd` 与 `internal/ierr`，于是包数写成 15、均值写成 90.9%、「已在此之上」写成 11。根因是 `cmd/taihu/cmd` 的 `coverage:` 行被测试二进制的裸 `FAIL` 隔开、**单独占一行**，按「`ok`/`FAIL` 行」抓取会整个漏掉。该陷阱已写进 spec 规则本体，防止下一个人重蹈。
 
-**`internal/aio` 的例外性质（必须写清，不能简化成「平台问题」）**：本机测得的 48.2% 分母只有 137 条语句 —— Linux 专属的 1017 行（占该包 66%）在 macOS 上**不编译、不进统计**，`probe_linux_test.go` 带 `_linux_test` 后缀在本机也不运行，而 `make check-linux` 只做 `go test -c`（编译不执行，见 `Makefile:69`）。所以这是**本机测不到真实覆盖率**，不是「测试写得少」。
+**`internal/aio` 的例外性质（必须写清，不能简化成「平台问题」）**：本机测得的 48.2% 分母只有 137 条语句 —— Linux 专属的 1017 行（占该包 66%）在 macOS 上**不编译、不进统计**，`internal/aio/aio_linux_test.go` 带 `_linux_test` 后缀在本机也不运行，而 `make check-linux` 只做 `go test -c`（编译不执行，见 `Makefile:69`）。所以这是**本机测不到真实覆盖率**，不是「测试写得少」。
 
 ### 工程结构
 

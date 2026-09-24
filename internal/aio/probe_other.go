@@ -5,7 +5,7 @@ package aio
 import "errors"
 
 // probe 探测 io_uring 可用性。非 Linux 平台恒不支持，且结论是确定性的（可缓存）。
-// 结论缓存与转发在 probe_cache.go。
+// 结论缓存与转发在 aio_internal.go。
 func probe() (info, bool) {
 	return info{Reason: "io_uring 仅 Linux 支持", KernelRelease: kernelRelease()}, true
 }

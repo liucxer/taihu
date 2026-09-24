@@ -18,17 +18,17 @@
 
 ### D1 · R7 走「归类」而非「补 join 点」
 
-**问题**：`aio_other.go:98` 每次 `Submit` 起一个 goroutine，`Close()`（`:190-196`）不等待。§六 的 6.1–6.5 里没有它的位置，而 §六 末尾写着「不在这节里的『不遵守』不是偏离，是遗漏 —— 按缺陷处理」。
+**问题**：`aio_fallback_other.go:98` 每次 `Submit` 起一个 goroutine，`Close()`（`:190-196`）不等待。§六 的 6.1–6.5 里没有它的位置，而 §六 末尾写着「不在这节里的『不遵守』不是偏离，是遗漏 —— 按缺陷处理」。
 
 **两个选项**：
 - (a) 在 §6 追加一类并给出可检验理由；
 - (b) 给 `ring` 加 `sync.WaitGroup`，`Close` 里 `wg.Wait()`，使其落回 6.1。
 
-**选 (a)。** 判据是 §六 抬头引的 `uber-048`/`049` 原文：「每个 goroutine 要么有**可预测的结束时间**，要么有**通知它停止的信号**；两种情况都还要有**办法阻塞等待它结束**」。逐条对 `aio_other.go:98`：
+**选 (a)。** 判据是 §六 抬头引的 `uber-048`/`049` 原文：「每个 goroutine 要么有**可预测的结束时间**，要么有**通知它停止的信号**；两种情况都还要有**办法阻塞等待它结束**」。逐条对 `aio_fallback_other.go:98`：
 
 | 要求 | 满足？ | 依据 |
 |---|---|---|
-| 可预测的结束时间 | ✅ | 存活期被**一次同步 `unix.Pread`/`Pwrite`** 限死（`aio_other.go:107-113`），无循环、无阻塞等待 |
+| 可预测的结束时间 | ✅ | 存活期被**一次同步 `unix.Pread`/`Pwrite`** 限死（`aio_fallback_other.go:107-113`），无循环、无阻塞等待 |
 | 有办法阻塞等待它结束 | ✅ | `ring.Wait`（`:140-187`）的 `collect()` 在 `:155` 阻塞于 `<-o.done`，而 `o.done` 正是该 goroutine 在 `:117` `close` 的 —— **join 点就是公开 API `Wait()`** |
 
 即：**它已经满足规则的字面要求**，只是没被归类。这与 §6.2（handler 有停止信号但**无** join 点）和 §6.3（worker 既无停止信号也**无** join 点）是不同性质 —— 那两处是「明知不满足、登记为已知例外」，这里是「满足但漏登记」。
@@ -68,18 +68,18 @@ func shmDial(t *testing.T, uds string) *ShmConn {
 
 ### D3 · R2 采纳「收紧」而非「保持现状」
 
-**问题**：`aio_other.go:32` 只判下界，Linux 两侧判双边，文档声明 `[1, 65536]`。
+**问题**：`aio_fallback_other.go:32` 只判下界，Linux 两侧判双边，文档声明 `[1, 65536]`。
 
 **选收紧。** 三条独立理由：
 1. **文档已经声明了契约**，代码没兑现 —— 是代码错，不是文档错（`aio_internal.go:18` 的文案、`aio.go:135` 的 doc 都写 `[1, 65536]`）。
-2. **有测试在证明它该被修**：`mode_test.go:47-57` 断言三种模式都拒绝三个越界值 —— 它现在被 `//go:build linux` 挡着才没在 macOS 上失败。**这个门控正在掩盖一个真实的平台行为不一致**，这本身比那个 1 行 bug 更值得修。
+2. **有测试在证明它该被修**：`internal/aio/aio_linux_test.go:47-57` 断言三种模式都拒绝三个越界值 —— 它现在被 `//go:build linux` 挡着才没在 macOS 上失败。**这个门控正在掩盖一个真实的平台行为不一致**，这本身比那个 1 行 bug 更值得修。
 3. **影响面为零**：唯一生产调用方传编译期常量 `aioDepth = 256`（`internal/device/device.go:33,95`），永远落在合法区间内。
 
-## 3. 机制设计：`probe_cache.go` 怎么在不改生产逻辑的前提下测（R3）
+## 3. 机制设计：`aio_internal.go` 怎么在不改生产逻辑的前提下测（R3）
 
-`probe_cache.go` **没有测试缝隙** —— `probe()` 是平台文件里声明的**函数**（`probe_linux.go:19` / `probe_other.go:9`），不是可替换的包级变量，测试无法替换它。
+`aio_internal.go` **没有测试缝隙** —— `probe()` 是平台文件里声明的**函数**（`probe_linux.go:19` / `probe_other.go:9`），不是可替换的包级变量，测试无法替换它。
 
-**不新造缝隙**（PRD R3 明确禁止改该文件的生产逻辑）。沿用**仓内既有的白盒手法** —— `mode_test.go:128-139` 已经开了先例：
+**不新造缝隙**（PRD R3 明确禁止改该文件的生产逻辑）。沿用**仓内既有的白盒手法** —— `internal/aio/aio_linux_test.go:128-139` 已经开了先例：
 
 ```go
 probeMu.Lock()
@@ -92,7 +92,7 @@ t.Cleanup(func() {          // 还原，避免污染同包其他用例
 })
 ```
 
-测试要覆盖 `probe_cache.go` 的 8 条语句，分三个用例：
+测试要覆盖 `aio_internal.go` 的 8 条语句，分三个用例：
 
 | 用例 | 手法 | 覆盖的语句 | 平台相关性 |
 |---|---|---|---|
@@ -107,11 +107,11 @@ t.Cleanup(func() {          // 还原，避免污染同包其他用例
 ## 4. 执行顺序（不可交换）
 
 ```
-① R2  修 aio_other.go:32 的上界              ← 行为变更，先做
+① R2  修 aio_fallback_other.go:32 的上界              ← 行为变更，先做
       ↓ 依赖
 ② R1  移 TestParseMode（独立）+ 移 TestNewWithOptionsInvalidMaxEvents（依赖①）
       ↓
-③ R3  probe_cache.go 补测
+③ R3  aio_internal.go 补测
       ↓
 ④ 实测新覆盖率 → 回填 spec 的数字
       ↓
@@ -134,8 +134,8 @@ t.Cleanup(func() {          // 还原，避免污染同包其他用例
 |---|---|
 | **公开 API** | 无变化。`Ring` 接口、`Mode`、`NewWithOptions`、`Probe` 的签名与语义全部不动 |
 | **行为（R2）** | 非 Linux 平台上 `NewWithOptions(65537, …)` 由「成功」变「返回 `errInvalidMaxEvents`」。**是收紧**，且生产路径传 `256`，不可达 |
-| **Linux 生产路径** | 完全不变。R2 只改 `aio_other.go`（`!linux`）；R1/R3 只动测试；R12 的五处是等价改写 |
-| **测试** | `mode_test.go` 减少两个测试（移走，不是删除）；新增两个测试文件（无 tag） |
+| **Linux 生产路径** | 完全不变。R2 只改 `aio_fallback_other.go`（`!linux`）；R1/R3 只动测试；R12 的五处是等价改写 |
+| **测试** | `internal/aio/aio_linux_test.go` 减少两个测试（移走，不是删除）；新增两个测试文件（无 tag） |
 | **spec 引用** | 修正 2 处 off-by-N 锚点；新增/改写的规则必须过 `verify_spec_refs.py` |
 
 ## 6. 验证策略
@@ -181,7 +181,7 @@ diff /tmp/before.txt /tmp/after.txt
 
 | 风险 | 对策 |
 |---|---|
-| **R12 的 `defer r.mu.Unlock()` 落在热路径** | 五处都是等价改写；`make check-linux` 强制过；提交信息写明理由。若复查时认为 `aio_linux.go` 的两处 `Unlock` 有「先解锁再处理 errno」的刻意意图，则**改为补注释说明意图**而不是改 `defer` —— 见 `implement.md` 的对应步骤 |
+| **R12 的 `defer r.mu.Unlock()` 落在热路径** | 五处都是等价改写；`make check-linux` 强制过；提交信息写明理由。若复查时认为 `aio_libaio_linux.go` 的两处 `Unlock` 有「先解锁再处理 errno」的刻意意图，则**改为补注释说明意图**而不是改 `defer` —— 见 `implement.md` 的对应步骤 |
 | **移测试时漏掉对平台符号的依赖** | 每个测试移出前先单独摘到无 tag 文件跑一次（本设计的三个决策都是这么定下来的，PRD F16/F17 已证实该手法可用） |
 | **改 spec 数字时引入新的算错** | 所有计数都附可复现命令（R10 的要求），且写完立刻重跑该命令比对 |
 | **R7(a) 的新类别被当成万能豁免** | 新类别的正文必须写明**它为什么满足规则**（可预测结束时间 + `Wait()` 是 join 点），而不是「允许不等待」。这一条是 R7 验收的一部分 |

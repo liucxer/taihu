@@ -88,7 +88,7 @@ Storage.Put (pkg/taihu-client/storage.go:181)
  → Device.Append (device.go:269)，fd=O_RDWR|O_DIRECT 无 O_SYNC (device_linux.go:12)
      4K 对齐快路径(bufAligned)：主体 bulkEnd 零拷贝直写调用方缓冲，仅 <4K 尾块 bufpool 4K 补零
      非对齐兜底：copy 进 bufpool.Get(aligned) 两段写
-     异步：aio.Ring.io_submit 批提交 (aio_linux.go:136) → 单 pump goroutine 串行 Wait(io_getevents) 分发 (device.go:142)
+     异步：aio.Ring.io_submit 批提交 (aio_libaio_linux.go:136) → 单 pump goroutine 串行 Wait(io_getevents) 分发 (device.go:142)
      → submitOp 阻塞至完成事件并校验 res = 内核已提交（无 O_SYNC，需显式 Sync 才持久化）
 ```
 

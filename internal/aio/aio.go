@@ -21,9 +21,9 @@
 //   - Linux + O_DIRECT 时 buf 首地址、偏移、长度需 4K 对齐（由 bufpool/device 层保证）。
 //
 // 本文件集中该包的**全部对外 API**（类型、常量与入口函数），且**只含导出名** ——
-// 未导出的常量、变量、类型与辅助函数在 aio_internal.go，探测结论缓存在 probe_cache.go。
-// 后端实现按平台分文件：aio_linux.go（libaio）、aio_uring_linux.go（io_uring）、
-// aio_other.go（非 Linux 兜底）；探测的实现细节在 probe_linux.go / probe_other.go。
+// 未导出的常量、变量、类型与辅助函数在 aio_internal.go（探测结论缓存也在该文件）。
+// 后端实现按平台分文件：aio_libaio_linux.go（libaio）、aio_uring_linux.go（io_uring）、
+// aio_fallback_other.go（非 Linux 兜底）；探测的实现细节在 probe_linux.go / probe_other.go。
 package aio
 
 import (
