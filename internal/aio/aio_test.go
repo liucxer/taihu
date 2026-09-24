@@ -14,19 +14,20 @@ import (
 	"github.com/liucxer/taihu/internal/ierr"
 )
 
-// 本文件是三份环境入口共用的契约测试：
+// 本文件是**平台无关**的契约测试（无 build tag，全平台编译运行）——平台入口见
+// aio_linux_test.go / aio_darwin_test.go：
 //
-//   - aio_darwin_test.go     macOS（只有兜底实现，无 O_DIRECT）
-//   - aio_linux419_test.go   Linux 4.19 验证机
-//   - aio_linux510_test.go   Linux 5.10 验证机
+//   - aio_test.go          本文件：平台无关的契约与选项用例
+//   - aio_linux_test.go    Linux 专属（libaio / io_uring / 探测 / 4.19 与 5.10 两份入口）
+//   - aio_darwin_test.go   macOS 入口（只有兜底实现，无 O_DIRECT）
 //
 // 入口文件只负责「本环境跑哪些后端、哪些通道，外加哪些平台事实断言」；契约本体
 // （runRingContract）在这里，Ring 的 6 个方法全部覆盖，IO 尺寸覆盖 ioSizeTable 的
 // 每一档（4K…4M），且每次都用独立于 ring 的第二个 fd 双向校验数据一致性。
 //
-// 为什么按环境拆入口：build tag 只能按 GOOS/GOARCH 分，分不出内核版本，所以 4.19 与
-// 5.10 两份会同时编译进同一个测试二进制，靠运行期内核门控（requireKernel，见
-// aio_linux_test.go）只让匹配的那一份真正跑。
+// 为什么按平台拆入口：build tag 只能按 GOOS/GOARCH 分，分不出内核版本，所以 4.19 与
+// 5.10 两份会同时编译进同一个测试二进制（见 aio_linux_test.go），靠运行期内核门控
+// （requireKernel，见 aio_linux_test.go 的测试基建部分）只让匹配的那一份真正跑。
 
 const testChunk = 4096
 
@@ -58,7 +59,7 @@ type backend struct {
 //
 // 为什么要分通道：同一套契约要在「普通缓冲 IO」与「O_DIRECT」两种形态下各跑一遍 ——
 // 后者是生产形态（device 层用 O_DIRECT 打开设备），但语言层面没有 O_DIRECT 常量
-// （darwin 的 x/sys/unix 里没有该符号），故实现只放在 Linux 侧（aio_linux_test.go）。
+// （darwin 的 x/sys/unix 里没有该符号），故实现只放在 Linux 侧（aio_linux_test.go 的测试基建部分）。
 type testChannel struct {
 	name string
 	// open 把同一个定长文件打开两次，返回两个独立 fd：ring 提交用一个，
@@ -528,7 +529,7 @@ func contractSubmitAfterClose(t *testing.T, b backend, ch testChannel) {
 
 // contractFdSurvivesGC 回归：后端不得持有「用完即丢、却会关闭调用方 fd」的包装对象。
 //
-// 背景见 aio_other.go 里关于 os.NewFile finalizer 的注释：macOS 兜底实现曾把 fd 包成
+// 背景见 aio_fallback_other.go 里关于 os.NewFile finalizer 的注释：macOS 兜底实现曾把 fd 包成
 // os.NewFile，包装对象成垃圾后 GC 会 close 掉**调用方持有的同一个 fd** —— 轻则随机
 // EBADF，重则 kevent 报 EBADF 触发 runtime fatal（netpoll failed）整进程退出。
 func contractFdSurvivesGC(t *testing.T, b backend, ch testChannel) {
@@ -751,4 +752,53 @@ func TestNewWithOptionsIOPollPrecondition(t *testing.T) {
 		t.Fatalf("devPath 为空应跳过校验: %v", err)
 	}
 	_ = r3.Close()
+}
+
+// TestParseMode 覆盖命令行取值解析：大小写/空白归一化、三个合法取值与非法取值。
+func TestParseMode(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    Mode
+		wantErr bool
+	}{
+		{"", ModeAuto, false},
+		{"auto", ModeAuto, false},
+		{"AUTO", ModeAuto, false},
+		{"  Auto\t", ModeAuto, false},
+		{"on", ModeIOUring, false},
+		{"ON", ModeIOUring, false},
+		{" off ", ModeLibAIO, false},
+		{"Off", ModeLibAIO, false},
+		{"bogus", ModeAuto, true},
+		{"1", ModeAuto, true},
+	}
+	for _, c := range cases {
+		got, err := ParseMode(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("ParseMode(%q) = %v, want error", c.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("ParseMode(%q) unexpected error: %v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("ParseMode(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// TestNewWithOptionsInvalidMaxEvents MaxEvents 越界时三个后端取值都必须报错，不得静默建出队列。
+func TestNewWithOptionsInvalidMaxEvents(t *testing.T) {
+	for _, m := range []Mode{ModeLibAIO, ModeIOUring, ModeAuto} {
+		for _, n := range []int{0, -1, 1<<16 + 1} {
+			r, err := NewWithOptions(Options{Mode: m, MaxEvents: n}, "")
+			if err == nil {
+				_ = r.Close()
+				t.Errorf("NewWithOptions({Mode: %d, MaxEvents: %d}) 应报错", int(m), n)
+			}
+		}
+	}
 }

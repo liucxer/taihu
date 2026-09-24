@@ -31,7 +31,7 @@ type op struct {
 
 // newLibAIORing 构建兜底队列。非 Linux 平台没有 libaio，落到这里。
 func newLibAIORing(maxEvents int) (Ring, error) {
-	if maxEvents <= 0 {
+	if maxEvents <= 0 || maxEvents > 1<<16 {
 		return nil, errInvalidMaxEvents
 	}
 	return &ring{

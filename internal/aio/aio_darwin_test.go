@@ -5,7 +5,7 @@ package aio
 import "testing"
 
 // 本文件是 macOS（开发/自测环境）的入口：本平台只有 goroutine + 同步 pread/pwrite 的
-// 兜底实现（aio_other.go），没有 libaio、没有 io_uring，也没有 O_DIRECT（darwin 的
+// 兜底实现（aio_fallback_other.go），没有 libaio、没有 io_uring，也没有 O_DIRECT（darwin 的
 // x/sys/unix 里根本没有 O_DIRECT 符号），故只跑普通缓冲 IO 这一条通道。
 //
 // 契约本体在 aio_test.go 的 runRingContract 里跨平台共享。
@@ -45,7 +45,7 @@ func TestDarwinPlatformFacts(t *testing.T) {
 	}
 }
 
-// fallbackBackend macOS 上唯一可跑的后端：aio_other.go 的 goroutine 兜底。
+// fallbackBackend macOS 上唯一可跑的后端：aio_fallback_other.go 的 goroutine 兜底。
 // 非 Linux 上 ModeLibAIO 没有内核接口可走，newLibAIORing 就落在这里。
 // 兜底实现逐条起 goroutine，没有队列深度上限，故 depthLimit=false（契约里的
 // queue_full 子测试不适用）。
