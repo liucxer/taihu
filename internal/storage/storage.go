@@ -1,14 +1,23 @@
+// Package storage 对象存储核心：编排 metastore（元数据持久化）+ device（裸盘 O_DIRECT），
+// 对上层（transport / cmd / cluster）暴露对象读写与容量管理。Storage 不感知 pebble 键格式
+// 与 O_DIRECT 对齐之外的细节：对齐与段快照语义在本层吸收。
+//
+// 本文件是包内**唯一导出文件**：全部 public 顶层声明（Storage 类型、BatchReadBlock/
+// BatchedReadResult/Compactor/CompactorConfig/Option、NewStorage/NewCompactor/
+// DefaultCompactorConfig/WithAIOMode/WithAIOIOPoll）集中于此；
+// 其余文件（write.go / read.go / compact.go / admin.go / options.go）只保留 Storage 方法
+// 实现与私有辅助。新增对外符号一律收敛到本文件，避免导出面散落。
 package storage
 
 import (
 	"context"
-	"fmt"
-	"io"
+	"sync"
+	"time"
 
+	"github.com/liucxer/taihu/internal/aio"
 	"github.com/liucxer/taihu/internal/device"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
-	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // Storage 对外 object 存储。数据写底层裸设备，key→位置映射经由 metastore（pebble）持久化，
@@ -76,270 +85,11 @@ func (s *Storage) Close() error {
 	return err
 }
 
-// Put 写入对象。size 为对象逻辑长度，in 提供数据（使用 in[:size] 的前 size 字节，
-// in 不足 size 字节时报错）。先从 db 原子申请写位置（段满自动滚动），
-// 再写设备数据，最后写映射。设备写位于分配锁之外，并发 Put 可写不同偏移。
-// 等价于 PutBegin + PutAppend + PutCommit（供一次性写调用方；分段直写走三个方法）。
-func (s *Storage) Put(ctx context.Context, key string, size int64, in []byte) error {
-	seg, off, err := s.PutBegin(ctx, key, size)
-	if err != nil {
-		return err
-	}
-	if size > 0 {
-		if err := s.PutAppend(ctx, seg, off, size, in); err != nil {
-			return err
-		}
-	}
-	return s.PutCommit(ctx, key, seg, off, size)
-}
-
-// PutBegin 校验 size 并原子分配段游标（返回 4K 对齐 off），开始分段写。
-// key 仅语义占位（分配不依赖 key，映射在 PutCommit 建立）。
-func (s *Storage) PutBegin(ctx context.Context, key string, size int64) (segmentID, off int64, err error) {
-	if size < 0 {
-		return 0, 0, ierr.ErrInvalidRange
-	}
-	if size > s.layout.SegmentSizeBytes {
-		return 0, 0, ierr.ErrTooLarge
-	}
-	return s.db.AllocateSegment(size)
-}
-
-// PutAppend 直写一段数据到段内 off 处。data 首地址 4K 对齐时零拷贝直写设备
-// （O_DIRECT 直写调用方缓冲），非对齐/尾段由 device.Append 内部对齐缓冲兜底。
-// 分段调用方须保证 off 递增（off + 已写字节数）且各段相邻。
-func (s *Storage) PutAppend(ctx context.Context, segmentID, off, size int64, data []byte) error {
-	if int64(len(data)) < size {
-		return ierr.ErrShortWrite
-	}
-	return s.dev.Append(ctx, segmentID, off, size, data)
-}
-
-// PutCommit 建立 key→(segmentID, off, size) 映射。顺序保证：先写设备数据，再写元数据，
-// 避免出现「有映射无数据」。
-func (s *Storage) PutCommit(ctx context.Context, key string, segmentID, off, size int64) error {
-	meta := metastore.ObjectMeta{SegmentID: segmentID, Offset: off, Size: size}
-	return s.db.PutMapping(ctx, key, meta)
-}
-
-// PutItem 批量写的一个条目：把 Data 的前 Size 字节写入 Key。
-type PutItem struct {
-	Key  string
-	Size int64
-	Data []byte
-}
-
-// BatchPut 批量写对象（等价于多次 Put 的批量版，供写流水线并发排空）：
-// 先批量申请写位置（单次游标持久化）→ 一次设备批量写（单次 io_submit）→
-// 一次 Pebble Batch 提交全部映射。任一项校验失败或设备写失败时整体返回错误
-// （与 Put 语义一致：有数据落盘但无映射的孤儿块由 segment GC 兜底回收）。
-func (s *Storage) BatchPut(ctx context.Context, items []PutItem) error {
-	if len(items) == 0 {
-		return nil
-	}
-	sizes := make([]int64, len(items))
-	for i := range items {
-		it := &items[i]
-		if it.Size < 0 {
-			return ierr.ErrInvalidRange
-		}
-		if it.Size > s.layout.SegmentSizeBytes {
-			return ierr.ErrTooLarge
-		}
-		if int64(len(it.Data)) < it.Size {
-			return ierr.ErrShortWrite
-		}
-		sizes[i] = it.Size
-	}
-
-	res, err := s.db.AllocateSegmentBatch(sizes)
-	if err != nil {
-		return err
-	}
-	jobs := make([]device.WriteJob, 0, len(items))
-	for i := range items {
-		if items[i].Size == 0 {
-			continue
-		}
-		jobs = append(jobs, device.WriteJob{
-			SegmentID: res[i].SegmentID,
-			Off:       res[i].Offset,
-			Data:      items[i].Data[:items[i].Size],
-			Size:      items[i].Size,
-		})
-	}
-	if len(jobs) > 0 {
-		if err := s.dev.AppendBatch(ctx, jobs); err != nil {
-			return err
-		}
-	}
-	comm := make([]metastore.PutMappingItem, len(items))
-	for i := range items {
-		comm[i] = metastore.PutMappingItem{
-			Key: items[i].Key,
-			Meta: metastore.ObjectMeta{
-				SegmentID: res[i].SegmentID,
-				Offset:    res[i].Offset,
-				Size:      items[i].Size,
-			},
-		}
-	}
-	return s.db.BatchPutMapping(ctx, comm)
-}
-
-// BatchAppend 批量设备写：Data[:Size] 写段内 Off 处（4K 对齐，末尾补零）。
-// 供 shm 写流水线按帧批量排空数据段（不涉及分配/元数据）。
-func (s *Storage) BatchAppend(ctx context.Context, jobs []device.WriteJob) error {
-	return s.dev.AppendBatch(ctx, jobs)
-}
-
-// BatchPutCommit 批量建立 key→(segmentID,off,size) 映射（单个 Pebble Batch 原子提交）。
-// 「先写设备数据、再写元数据」的顺序由调用方保证（本方法只做元数据批量提交）。
-func (s *Storage) BatchPutCommit(ctx context.Context, items []metastore.PutMappingItem) error {
-	return s.db.BatchPutMapping(ctx, items)
-}
-
-// BatchDelete 批量删除对象映射。返回 per-key 错误（key 不存在为 ierr.ErrNotFound）
-// 与整体存储错误；物理空间回收留待 segment 级 GC。
-func (s *Storage) BatchDelete(ctx context.Context, keys []string) ([]error, error) {
-	return s.db.BatchDeleteMapping(ctx, keys)
-}
-
-// Meta 返回 key 当前的对象映射快照（不存在返回 ierr.ErrNotFound）。一次 GET 需要跨多个
-// chunk 读取同一 key 时，入口解析一次并全程复用，避免逐 chunk 重解析在多 chunk 响应内
-// 混合两个版本（详见 ReadAtMeta）。
-func (s *Storage) Meta(ctx context.Context, key string) (metastore.ObjectMeta, error) {
-	return s.db.GetMapping(ctx, key)
-}
-
 // RefSegment / UnrefSegment 透出段读引用：GET 级快照须在整段读取期间持有快照段引用，
 // 否则覆盖写/删除后该段存活计数归零转 Reclaiming 并被 GC 复用，迟到的 chunk 会读到
 // 他人数据（比版本混合更严重的静默损坏）。
 func (s *Storage) RefSegment(segmentID int64)   { s.db.RefSegment(segmentID) }
 func (s *Storage) UnrefSegment(segmentID int64) { s.db.UnrefSegment(segmentID) }
-
-// ReadAt 读取对象内 [off, off+size) 区间的数据并返回（返回值为从 bufpool 取出的池化
-// 缓冲或 nil；调用方用毕必须 bufpool.Put(返回值) 归还，否则造成池泄漏）。
-//
-// 对外不要求 off/size 对齐（Storage 层吸收 O_DIRECT 的 4K 对齐细节）：
-// 将物理读向下/向上对齐到 4K，再取回请求窗口。对齐区间（skip==0 且 size 为 4K 倍数）
-// 零拷贝直读，非对齐区间在池化缓冲内原址平移一次。
-//
-// 错误与边界：
-//   - off < 0 或 off > Size：ierr.ErrInvalidRange；
-//   - 请求超出对象结尾：截断到剩余字节，返回的部分不足 size 时附 io.EOF；
-//   - off == Size（剩余 0）：返回 (nil, io.EOF)。
-func (s *Storage) ReadAt(ctx context.Context, key string, off, size int64) ([]byte, error) {
-	meta, err := s.db.GetMapping(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	return s.ReadAtMeta(ctx, meta, off, size)
-}
-
-// ReadAtMeta 与 ReadAt 同语义（含 bufpool 归还契约），区别是映射由调用方以快照形式
-// 提供：一次 GET 跨多个 chunk 时入口解析一次 meta 并全程复用，使同一响应严格来自单一
-// 版本。调用方负责快照存活 —— 跨 chunk 期间须 RefSegment/UnrefSegment 持有
-// meta.SegmentID 引用，防止该段被 GC 回收复用（见 RefSegment）。
-func (s *Storage) ReadAtMeta(ctx context.Context, meta metastore.ObjectMeta, off, size int64) ([]byte, error) {
-	if off < 0 || off > meta.Size {
-		return nil, ierr.ErrInvalidRange
-	}
-	remaining := meta.Size - off
-	want := size
-	if want > remaining {
-		want = remaining
-	}
-	if want == 0 {
-		return nil, io.EOF
-	}
-
-	// 段内物理读区间 [dstart, dstart+dlen)，向下/向上 4K 对齐。
-	relStart := meta.Offset + off
-	dstart := relStart &^ (layout.BlockSize - 1)
-	dlen := layout.Align4k(relStart+want) - dstart
-	skip := relStart - dstart
-
-	// 读引用计数：防 GC 在读在途时回收并复用该段（迟到读读错数据）。
-	s.db.RefSegment(meta.SegmentID)
-	defer s.db.UnrefSegment(meta.SegmentID)
-
-	data, err := s.dev.ReadAt(ctx, meta.SegmentID, dstart, dlen)
-	if err != nil {
-		return nil, err
-	}
-	if n := int64(len(data)); n < want {
-		// 设备不足（对象末尾）：返回已读前缀，调用方按 io.EOF 收尾。
-		want = n
-	}
-	if skip > 0 || want < int64(len(data)) {
-		// 非对齐窗口：池化缓冲内原址左移，只保留 [skip, skip+want)。
-		n := copy(data, data[skip:skip+want])
-		data = data[:n]
-	}
-	if int64(len(data)) < size {
-		return data, io.EOF
-	}
-	return data, nil
-}
-
-// ReadAtInto 读取对象内 [off, off+size) 区间的数据，直接 DMA 进调用方 dst
-// （服务端 shm 直读共享内存用：免 bufpool→共享内存 memcpy）。
-//
-// 要求：
-//   - off 4K 对齐（O_DIRECT 直读快路径，skip==0；非对齐 off 由调用方回退 ReadAt+拷贝）；
-//   - dst 首地址 4K 对齐（bufAligned）且 cap ≥ align4K(want)（物理读区间含尾部对齐余量）。
-//
-// 返回实际读入的请求窗口字节数（读到对象末尾不足 size 时截断；remaining==0 返回
-// (0, io.EOF)）。dst 中 [0, 返回 n) 为有效数据。
-func (s *Storage) ReadAtInto(ctx context.Context, key string, off, size int64, dst []byte) (int64, error) {
-	meta, err := s.db.GetMapping(ctx, key)
-	if err != nil {
-		return 0, err
-	}
-	return s.ReadAtIntoMeta(ctx, meta, off, size, dst)
-}
-
-// ReadAtIntoMeta 与 ReadAtInto 同语义，映射由调用方以快照形式提供（快照存活责任同
-// ReadAtMeta：跨 chunk 期间须持有 meta.SegmentID 段引用）。
-func (s *Storage) ReadAtIntoMeta(ctx context.Context, meta metastore.ObjectMeta, off, size int64, dst []byte) (int64, error) {
-	if off < 0 || off > meta.Size || off%layout.BlockSize != 0 {
-		return 0, ierr.ErrInvalidRange
-	}
-	remaining := meta.Size - off
-	want := size
-	if want > remaining {
-		want = remaining
-	}
-	if want == 0 {
-		return 0, io.EOF
-	}
-
-	// 段内物理读区间：off 4K 对齐 + meta.Offset 4K 对齐（写入保证）→ skip==0，
-	// dstart = relStart 4K 对齐，dlen 向上对齐到 4K。
-	relStart := meta.Offset + off
-	dlen := layout.Align4k(relStart+want) - relStart
-	if int64(len(dst)) < dlen {
-		return 0, fmt.Errorf("taihu: readinto dst %d < dlen %d", len(dst), dlen)
-	}
-
-	// 读引用计数：防 GC 在读在途时回收并复用该段（迟到读读错数据）。
-	s.db.RefSegment(meta.SegmentID)
-	defer s.db.UnrefSegment(meta.SegmentID)
-
-	n, err := s.dev.ReadAtInto(ctx, meta.SegmentID, relStart, dlen, dst[:dlen])
-	if err != nil {
-		return 0, err
-	}
-	if n < want {
-		// 设备不足（对象末尾）：返回已读前缀，调用方按 EOF 收尾。
-		want = n
-	}
-	if want < size {
-		return want, io.EOF
-	}
-	return want, nil
-}
 
 // BatchReadBlock 批读的一个对象块（直读快路径前置：Off/Size 4K 对齐，Size 为整块）。
 type BatchReadBlock struct {
@@ -355,112 +105,56 @@ type BatchedReadResult struct {
 	Err error // io.EOF 表示读到对象/设备末尾短读；其余为映射/设备错误
 }
 
-// BatchRead 一次性批读多个对象块：把各块解析为设备直读 job 后，交给 device 以一次
-// io_submit 批量提交（摊薄系统调用），完成后再返回各块结果。逐块语义与 ReadAtInto
-// 完全等价（cost 短读截断 + io.EOF）。供服务端"多 stream 一 worker 聚合读"使用。
-func (s *Storage) BatchRead(ctx context.Context, blocks []BatchReadBlock) ([]BatchedReadResult, error) {
-	res := make([]BatchedReadResult, len(blocks))
-	if len(blocks) == 0 {
-		return res, nil
-	}
-	// Phase 1：批量查对象映射（单快照 + 单迭代，摊薄 N 次 pebble Get）→
-	// 段内物理区间，构建 device.ReadJob；持段读引用。
-	keys := make([]string, len(blocks))
-	for i := range blocks {
-		keys[i] = blocks[i].Key
-	}
-	metas, err := s.db.BatchGetMapping(ctx, keys)
-	if err != nil {
-		return res, err
-	}
-	devJobs := make([]device.ReadJob, len(blocks))
-	refed := make([]bool, len(blocks))
-	wants := make([]int64, len(blocks))
-	for i := range blocks {
-		b := &blocks[i]
-		meta := metas[i]
-		if b.Off < 0 || b.Off > meta.Size || b.Off%layout.BlockSize != 0 {
-			return res, ierr.ErrInvalidRange
-		}
-		remaining := meta.Size - b.Off
-		want := b.Size
-		if want > remaining {
-			want = remaining
-		}
-		if want == 0 {
-			res[i] = BatchedReadResult{N: 0, Err: io.EOF}
-			continue
-		}
-		relStart := meta.Offset + b.Off
-		dlen := layout.Align4k(relStart+want) - relStart
-		if int64(len(b.Dst)) < dlen {
-			return res, fmt.Errorf("taihu: batchread dst %d < dlen %d", len(b.Dst), dlen)
-		}
-		s.db.RefSegment(meta.SegmentID)
-		refed[i] = true
-		devJobs[i] = device.ReadJob{SegmentID: meta.SegmentID, Off: relStart, Buf: b.Dst[:dlen], Size: dlen}
-		wants[i] = want
-	}
-	// 整批都无有效 job 时直接返回（已逐块置 EOF）。
-	any := false
-	for i := range devJobs {
-		if refed[i] {
-			any = true
-			break
-		}
-	}
-	// Phase 2：一次设备批提交。
-	if any {
-		if ns, err := s.dev.ReadAtIntoBatch(ctx, devJobs); err != nil {
-			for i := range blocks {
-				if refed[i] {
-					s.db.UnrefSegment(devJobs[i].SegmentID)
-				}
-			}
-			return res, err
-		} else {
-			for i := range blocks {
-				if refed[i] {
-					n := ns[i]
-					want := wants[i]
-					if n < want {
-						want = n
-					}
-					if want < blocks[i].Size {
-						res[i] = BatchedReadResult{N: want, Err: io.EOF}
-					} else {
-						res[i] = BatchedReadResult{N: want}
-					}
-				}
-			}
-		}
-	}
-	// Phase 3：释放所有段读引用。
-	for i := range blocks {
-		if refed[i] {
-			s.db.UnrefSegment(devJobs[i].SegmentID)
-		}
-	}
-	return res, nil
+// CompactorConfig 后台段压缩（compaction）配置。
+// 对应设计文档《segment 级 Compaction（数据迁移）设计方案》。
+type CompactorConfig struct {
+	Interval        time.Duration // 扫描周期
+	HoleThreshold   float64       // 单段空洞率阈值：≥ 该值的 Full 段入候选
+	ForceWatermark  float64       // 全局水位：已用段占比 ≥ 该值强制压缩（不等单段阈值）
+	MaxMovePerRound int           // 每轮搬移对象数上限（限速，防冲击稳态带宽）
 }
 
-// Delete 删除对象的持久化映射。缓存失效由 store 内部处理。物理空间回收留待 segment 级 GC。
-// key 不存在时返回 ierr.ErrNotFound。
-func (s *Storage) Delete(ctx context.Context, key string) error {
-	if _, err := s.db.GetMapping(ctx, key); err != nil {
-		return err
+// DefaultCompactorConfig 返回默认配置：60s 低频扫描、空洞 80% 或段水位 80% 触发、每轮 ≤512 对象。
+func DefaultCompactorConfig() CompactorConfig {
+	return CompactorConfig{
+		Interval:        time.Minute,
+		HoleThreshold:   0.8,
+		ForceWatermark:  0.8,
+		MaxMovePerRound: 512,
 	}
-	return s.db.DeleteMapping(ctx, key)
 }
 
-// Stat 返回对象逻辑大小。远程层（taihu-server）Get size=-1 全量读等场景使用。
-// key 不存在时返回 ierr.ErrNotFound。
-func (s *Storage) Stat(ctx context.Context, key string) (int64, error) {
-	meta, err := s.db.GetMapping(ctx, key)
-	if err != nil {
-		return 0, err
-	}
-	return meta.Size, nil
+// Compactor 后台段压缩器：把高空洞 Full 段（含中断未完成的 Compacting 段）的存活对象
+// 搬移到新位置（可动用预留缓冲段），搬空后旧段计数归零自动转 Reclaiming，
+// 由现有后台 GC 回收入池复用。与 GC 为两条独立惰性链，互不冲突。
+// 实现（run/compactOnce/moveObject）见 compact.go。
+type Compactor struct {
+	st   *Storage
+	cfg  CompactorConfig
+	stop chan struct{}
+	wg   sync.WaitGroup
+}
+
+// NewCompactor 构造压缩器（不启动；调用 Start/Stop 管理生命周期）。
+func NewCompactor(st *Storage, cfg CompactorConfig) *Compactor {
+	return &Compactor{st: st, cfg: cfg, stop: make(chan struct{})}
+}
+
+// Option 是 NewStorage 的可选参数（变参选项）。新增配置项时在此扩展，
+// 既有调用点无需改动签名。具体选项字段见 options.go。
+type Option func(*options)
+
+// WithAIOMode 指定底层磁盘异步 IO 后端：aio.ModeAuto / ModeLibAIO / ModeIOUring。
+// 由命令行 -io-uring=auto|on|off 映射而来（on→ModeIOUring，off→ModeLibAIO）。
+// ModeIOUring 在内核不支持时启动失败（不静默降级）。
+func WithAIOMode(m aio.Mode) Option {
+	return func(o *options) { o.aioMode = m }
+}
+
+// WithAIOIOPoll 启用 io_uring 的 IOPOLL 模式（仅 io_uring 后端生效）。默认关闭：
+// 它需要块设备队列开启轮询，且完成靠内核忙等推进（占一个核），收益需实测。
+func WithAIOIOPoll(on bool) Option {
+	return func(o *options) { o.aioIOPoll = on }
 }
 
 // IOStats 返回底层设备磁盘 IO 尺寸统计（4MiB 整块 vs 其他）。压测/验证用。

@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/liucxer/taihu/internal/metastore"
@@ -14,39 +13,9 @@ import (
 	"github.com/liucxer/taihu/pkg/ierr"
 )
 
-// CompactorConfig 后台段压缩（compaction）配置。
-// 对应设计文档《segment 级 Compaction（数据迁移）设计方案》。
-type CompactorConfig struct {
-	Interval        time.Duration // 扫描周期
-	HoleThreshold   float64       // 单段空洞率阈值：≥ 该值的 Full 段入候选
-	ForceWatermark  float64       // 全局水位：已用段占比 ≥ 该值强制压缩（不等单段阈值）
-	MaxMovePerRound int           // 每轮搬移对象数上限（限速，防冲击稳态带宽）
-}
-
-// DefaultCompactorConfig 返回默认配置：60s 低频扫描、空洞 80% 或段水位 80% 触发、每轮 ≤512 对象。
-func DefaultCompactorConfig() CompactorConfig {
-	return CompactorConfig{
-		Interval:        time.Minute,
-		HoleThreshold:   0.8,
-		ForceWatermark:  0.8,
-		MaxMovePerRound: 512,
-	}
-}
-
-// Compactor 后台段压缩器：把高空洞 Full 段（含中断未完成的 Compacting 段）的存活对象
-// 搬移到新位置（可动用预留缓冲段），搬空后旧段计数归零自动转 Reclaiming，
-// 由现有后台 GC 回收入池复用。与 GC 为两条独立惰性链，互不冲突。
-type Compactor struct {
-	st   *Storage
-	cfg  CompactorConfig
-	stop chan struct{}
-	wg   sync.WaitGroup
-}
-
-// NewCompactor 构造压缩器（不启动；调用 Start/Stop 管理生命周期）。
-func NewCompactor(st *Storage, cfg CompactorConfig) *Compactor {
-	return &Compactor{st: st, cfg: cfg, stop: make(chan struct{})}
-}
+// Compactor 的后台压缩实现（Compactor / CompactorConfig / NewCompactor /
+// DefaultCompactorConfig 类型与构造声明集中在 storage.go 导出面）。
+// 两条独立惰性链：compaction 搬移高空洞 Full 段，GC 回收空段，互不冲突。
 
 // Start 启动后台压缩循环。
 func (c *Compactor) Start() {
