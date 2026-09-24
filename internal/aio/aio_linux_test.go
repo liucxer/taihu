@@ -107,24 +107,10 @@ func linuxTestChannels() []testChannel {
 // 「O_DIRECT 通道跑过了」变成假象）。
 func oDirectChannel() testChannel {
 	return testChannel{
-		name: "odirect",
-		open: func(t *testing.T, size int64) (*os.File, *os.File) {
-			path := filepath.Join(oDirectDir(t), "aio-odirect-test")
-			t.Cleanup(func() { _ = os.Remove(path) })
-			open := func() *os.File {
-				f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC|syscall.O_DIRECT, 0o600)
-				if err != nil {
-					t.Skipf("O_DIRECT 打开 %s 失败: %v", path, err)
-				}
-				if err := f.Truncate(size); err != nil {
-					t.Fatalf("truncate %s: %v", path, err)
-				}
-				t.Cleanup(func() { _ = f.Close() })
-				return f
-			}
-			return open(), open()
-		},
-		buf: alignedBuf,
+		name:    "odirect",
+		oflags:  syscall.O_DIRECT,
+		dirBase: oDirectDir,
+		buf:     alignedBuf,
 	}
 }
 
@@ -1239,31 +1225,89 @@ type backend struct {
 	depthLimit bool
 }
 
-// testChannel 一条文件通道：文件怎么开、缓冲怎么分配。
+// testChannel 一条文件通道：共用一个「设备文件」，决定文件怎么开、缓冲怎么分配。
 //
 // 为什么要分通道：同一套契约要在「普通缓冲 IO」与「O_DIRECT」两种形态下各跑一遍 ——
-// 后者是生产形态（device 层用 O_DIRECT 打开设备），但语言层面没有 O_DIRECT 常量
-// （darwin 的 x/sys/unix 里没有该符号），故实现只放在 Linux 侧（aio_linux_test.go 的测试基建部分）。
+// 后者是生产形态（device 层用 O_DIRECT 打开设备）。
+//
+// 为什么要共用一个文件：现网一个 taihu server 对应一块 nvme，数据面只有**一个**设备
+// 文件；契约测试复刻这一形态 —— 全部子用例对同一个文件读写。每次 open 先把文件
+// Truncate 到子用例自己的窗口（与「每用例一个等大文件」的 EOF 语义一致），
+// 再为 ring 与独立校验各开一个新 fd（见 sharedDev.open）。
 type testChannel struct {
-	name string
-	// open 把同一个定长文件打开两次，返回两个独立 fd：ring 提交用一个，
-	// 独立校验（不经 ring）用另一个。文件系统不支持该通道时 t.Skipf。
-	open func(t *testing.T, size int64) (ring, verify *os.File)
-	// buf 按通道要求分配缓冲：O_DIRECT 通道必须 4K 对齐。
-	buf func(n int) []byte
+	name    string
+	dev     *sharedDev
+	oflags  int                       // 子用例读写 fd 的打开标志（0=普通缓冲；O_DIRECT 通道设置 syscall.O_DIRECT）
+	dirBase func(t *testing.T) string // 非 nil 时用它选文件所在目录（O_DIRECT 通道 → oDirectDir）
+	buf     func(n int) []byte        // 按通道要求分配缓冲：O_DIRECT 通道必须 4K 对齐
+}
+
+// setup 由 runRingContract 在入口测试上调用一次（整个 run 的 TempDir 生命周期内），
+// 创建契约共用的单一设备文件。
+func (ch *testChannel) setup(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	if ch.dirBase != nil {
+		dir = ch.dirBase(t)
+	}
+	ch.dev = newSharedDev(t, dir, ch.oflags)
+}
+
+// open 返回指向同一个设备文件的两个新 fd：ring 提交用一个，独立校验（不经 ring）用另一个。
+func (ch *testChannel) open(t *testing.T, size int64) (ring, verify *os.File) {
+	t.Helper()
+	if ch.dev == nil {
+		t.Fatal("testChannel 未 setup：runRingContract 必须先调用 ch.setup(t)")
+	}
+	return ch.dev.open(t, size)
+}
+
+// sharedDev 契约共用的单一设备文件：模拟现网「一 server 一 nvme」的单文件形态。
+type sharedDev struct {
+	path   string
+	f      *os.File // 持久的截断句柄（普通 O_RDWR 打开，与 O_DIRECT 通道的读写 fd 解耦）
+	oflags int
+}
+
+// newSharedDev 创建共享设备文件。O_DIRECT 通道要求文件落在支持 direct 的文件系统上
+// （目录由调用方经 oDirectDir 选出；TAIHU_AIO_TEST_DIR 可显式指定）。
+func newSharedDev(t *testing.T, dir string, oflags int) *sharedDev {
+	t.Helper()
+	path := filepath.Join(dir, "aio-device")
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatalf("create shared device file: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = f.Close()
+		_ = os.Remove(path)
+	})
+	return &sharedDev{path: path, f: f, oflags: oflags}
+}
+
+// open 把设备文件 Truncate 到 size 后返回指向它的两个新 fd。
+func (d *sharedDev) open(t *testing.T, size int64) (ring, verify *os.File) {
+	t.Helper()
+	if err := d.f.Truncate(size); err != nil {
+		t.Fatalf("truncate shared device to %d: %v", size, err)
+	}
+	newFd := func(what string) *os.File {
+		t.Helper()
+		f, err := os.OpenFile(d.path, os.O_RDWR|d.oflags, 0o600)
+		if err != nil {
+			t.Fatalf("open %s fd on %s: %v", what, d.path, err)
+		}
+		t.Cleanup(func() { _ = f.Close() })
+		return f
+	}
+	return newFd("ring"), newFd("verify")
 }
 
 // plainChannel 普通缓冲 IO 通道，全平台可用。
 func plainChannel() testChannel {
 	return testChannel{
 		name: "plain",
-		open: func(t *testing.T, size int64) (ring, verify *os.File) {
-			// 两个 fd 必须指向同一个文件：t.TempDir() 每次调用都给一个新目录，
-			// 故路径只算一次。
-			path := filepath.Join(t.TempDir(), "aio-dev")
-			return newTestFileAt(t, path, size), newTestFileAt(t, path, size)
-		},
-		buf: func(n int) []byte { return make([]byte, n) },
+		buf:  func(n int) []byte { return make([]byte, n) },
 	}
 }
 
@@ -1273,8 +1317,8 @@ func newTestFile(t *testing.T, size int64) *os.File {
 	return newTestFileAt(t, filepath.Join(t.TempDir(), "aio-dev"), size)
 }
 
-// newTestFileAt 按给定路径建定长文件并返回句柄。同一路径可以开成多个独立 fd
-// （plainChannel 就是这样给「ring 提交」与「独立校验」各拿一个 fd 的）。
+// newTestFileAt 按给定路径建定长文件并返回句柄。契约通道不再使用它（改走共享设备
+// 文件 sharedDev.open）；它仍服务于各 ring 构造类单测。
 func newTestFileAt(t *testing.T, path string, size int64) *os.File {
 	t.Helper()
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
@@ -1323,6 +1367,7 @@ func batchCount(size int) int {
 // runRingContract 对单个后端 + 单条文件通道跑完整契约。子测试名即覆盖点，
 // `go test -v` 的输出可以直接当覆盖清单读。
 func runRingContract(t *testing.T, b backend, ch testChannel) {
+	ch.setup(t) // 建共享设备文件：后续全部子用例对同一个文件读写
 	t.Run("roundtrip", func(t *testing.T) { contractRoundTrip(t, b, ch) })
 	t.Run("batch", func(t *testing.T) { contractBatch(t, b, ch) })
 	t.Run("inflight_mixed", func(t *testing.T) { contractInflightMixed(t, b, ch) })
