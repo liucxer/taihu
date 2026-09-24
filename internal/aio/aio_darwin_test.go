@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liucxer/taihu/internal/ierr"
+	"github.com/liucxer/taihu/pkg/ierr"
 	"golang.org/x/sys/unix"
 )
 

@@ -5,14 +5,13 @@
 package transport
 
 import (
-	"errors"
 	"io"
 
 	"github.com/liucxer/taihu/internal/storage"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
-// errShmUnsupported shmipc 仅支持 Linux。
-var errShmUnsupported = errors.New("taihu: shmipc only supported on linux")
+// ierr.ErrShmUnsupported shmipc 仅支持 Linux。
 
 // ShmSupported 报告本平台是否支持 shmipc 共享内存 IPC：非 Linux 恒为 false。
 // 调用方（server 启动）据此跳过 shm 服务而非启动失败 —— 本平台 TCP 数据面
@@ -21,15 +20,15 @@ func ShmSupported() bool { return false }
 
 // ServeShm 非 Linux 平台的占位实现。
 func ServeShm(storage *storage.Storage, uds string) (io.Closer, error) {
-	return nil, errShmUnsupported
+	return nil, ierr.ErrShmUnsupported
 }
 
 // ServeShmWithBatch 非 Linux 平台的占位实现。
 func ServeShmWithBatch(storage *storage.Storage, uds string, batchTarget, batchWorkers int) (io.Closer, error) {
-	return nil, errShmUnsupported
+	return nil, ierr.ErrShmUnsupported
 }
 
 // ServeShmWithConfig 非 Linux 平台的占位实现。
 func ServeShmWithConfig(storage *storage.Storage, uds string, cfg PipelineConfig) (io.Closer, error) {
-	return nil, errShmUnsupported
+	return nil, ierr.ErrShmUnsupported
 }

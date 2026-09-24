@@ -2,7 +2,6 @@ package taihuclient
 
 import (
 	"context"
-	"errors"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -11,14 +10,11 @@ import (
 	"github.com/liucxer/taihu/internal/cluster"
 	"github.com/liucxer/taihu/internal/rpcclient"
 	"github.com/liucxer/taihu/internal/version"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
-var (
-	// ErrNoInstances 集群无在线实例可写。
-	ErrNoInstances = errors.New("taihu-cluster: no online instance")
-	// errSourceUnset 集群全 miss 且未配置回源。
-	errSourceUnset = errors.New("taihu-cluster: no source getter configured")
-)
+// ErrNoInstances 集群无在线实例可写（唯一定义在 pkg/ierr，此处 re-export）。
+var ErrNoInstances = ierr.ErrNoInstances
 
 // Storage 集群对象存储：写=本地优先选实例（首写锚定），读=本地实例直查 →
 // 索引定位远端 → 回源重建。满足 rpcclient.ObjectStore。
@@ -51,7 +47,7 @@ var _ rpcclient.ObjectStore = (*Storage)(nil)
 // NewCluster 构建集群客户端并启动发现/索引后台任务。
 func NewCluster(cfg ClusterConfig) (*Storage, error) {
 	if cfg.KV == nil {
-		return nil, errors.New("taihuclient: KV is required")
+		return nil, ierr.ErrKVRequired
 	}
 	hostname, _ := os.Hostname()
 	reg := newInstanceRegistry(cfg.KV, hostname, cfg.RefreshInterval, cfg.HeartbeatTimeout)
@@ -140,7 +136,7 @@ func (s *Storage) clientFor(inst cluster.InstanceInfo) (*rpcclient.Storage, erro
 	case TransportShm:
 		// 强制共享内存：仅同机实例可用（uds socket）。
 		if inst.ShmAddr == "" {
-			return nil, errors.New("taihuclient: instance has no shm addr (transport=shm requires same-host instance)")
+			return nil, ierr.ErrNoShmAddr
 		}
 		c, err = rpcclient.DialShmPool(context.Background(), inst.ShmAddr, s.cfg.Conns)
 	default:
@@ -276,7 +272,7 @@ func (s *Storage) lookup(ctx context.Context, key string) (cluster.InstanceInfo,
 // 返回的 data 无池化归属，release 为 noop。
 func (s *Storage) getFromSource(ctx context.Context, key string, off, size int64) ([]byte, func(), error) {
 	if s.cfg.Source == nil {
-		return nil, nil, errSourceUnset
+		return nil, nil, ierr.ErrSourceUnset
 	}
 	data, err := s.cfg.Source(ctx, key)
 	if err != nil {

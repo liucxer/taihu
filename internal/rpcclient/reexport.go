@@ -1,8 +1,8 @@
 package rpcclient
 
 import (
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/metastore"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // 本文件把出现在本包**导出签名**里的 internal 类型 re-export 出去。
@@ -24,7 +24,7 @@ import (
 // 忘了补时**编译不会报错**，只是包对外悄悄不可用，故 internal/rpcclient/api_test.go 用
 // 外部测试包逐个命名这些类型，作为编译期的兜底。
 
-// 客户端可见的库错误（唯一定义在 internal/ierr；此处 re-export 以便外部
+// 客户端可见的库错误（唯一定义在 pkg/ierr；此处 re-export 以便外部
 // errors.Is(err, rpcclient.ErrNotFound) 判断）。
 //
 // 不含 ierr.ErrConflict：那是 compaction 内部的 CAS 控制信号，不是客户端会收到的错误。

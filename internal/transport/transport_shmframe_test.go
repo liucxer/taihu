@@ -12,6 +12,7 @@ import (
 	"io"
 	"testing"
 
+	"github.com/liucxer/taihu/pkg/ierr"
 	"github.com/liucxer/taihu/third_party/shmipc-go"
 
 	"github.com/liucxer/taihu/internal/transport/protocol"
@@ -154,11 +155,11 @@ func TestShmReadFrameBadInput(t *testing.T) {
 			if err == nil {
 				t.Fatalf("shmReadFrame 应报错，得到 op=0x%x payload=%x", byte(op), payload)
 			}
-			if tc.wantBadFrm && !errors.Is(err, errShmBadFrame) {
-				t.Fatalf("err = %v, want errShmBadFrame", err)
+			if tc.wantBadFrm && !errors.Is(err, ierr.ErrShmBadFrame) {
+				t.Fatalf("err = %v, want ierr.ErrShmBadFrame", err)
 			}
-			if !tc.wantBadFrm && errors.Is(err, errShmBadFrame) {
-				t.Fatalf("err = %v, 不应为 errShmBadFrame", err)
+			if !tc.wantBadFrm && errors.Is(err, ierr.ErrShmBadFrame) {
+				t.Fatalf("err = %v, 不应为 ierr.ErrShmBadFrame", err)
 			}
 		})
 	}

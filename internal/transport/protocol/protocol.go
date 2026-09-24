@@ -23,7 +23,7 @@ import (
 
 	"github.com/liucxer/taihu/third_party/netpoll"
 
-	"github.com/liucxer/taihu/internal/ierr"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // ChunkSize 单条数据帧负载上限（4MiB），与旧 gRPC 方案一致。
@@ -139,9 +139,9 @@ func MapCode(c ErrCode) error {
 	case CodeNoSpace:
 		return ierr.ErrNoSpace
 	case CodeInvalidArgument:
-		return errors.New("taihu: invalid argument")
+		return ierr.ErrInvalidArgument
 	default:
-		return errors.New("taihu: rpc error")
+		return ierr.ErrRPCError
 	}
 }
 
@@ -250,7 +250,7 @@ func ParsePutHeader(r ByteReader) (key string, size int64, err error) {
 		return "", 0, err
 	}
 	if kl > MaxKeyLen {
-		return "", 0, errors.New("taihu: key too long")
+		return "", 0, ierr.ErrKeyTooLong
 	}
 	key, err = r.ReadString(int(kl))
 	if err != nil {
@@ -270,7 +270,7 @@ func ParseGetReq(r ByteReader) (key string, off, size int64, err error) {
 		return "", 0, 0, err
 	}
 	if kl > MaxKeyLen {
-		return "", 0, 0, errors.New("taihu: key too long")
+		return "", 0, 0, ierr.ErrKeyTooLong
 	}
 	key, err = r.ReadString(int(kl))
 	if err != nil {
@@ -294,7 +294,7 @@ func ParseKeyReq(r ByteReader) (string, error) {
 		return "", err
 	}
 	if kl > MaxKeyLen {
-		return "", errors.New("taihu: key too long")
+		return "", ierr.ErrKeyTooLong
 	}
 	return r.ReadString(int(kl))
 }
@@ -489,7 +489,7 @@ func ParseKeysData(r ByteReader, out []string) ([]string, error) {
 			return out, err
 		}
 		if kl > MaxKeyLen {
-			return out, errors.New("taihu: key too long")
+			return out, ierr.ErrKeyTooLong
 		}
 		k, err := r.ReadString(int(kl))
 		if err != nil {

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/metastore"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // TestSegmentWireParity 断言 wire 结构与领域态结构的字段平齐。

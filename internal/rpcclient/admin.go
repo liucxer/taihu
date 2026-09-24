@@ -2,10 +2,10 @@ package rpcclient
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/liucxer/taihu/internal/transport"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // 管理类 RPC（taihu-cli 设计文档 §4）。首版仅 TCP 路径支持：Storage 内部连接中
@@ -88,5 +88,5 @@ func (s *Storage) adminConn() (*transport.Conn, error) {
 			return t, nil
 		}
 	}
-	return nil, errors.New("taihu: admin RPC not supported on this transport (shm only)")
+	return nil, ierr.ErrAdminShmOnly
 }

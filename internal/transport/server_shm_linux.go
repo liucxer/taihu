@@ -14,7 +14,6 @@ package transport
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"io"
 	"net"
 	"os"
@@ -22,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/liucxer/taihu/pkg/ierr"
 	"github.com/liucxer/taihu/third_party/shmipc-go"
 
 	"github.com/liucxer/taihu/internal/bufpool"
@@ -288,7 +288,7 @@ func (s *shmServer) handleStream(st *shmipc.Stream) {
 		case protocol.OpStatReq:
 			err = s.handleShmStat(st, payload)
 		default:
-			err = errShmStreamBroken
+			err = ierr.ErrShmStreamBroken
 		}
 
 		r.ReleasePreviousRead()
@@ -299,15 +299,14 @@ func (s *shmServer) handleStream(st *shmipc.Stream) {
 	_ = st.Close()
 }
 
-// errShmStreamBroken 哨兵错误：流上残留未消费请求帧，无法继续复用，须关闭通知对端。
-var errShmStreamBroken = errors.New("taihu: shm stream broken")
+// ierr.ErrShmStreamBroken 哨兵错误：流上残留未消费请求帧，无法继续复用，须关闭通知对端。
 
 // shmRespErr 写错误响应并返回哨兵错误（handleStream 据此关闭流）。
 // 与 TCP 不同（TCP 流用完即关、迟到帧被丢弃），shm 流被客户端 PutBack 复用，
 // 请求未完整消费（超限/畸形）时残留帧会污染流，故错误响应后必须关闭。
 func (s *shmServer) shmRespErr(st *shmipc.Stream, op protocol.OpCode, code protocol.ErrCode) error {
 	_ = shmWriteFrame(st, op, protocol.EncCode(code))
-	return errShmStreamBroken
+	return ierr.ErrShmStreamBroken
 }
 
 // handleShmPut 处理 Put 请求流：PutHeader → PutData* → PutEnd，语义镜像 TCP handlePut。

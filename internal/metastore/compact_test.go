@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/layout"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // TestCompactingRebuildWithLiveObjects：搬移中断（Compacting 段仍有存活对象）重启后回退 Full，

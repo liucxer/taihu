@@ -13,9 +13,9 @@ import (
 	"github.com/liucxer/taihu/internal/aio"
 	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/device"
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // TestOptionsApply 覆盖 options.go 的 Option 构造与应用（含非法 AIO 模式透传）。

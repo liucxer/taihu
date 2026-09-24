@@ -4,11 +4,12 @@ package rpcclient
 
 import (
 	"context"
-	"errors"
+
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
-// ErrShmOnly 零拷贝写（NewPut）仅共享内存连接支持。
-var ErrShmOnly = errors.New("taihu: zero-copy write requires shm connection")
+// ErrShmOnly 零拷贝写（NewPut）仅共享内存连接支持（唯一定义在 pkg/ierr，此处 re-export）。
+var ErrShmOnly = ierr.ErrShmOnly
 
 // putStream 传输层零拷贝写流接口（linux 由 transport.ShmPutWriter 实现）。
 type putStream interface {
@@ -32,7 +33,7 @@ func (w *PutWriter) Commit() error { return w.w.Commit() }
 // 单次 Reserve 不超过 4MiB，更大对象分块多次 Reserve。
 func (s *Storage) NewPut(ctx context.Context, key string, size int64) (*PutWriter, error) {
 	if len(s.conns) == 0 {
-		return nil, errors.New("taihu: storage closed")
+		return nil, ierr.ErrStorageClosed
 	}
 	return newShmPut(ctx, s, key, size)
 }

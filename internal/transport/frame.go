@@ -6,10 +6,10 @@ package transport
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"sync"
 	"sync/atomic"
 
+	"github.com/liucxer/taihu/pkg/ierr"
 	"github.com/liucxer/taihu/third_party/netpoll"
 
 	"github.com/liucxer/taihu/internal/bufpool"
@@ -30,8 +30,6 @@ func init() {
 
 // streamInCap 每流投递缓冲上限：读循环背压到流处理器消费速度。
 const streamInCap = 8
-
-var errConnClosed = errors.New("taihu: connection closed")
 
 // frameMsg 读循环投递给流处理器的一帧：op 已解析，r 为零拷贝子 Reader（定位在
 // payload 起点，Len() 即负载长度；无负载帧 Len()==0）。用毕必须 r.Release()。
@@ -171,9 +169,9 @@ func (c *Conn) await(ctx context.Context, st *stream) (frameMsg, error) {
 	case msg := <-st.in:
 		return msg, nil
 	case <-st.done:
-		return frameMsg{}, errConnClosed
+		return frameMsg{}, ierr.ErrConnClosed
 	case <-c.closed:
-		return frameMsg{}, errConnClosed
+		return frameMsg{}, ierr.ErrConnClosed
 	case <-ctx.Done():
 		return frameMsg{}, ctx.Err()
 	}

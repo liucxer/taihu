@@ -19,10 +19,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/storage"
 	"github.com/liucxer/taihu/internal/transport/protocol"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // tcpNewTestStorage 在 t.TempDir()（TMPDIR=/var/tmp，xfs，支持 O_DIRECT）下建真实 Storage。

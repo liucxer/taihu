@@ -10,8 +10,8 @@ import (
 	"github.com/liucxer/taihu/third_party/netpoll"
 
 	"github.com/liucxer/taihu/internal/bufpool"
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/transport/protocol"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // dialTimeout 客户端拨号超时。

@@ -15,8 +15,8 @@ import (
 
 	"github.com/liucxer/taihu/third_party/netpoll"
 
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/transport/protocol"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // TestTCPStreamLifecycleAndIDs 覆盖 stream/finish 幂等与 Conn 的流注册/注销。
@@ -64,8 +64,8 @@ func TestTCPConnCloseUnblocksAwait(t *testing.T) {
 	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if _, err := c.await(context.Background(), st); !errors.Is(err, errConnClosed) {
-		t.Fatalf("await after close err=%v, want errConnClosed", err)
+	if _, err := c.await(context.Background(), st); !errors.Is(err, ierr.ErrConnClosed) {
+		t.Fatalf("await after close err=%v, want ierr.ErrConnClosed", err)
 	}
 	// 幂等
 	c.closeAll()

@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/liucxer/taihu/internal/bufpool"
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // newTestStorageLayout 构造带指定布局的文件设备 Storage（testLayout 之外的小段布局便于触发搬移）。

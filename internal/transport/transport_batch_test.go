@@ -12,8 +12,8 @@ import (
 
 	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/device"
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/transport/protocol"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // TestTCPDrainBatch 覆盖 drain 的取批上限与「有多少取多少」语义。

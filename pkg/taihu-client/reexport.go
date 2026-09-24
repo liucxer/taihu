@@ -28,7 +28,7 @@ type ObjectStore = rpcclient.ObjectStore
 
 // 客户端可见的库错误。本包的 Storage 把底层错误原样透出（不做包装），故只 import
 // 本包的调用方也需要能命名它们才能做 errors.Is / 相等判断。
-// 定义在 internal/ierr，internal/rpcclient 已 re-export，此处再指一层以保持单一来源。
+// 定义在 pkg/ierr，internal/rpcclient 已 re-export，此处再指一层以保持单一来源。
 var (
 	// ErrNotFound 表示 key 不存在。
 	ErrNotFound = rpcclient.ErrNotFound

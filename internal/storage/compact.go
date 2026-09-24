@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/liucxer/taihu/internal/bufpool"
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/metastore"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // CompactorConfig 后台段压缩（compaction）配置。

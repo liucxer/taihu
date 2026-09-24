@@ -6,9 +6,9 @@ import (
 	"io"
 
 	"github.com/liucxer/taihu/internal/device"
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // Storage 对外 object 存储。数据写底层裸设备，key→位置映射经由 metastore（pebble）持久化，

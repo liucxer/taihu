@@ -10,6 +10,7 @@ import (
 
 	"github.com/liucxer/taihu/internal/cluster"
 	"github.com/liucxer/taihu/internal/rpcclient"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // storage.go 覆盖：clientFor 各传输分支、Put/Get/Stat/Delete 端到端、回源重建、
@@ -179,8 +180,8 @@ func TestStoragePutGetStatDeleteRemote(t *testing.T) {
 	if err := s.Delete(ctx, "obj-1"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	// 已删除且未配置回源 → errSourceUnset（不再从本地逐个试读）。
-	if _, _, err := s.Get(ctx, "obj-1", 0, -1); !errors.Is(err, errSourceUnset) {
+	// 已删除且未配置回源 → ierr.ErrSourceUnset（不再从本地逐个试读）。
+	if _, _, err := s.Get(ctx, "obj-1", 0, -1); !errors.Is(err, ierr.ErrSourceUnset) {
 		t.Fatalf("Get after delete: %v", err)
 	}
 }
@@ -306,7 +307,7 @@ func TestStorageIndexLookupFallbackAndPreload(t *testing.T) {
 	if err := s.cfg.KV.Put(ctx, []byte(cluster.IndexKeyPrefix+"idx-key"), []byte("idx")); err != nil {
 		t.Fatalf("seed index: %v", err)
 	}
-	if _, _, err := s.Get(ctx, "idx-key", 0, -1); !errors.Is(err, errSourceUnset) {
+	if _, _, err := s.Get(ctx, "idx-key", 0, -1); !errors.Is(err, ierr.ErrSourceUnset) {
 		t.Fatalf("Get via index: %v", err)
 	}
 	if name, ok := s.cache.get("idx-key"); !ok || name != "idx" {

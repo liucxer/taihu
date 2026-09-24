@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // TestSegmentsSummary 覆盖 admin Segments 的段明细/汇总/游标与四种段状态分支。

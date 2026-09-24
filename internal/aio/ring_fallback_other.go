@@ -10,7 +10,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/liucxer/taihu/internal/ierr"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // ring 非 Linux 平台（macOS 开发/自测）兜底实现：每个提交起一个 goroutine

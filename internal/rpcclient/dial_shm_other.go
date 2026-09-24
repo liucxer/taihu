@@ -6,17 +6,16 @@ package rpcclient
 
 import (
 	"context"
-	"errors"
-)
 
-var errShmUnsupported = errors.New("taihu: shmipc only supported on linux")
+	"github.com/liucxer/taihu/pkg/ierr"
+)
 
 // DialShm 非 Linux 占位实现。
 func DialShm(ctx context.Context, uds string) (*Storage, error) {
-	return nil, errShmUnsupported
+	return nil, ierr.ErrShmUnsupported
 }
 
 // DialShmPool 非 Linux 占位实现。
 func DialShmPool(ctx context.Context, uds string, sessions int) (*Storage, error) {
-	return nil, errShmUnsupported
+	return nil, ierr.ErrShmUnsupported
 }

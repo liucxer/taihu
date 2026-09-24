@@ -9,8 +9,8 @@ import (
 
 	"github.com/cockroachdb/pebble"
 
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/layout"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // pebbleStore 基于 CockroachDB pebble（纯 Go LSM）实现 Store。

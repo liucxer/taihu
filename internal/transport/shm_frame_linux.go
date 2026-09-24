@@ -10,8 +10,8 @@ package transport
 
 import (
 	"encoding/binary"
-	"errors"
 
+	"github.com/liucxer/taihu/pkg/ierr"
 	"github.com/liucxer/taihu/third_party/shmipc-go"
 
 	"github.com/liucxer/taihu/internal/transport/protocol"
@@ -24,8 +24,7 @@ const (
 	shmMaxFrameSize = shmOpLen + protocol.ChunkSize // 帧负载（op+payload）上限
 )
 
-// errShmBadFrame 畸形 shm 帧。
-var errShmBadFrame = errors.New("taihu: bad shm frame")
+// ierr.ErrShmBadFrame 畸形 shm 帧。
 
 // shmReadFrame 从 BufferReader 读一帧 [4B len][1B op][payload]，返回 op 与负载切片。
 // 单切片时负载零拷贝引用共享内存（fast path）；跨切片时 ReadBytes 慢路径汇入一次拷贝。
@@ -40,7 +39,7 @@ func shmReadFrame(r shmipc.BufferReader) (op protocol.OpCode, payload []byte, er
 	}
 	n := int(binary.BigEndian.Uint32(lb))
 	if n < shmOpLen || n > shmMaxFrameSize {
-		return 0, nil, errShmBadFrame
+		return 0, nil, ierr.ErrShmBadFrame
 	}
 	b, err := r.ReadBytes(shmOpLen)
 	if err != nil {

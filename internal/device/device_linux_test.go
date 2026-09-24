@@ -21,8 +21,8 @@ import (
 
 	"github.com/liucxer/taihu/internal/aio"
 	"github.com/liucxer/taihu/internal/bufpool"
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/layout"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 func TestDeviceAppendAlignment(t *testing.T) {
@@ -325,7 +325,7 @@ func TestCloseIdempotent(t *testing.T) {
 	}
 }
 
-// TestDeviceClosedOps 覆盖各提交入口在设备已关闭时的 errDeviceClosed 快路径。
+// TestDeviceClosedOps 覆盖各提交入口在设备已关闭时的 ierr.ErrDeviceClosed 快路径。
 func TestDeviceClosedOps(t *testing.T) {
 	dev := newCovDevice(t)
 	// 只置关闭标志并等完成泵退出（不关 fd），使提交入口命中「已关闭」检查。
@@ -340,24 +340,24 @@ func TestDeviceClosedOps(t *testing.T) {
 	dst := bufpool.Get(4096)
 	defer bufpool.Put(dst)
 
-	if err := dev.Append(ctx, 0, 0, 4096, blk); !errors.Is(err, errDeviceClosed) {
-		t.Fatalf("关闭后 Append: %v, want errDeviceClosed", err)
+	if err := dev.Append(ctx, 0, 0, 4096, blk); !errors.Is(err, ierr.ErrDeviceClosed) {
+		t.Fatalf("关闭后 Append: %v, want ierr.ErrDeviceClosed", err)
 	}
-	if _, err := dev.ReadAt(ctx, 0, 0, 4096); !errors.Is(err, errDeviceClosed) {
-		t.Fatalf("关闭后 ReadAt: %v, want errDeviceClosed", err)
+	if _, err := dev.ReadAt(ctx, 0, 0, 4096); !errors.Is(err, ierr.ErrDeviceClosed) {
+		t.Fatalf("关闭后 ReadAt: %v, want ierr.ErrDeviceClosed", err)
 	}
-	if _, err := dev.ReadAtInto(ctx, 0, 0, 4096, dst); !errors.Is(err, errDeviceClosed) {
-		t.Fatalf("关闭后 ReadAtInto: %v, want errDeviceClosed", err)
+	if _, err := dev.ReadAtInto(ctx, 0, 0, 4096, dst); !errors.Is(err, ierr.ErrDeviceClosed) {
+		t.Fatalf("关闭后 ReadAtInto: %v, want ierr.ErrDeviceClosed", err)
 	}
-	if err := dev.AppendBatch(ctx, []WriteJob{{SegmentID: 0, Off: 0, Data: blk, Size: 4096}}); !errors.Is(err, errDeviceClosed) {
-		t.Fatalf("关闭后 AppendBatch: %v, want errDeviceClosed", err)
+	if err := dev.AppendBatch(ctx, []WriteJob{{SegmentID: 0, Off: 0, Data: blk, Size: 4096}}); !errors.Is(err, ierr.ErrDeviceClosed) {
+		t.Fatalf("关闭后 AppendBatch: %v, want ierr.ErrDeviceClosed", err)
 	}
-	if _, err := dev.ReadAtIntoBatch(ctx, []ReadJob{{SegmentID: 0, Off: 0, Buf: dst, Size: 4096}}); !errors.Is(err, errDeviceClosed) {
-		t.Fatalf("关闭后 ReadAtIntoBatch: %v, want errDeviceClosed", err)
+	if _, err := dev.ReadAtIntoBatch(ctx, []ReadJob{{SegmentID: 0, Off: 0, Buf: dst, Size: 4096}}); !errors.Is(err, ierr.ErrDeviceClosed) {
+		t.Fatalf("关闭后 ReadAtIntoBatch: %v, want ierr.ErrDeviceClosed", err)
 	}
 	// 完成泵已退出：batchWait 须在 pumpDone 上立即返回，不永久阻塞。
-	if _, err := dev.batchWait(1, 1); !errors.Is(err, errDeviceClosed) {
-		t.Fatalf("泵退出后 batchWait: %v, want errDeviceClosed", err)
+	if _, err := dev.batchWait(1, 1); !errors.Is(err, ierr.ErrDeviceClosed) {
+		t.Fatalf("泵退出后 batchWait: %v, want ierr.ErrDeviceClosed", err)
 	}
 }
 

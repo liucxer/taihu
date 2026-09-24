@@ -17,7 +17,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/liucxer/taihu/internal/ierr"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // 本文件是 internal/aio 的**全部 Linux 测试**，按「一个平台一个文件」组织 —— 跨平台

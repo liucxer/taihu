@@ -16,8 +16,8 @@ import (
 	"github.com/liucxer/taihu/third_party/shmipc-go"
 
 	"github.com/liucxer/taihu/internal/bufpool"
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/transport/protocol"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // 共享内存缓冲配置：小切片承载控制帧（请求/一元响应），大切片承载 4MiB 数据帧

@@ -12,7 +12,6 @@ package device
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,8 +23,8 @@ import (
 
 	"github.com/liucxer/taihu/internal/aio"
 	"github.com/liucxer/taihu/internal/bufpool"
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/layout"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 const (
@@ -44,8 +43,7 @@ const (
 	chunk4MiB = 1 << 22
 )
 
-// errDeviceClosed 设备已关闭后仍尝试提交。
-var errDeviceClosed = errors.New("taihu: device closed")
+// ierr.ErrDeviceClosed 设备已关闭后仍尝试提交。
 
 // Device 底层存储：直接操作裸设备文件。
 type Device struct {
@@ -192,7 +190,7 @@ func (d *Device) submitOpN(buf []byte, off int64, read bool, count bool) (aio.Ev
 		d.mu.Lock()
 		if d.closed {
 			d.mu.Unlock()
-			return aio.Event{}, errDeviceClosed
+			return aio.Event{}, ierr.ErrDeviceClosed
 		}
 		d.inSubmit++
 		d.mu.Unlock()
@@ -500,7 +498,7 @@ func (d *Device) AppendBatch(ctx context.Context, jobs []WriteJob) error {
 		d.mu.Lock()
 		if d.closed {
 			d.mu.Unlock()
-			return errDeviceClosed
+			return ierr.ErrDeviceClosed
 		}
 		d.inSubmit += len(chunk)
 		d.mu.Unlock()
@@ -669,7 +667,7 @@ func (d *Device) ReadAtIntoBatch(ctx context.Context, jobs []ReadJob) ([]int64, 
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()
-		return nil, errDeviceClosed
+		return nil, ierr.ErrDeviceClosed
 	}
 	d.inSubmit += len(specs0)
 	d.mu.Unlock()
@@ -772,7 +770,7 @@ func (d *Device) batchWait(firstSeq uint64, n int) ([]aio.Event, error) {
 			d.mu.Lock()
 			delete(d.m, seq)
 			d.mu.Unlock()
-			return evs, errDeviceClosed
+			return evs, ierr.ErrDeviceClosed
 		}
 	}
 	return evs, nil

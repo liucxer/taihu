@@ -28,7 +28,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/liucxer/taihu/internal/ierr"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // ── UAPI 声明：常量、结构体与编译期布局断言 ──────────────────────────

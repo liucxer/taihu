@@ -9,7 +9,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/liucxer/taihu/internal/ierr"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // 事件与 iocb 布局必须与 linux/aio_abi.h 一致（64 位平台）。

@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/layout"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // errInjected 注入的存储错误（用于错误分支断言）。

@@ -2,7 +2,7 @@
 
 package aio
 
-import "github.com/liucxer/taihu/internal/ierr"
+import "github.com/liucxer/taihu/pkg/ierr"
 
 // probe 探测 io_uring 可用性。非 Linux 平台恒不支持，且结论是确定性的（可缓存）。
 // 结论缓存与转发在 aio.go 的「包内私有」节。

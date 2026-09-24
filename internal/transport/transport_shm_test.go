@@ -19,10 +19,10 @@ import (
 
 	"github.com/liucxer/taihu/third_party/shmipc-go"
 
-	"github.com/liucxer/taihu/internal/ierr"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/storage"
 	"github.com/liucxer/taihu/internal/transport/protocol"
+	"github.com/liucxer/taihu/pkg/ierr"
 )
 
 // shmTestSegSize/shmTestSegCount 测试用段布局：小段（64MiB）避免稀疏镜像过大，
