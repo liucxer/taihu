@@ -20,10 +20,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/device"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/storage"
+	"github.com/liucxer/taihu/pkg/bufpool"
 )
 
 type storageBenchConfig struct {
