@@ -120,6 +120,15 @@ func (c *ShmConn) Put(ctx context.Context, key string, size int64, in []byte) er
 	return protocol.MapCode(protocol.ErrCode(code))
 }
 
+// getResult Get/GetFd 的统一交付结果：fd>0 时 data 为共享内存零拷贝引用
+// （fd/foff 为 memfd splice 源）；fd==0 时 data 为池化拷贝缓冲。release 用毕必调（幂等）。
+type getResult struct {
+	fd      int
+	foff    uint64
+	data    []byte
+	release func()
+}
+
 // Get 读取对象内 [off, off+size) 子区间并返回整块数据；size=-1 读至对象结尾。
 //
 // 返回 (data, release, err)：data len==size 为本次调用私有缓冲，调用方用毕必须调用
@@ -131,32 +140,59 @@ func (c *ShmConn) Put(ctx context.Context, key string, size int64, in []byte) er
 //   - 对齐汇入（多帧响应/跨切片回退）：逐帧拷入 bufpool 对齐缓冲，恰一次用户态
 //     拷贝，release 经 bufpool.Put 归还。正确性不依赖切片连续性。
 func (c *ShmConn) Get(ctx context.Context, key string, off, size int64) ([]byte, func(), error) {
+	r, err := c.getEx(ctx, key, off, size)
+	if err != nil {
+		return nil, nil, err
+	}
+	return r.data, r.release, nil
+}
+
+// GetFd 读取对象内 [off, off+size) 子区间并交付为 memfd (fd, offset) 零拷贝源：
+// 供 FUSE 读路径 splice（fuse.ReadResultFd），避免共享内存 payload 再拷入用户态缓冲。
+//
+// 返回 (fd, foff, data, release, err)：
+//   - fd > 0：整响应恰一帧且落在单共享内存切片，data 零拷贝引用共享内存（此时
+//     data 与 fd/foff 指向同一段内存）；调用方应 splice(fd, foff, size) 取数，
+//     splice 完成（含 fallback Pread）后调用 release() 归还帧 pin 并 PutBack 流。
+//   - fd == 0：整响应多帧/跨切片（或异常），data 为池化拷贝缓冲（恰一次汇入拷贝），
+//     语义与 Get 一致，release() 归还。
+//
+// 两条路径用毕都必须调用 release()（幂等）。
+func (c *ShmConn) GetFd(ctx context.Context, key string, off, size int64) (int, uint64, []byte, func(), error) {
+	r, err := c.getEx(ctx, key, off, size)
+	if err != nil {
+		return 0, 0, nil, nil, err
+	}
+	return r.fd, r.foff, r.data, r.release, nil
+}
+
+func (c *ShmConn) getEx(ctx context.Context, key string, off, size int64) (*getResult, error) {
 	if size < 0 {
 		total, err := c.Stat(ctx, key)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		size = total - off
 	}
 	if size < 0 {
-		return nil, nil, ierr.ErrInvalidRange
+		return nil, ierr.ErrInvalidRange
 	}
 	if size == 0 {
-		return nil, func() {}, nil
+		return &getResult{data: nil, release: func() {}}, nil
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	st, err := c.sm.GetStream()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if d, ok := ctx.Deadline(); ok {
 		_ = st.SetDeadline(d)
 	}
 	if err := shmWriteFrame(st, protocol.OpGetReq, protocol.EncodeGetReq(key, off, size)); err != nil {
 		_ = st.Close()
-		return nil, nil, err
+		return nil, err
 	}
 
 	r := st.BufferReader()
@@ -164,6 +200,8 @@ func (c *ShmConn) Get(ctx context.Context, key string, off, size int64) ([]byte,
 		pos  int64
 		buf  []byte // 汇集缓冲（多帧路径），out = buf[:size]
 		out  []byte // 返回缓冲
+		fd   int
+		foff uint64
 		once sync.Once
 	)
 	// release 幂等归还：汇集路径归还 bufpool 缓冲；零拷贝路径保持 pin 直至归还；
@@ -182,7 +220,7 @@ func (c *ShmConn) Get(ctx context.Context, key string, off, size int64) ([]byte,
 		op, payload, err := shmReadFrame(r)
 		if err != nil {
 			release()
-			return nil, nil, err
+			return nil, err
 		}
 		switch op {
 		case protocol.OpGetData, protocol.OpGetDataFinal:
@@ -190,7 +228,7 @@ func (c *ShmConn) Get(ctx context.Context, key string, off, size int64) ([]byte,
 			rem := int64(len(payload))
 			if rem > size-pos {
 				release()
-				return nil, nil, fmt.Errorf("taihu: get stream exceeds requested size")
+				return nil, fmt.Errorf("taihu: get stream exceeds requested size")
 			}
 			if buf == nil && out == nil {
 				if rem == size {
@@ -199,7 +237,9 @@ func (c *ShmConn) Get(ctx context.Context, key string, off, size int64) ([]byte,
 					out = payload
 					pos = size
 					if final {
-						return out, release, nil
+						// 解析 payload 的 memfd (fd, offset)：splice 零拷贝源。
+						fd, foff, _ = shmipc.ResolveBufferRef(r, out)
+						return &getResult{fd: fd, foff: foff, data: out, release: release}, nil
 					}
 					continue // 非 final（协议异常）：不释放，等下一帧触发超限报错
 				}
@@ -216,21 +256,21 @@ func (c *ShmConn) Get(ctx context.Context, key string, off, size int64) ([]byte,
 				// final 帧：数据流收尾。缺帧（短读）在此报错，等价 TCP OpGetEnd 校验。
 				if pos != size {
 					release()
-					return nil, nil, fmt.Errorf("taihu: get short read: got %d want %d", pos, size)
+					return nil, fmt.Errorf("taihu: get short read: got %d want %d", pos, size)
 				}
-				return out, release, nil
+				return &getResult{fd: fd, foff: foff, data: out, release: release}, nil
 			}
 		case protocol.OpGetErr:
 			code, err := protocol.ReadU32(protocol.NewSliceReader(payload))
 			if err != nil {
 				release()
-				return nil, nil, err
+				return nil, err
 			}
 			release()
-			return nil, nil, protocol.MapCode(protocol.ErrCode(code))
+			return nil, protocol.MapCode(protocol.ErrCode(code))
 		default:
 			release()
-			return nil, nil, fmt.Errorf("taihu: unexpected get frame op %d", op)
+			return nil, fmt.Errorf("taihu: unexpected get frame op %d", op)
 		}
 	}
 }

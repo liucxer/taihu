@@ -49,6 +49,12 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in []byte) er
 	return s.pick().Put(ctx, key, size, in)
 }
 
+// fdGetter 可选接口：底层连接支持共享内存 fd 交付时实现（仅 shm 连接；
+// TCP 连接的接收缓冲不可 splice，不实现，回退 Get 拷贝路径）。
+type fdGetter interface {
+	GetFd(ctx context.Context, key string, off, size int64) (fd int, foff uint64, data []byte, release func(), err error)
+}
+
 // Get 读取对象内 [off, off+size) 子区间并返回整块数据；size=-1 读至对象结尾。
 //
 // 返回 (data, release, err)：data len==size 为本次调用私有缓冲，调用方用毕必须调用
@@ -56,6 +62,19 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in []byte) er
 // 单帧零拷贝路径 data 直接引用接收缓冲；否则为一次对齐汇入拷贝，正确性等价。
 func (s *Storage) Get(ctx context.Context, key string, off, size int64) ([]byte, func(), error) {
 	return s.pick().Get(ctx, key, off, size)
+}
+
+// GetFd 读取对象内 [off, off+size) 子区间并尽力交付共享内存 (fd, offset) 零拷贝源
+// （供 FUSE 读路径 splice）；底层连接不支持（TCP/多帧）时回退 Get 拷贝路径。
+// 返回值语义见 transport.ShmConn.GetFd：fd>0 时 splice(fd, foff, size) 后调用
+// release()；fd==0 时 data 为池化拷贝缓冲，用毕 release()。
+func (s *Storage) GetFd(ctx context.Context, key string, off, size int64) (int, uint64, []byte, func(), error) {
+	c := s.pick()
+	if g, ok := c.(fdGetter); ok {
+		return g.GetFd(ctx, key, off, size)
+	}
+	data, rel, err := c.Get(ctx, key, off, size)
+	return 0, 0, data, rel, err
 }
 
 // Delete 删除对象映射；key 不存在时返回 ErrNotFound。
