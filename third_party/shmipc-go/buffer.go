@@ -468,6 +468,27 @@ func (l *linkedBuffer) releasePreviousReadAndReserve() {
 	}
 }
 
+// ResolveBufferRef 把 BufferReader 最近一次 ReadBytes/Peek 返回的 []byte 引用解析为
+// 其所在共享内存的 (memfd fd, 文件内偏移)。仅当引用确实落在本会话共享内存 mmap
+// 区域内（零拷贝单切片 fast path）时 ok=true；慢路径汇入的堆缓冲（跨切片/fallback）
+// 返回 ok=false。用于把共享内存帧零拷贝交付给 splice 源（FUSE ReadResultFd）。
+func ResolveBufferRef(r BufferReader, ref []byte) (fd int, off uint64, ok bool) {
+	lb, ok := r.(*linkedBuffer)
+	if !ok {
+		return 0, 0, false
+	}
+	if len(ref) == 0 || lb.bufferManager == nil || len(lb.bufferManager.mem) == 0 {
+		return 0, 0, false
+	}
+	base := uintptr(unsafe.Pointer(&lb.bufferManager.mem[0]))
+	end := base + uintptr(len(lb.bufferManager.mem))
+	p := uintptr(unsafe.Pointer(&ref[0]))
+	if p < base || p >= end || p+uintptr(len(ref)) > end {
+		return 0, 0, false
+	}
+	return lb.bufferManager.memFd, uint64(p - base), true
+}
+
 func (l *linkedBuffer) readNextSlice() {
 	slice := l.sliceList.popFront()
 	if slice.isFromShm {

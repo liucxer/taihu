@@ -205,6 +205,21 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) ([]byte,
 	return s.getFromSource(ctx, key, off, size)
 }
 
+// GetFd 读取对象 [off, off+size) 子区间并尽力交付共享内存 (fd, offset) 零拷贝源
+// （供 FUSE 读路径 splice）：路由缓存 → TiKV 索引定位实例；实例连接不支持
+// （TCP/多帧）时回退 Get 拷贝路径。返回值语义见 rpcclient.Storage.GetFd：
+// fd>0 时 splice(fd, foff, size) 完成后调用 release()；fd==0 时 data 为池化
+// 拷贝缓冲，用毕 release()。回源重建仅走拷贝路径。
+func (s *Storage) GetFd(ctx context.Context, key string, off, size int64) (int, uint64, []byte, func(), error) {
+	if inst, ok := s.lookup(ctx, key); ok {
+		if fd, foff, data, rel, err := s.getFromFd(ctx, key, off, size, []cluster.InstanceInfo{inst}); err != rpcclient.ErrNotFound {
+			return fd, foff, data, rel, err
+		}
+	}
+	data, rel, err := s.getFromSource(ctx, key, off, size)
+	return 0, 0, data, rel, err
+}
+
 // PreloadRoute 预热路由缓存：逐个 key 查索引/路由并填充 routeCache（不读数据）。
 // 压测/预热场景用：热缓存下 Get 首查 routeCache 命中，不再打 TiKV 索引，
 // 消除"每 key 先查 TiKV"的冷启动开销。串行预热大 key 集时 TiKV 查询延迟
@@ -248,6 +263,24 @@ func (s *Storage) getFrom(ctx context.Context, key string, off, size int64, inst
 		}
 	}
 	return nil, nil, rpcclient.ErrNotFound
+}
+
+// getFromFd 从给定实例列表逐个试读（fd 优先），全部 miss 返回 ErrNotFound。
+func (s *Storage) getFromFd(ctx context.Context, key string, off, size int64, insts []cluster.InstanceInfo) (int, uint64, []byte, func(), error) {
+	for _, inst := range insts {
+		c, err := s.clientFor(inst)
+		if err != nil {
+			continue
+		}
+		fd, foff, data, rel, err := c.GetFd(ctx, key, off, size)
+		if err == nil {
+			return fd, foff, data, rel, nil
+		}
+		if err != rpcclient.ErrNotFound {
+			return 0, 0, nil, nil, err
+		}
+	}
+	return 0, 0, nil, nil, rpcclient.ErrNotFound
 }
 
 // lookup 路由缓存 → 索引，解析为活跃实例。
