@@ -49,6 +49,13 @@ type shmServer struct {
 	batched   *shmBatchReader // 非 nil 时启用"多 stream 一 worker"批读（4MiB 整块聚合 io_submit）
 	writer    *batchWriter    // 非 nil 时启用整对象攒批写（一次 AppendBatch + BatchPutCommit）
 	deleter   *batchDeleter   // 非 nil 时启用批量删（一次 BatchDelete）
+
+	// sessions 已 accept 的 shmipc Session 集合（serveConn 增删，Close 逐个关闭）。
+	// 不能只关 unix listener：shmipc.Server 内部 dup fd 后已关闭传入的 net.Conn，
+	// 服务端的 ServeConn/AcceptStream/读帧实际阻塞在 session 自己的 shutdownCh/
+	// closeNotifyCh 上，只有 session.Close() 会关闭这两条 channel 唤醒它们。
+	sessionsMu sync.Mutex
+	sessions   map[*shmipc.Session]struct{}
 }
 
 // ServeShm 在 unix socket 路径 uds 上提供 shmipc 服务，返回 io.Closer 关闭服务。
@@ -205,22 +212,35 @@ func ServeShmWithConfig(storage *storage.Storage, uds string, cfg PipelineConfig
 		return nil, err
 	}
 	s := &shmServer{
-		storage: storage,
-		ln:      ln,
-		conf:    conf,
-		closed:  make(chan struct{}),
-		batched: newShmBatchReader(storage, cfg.ReadBatch, cfg.ReadWorkers),
-		writer:  newBatchWriter(storage, cfg.WriteWorkers, cfg.WriteBatch),
-		deleter: newBatchDeleter(storage, cfg.DeleteWorkers, cfg.DeleteBatch),
+		storage:  storage,
+		ln:       ln,
+		conf:     conf,
+		closed:   make(chan struct{}),
+		sessions: make(map[*shmipc.Session]struct{}),
+		batched:  newShmBatchReader(storage, cfg.ReadBatch, cfg.ReadWorkers),
+		writer:   newBatchWriter(storage, cfg.WriteWorkers, cfg.WriteBatch),
+		deleter:  newBatchDeleter(storage, cfg.DeleteWorkers, cfg.DeleteBatch),
 	}
 	go s.acceptLoop()
 	return s, nil
 }
 
-// Close 关闭 unix listener 并等待全部连接/流处理 goroutine 退出。
+// Close 关闭 unix listener，并逐个关闭已 accept 的 shmipc Session，然后等待全部
+// 连接/流处理 goroutine 退出。只关 listener 不够：AcceptStream 阻塞在 session 的
+// shutdownCh、读帧阻塞在 stream 的 closeNotifyCh，session.Close() 会同步关闭这两条
+// channel 使 serveConn/handleStream 出错返回，wg 因此有界（优雅停机不卡死）。
 func (s *shmServer) Close() error {
 	s.closeOnce.Do(func() { close(s.closed) })
 	_ = s.ln.Close()
+	s.sessionsMu.Lock()
+	sessions := make([]*shmipc.Session, 0, len(s.sessions))
+	for sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	s.sessionsMu.Unlock()
+	for _, sess := range sessions {
+		_ = sess.Close() // 关闭已唤醒；serveConn 自己也会兜底关闭漏网会话
+	}
 	s.wg.Wait()
 	return nil
 }
@@ -243,14 +263,30 @@ func (s *shmServer) acceptLoop() {
 	}
 }
 
-// serveConn 单连接服务循环：接受流并逐流起 goroutine 处理。
+// serveConn 单连接服务循环：接受流并逐流起 goroutine 处理。会话在建立后登记进
+// s.sessions（Close 据此逐个关闭唤醒阻塞点），退出时注销并关闭。
 func (s *shmServer) serveConn(conn net.Conn) {
 	defer s.wg.Done()
 	session, err := shmipc.Server(conn, s.conf)
 	if err != nil {
 		return
 	}
-	defer session.Close()
+	s.sessionsMu.Lock()
+	s.sessions[session] = struct{}{}
+	s.sessionsMu.Unlock()
+	defer func() {
+		s.sessionsMu.Lock()
+		delete(s.sessions, session)
+		s.sessionsMu.Unlock()
+		_ = session.Close()
+	}()
+	// 落在 Close 快照之后的会话由这里兜底关闭（Close 的 wg.Wait 只等登记过的
+	// serveConn/handleStream，会话必须自己收尾，否则无人关闭会阻塞退出）。
+	select {
+	case <-s.closed:
+		return
+	default:
+	}
 	for {
 		stream, err := session.AcceptStream()
 		if err != nil {
@@ -273,6 +309,13 @@ func (s *shmServer) handleStream(st *shmipc.Stream) {
 	r := st.BufferReader()
 	var err error
 	for {
+		// 停机分支：s.closed 后尽快收尾（读帧阻塞由 Close 关 session 唤醒，此处
+		// 兜住两帧之间未阻塞的空窗，避免多读一轮请求）。
+		select {
+		case <-s.closed:
+			return
+		default:
+		}
 		op, payload, rerr := shmReadFrame(r)
 		if rerr != nil {
 			err = rerr

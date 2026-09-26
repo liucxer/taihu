@@ -94,18 +94,34 @@ func (a txnkvClient) Begin() (tikvTxn, error) { return a.c.Begin() }
 func (a txnkvClient) Close() error { return a.c.Close() }
 
 // NewTiKVKV 连接 TiKV PD 集群（TxnKV）。tls 启用时写入 client-go 全局 Security
-// 配置（txnkv.NewClient 只读全局配置）；ctx 仅为保持调用约定，暂不使用。
-func NewTiKVKV(_ context.Context, pdAddrs []string, tls TLSConfig) (*TiKVKV, error) {
+// 配置（txnkv.NewClient 只读全局配置）。ctx 用于给 PD 连接限时：txnkv.NewClient
+// 不接受 ctx，PD 不可达时可能长期阻塞，放进 goroutine 用 ctx 兜底——超时放弃后
+// 该 goroutine 仍会在 NewClient 自身超时/重试上限内自行结束，且启动失败路径紧随
+// os.Exit，无泄漏风险。
+func NewTiKVKV(ctx context.Context, pdAddrs []string, tls TLSConfig) (*TiKVKV, error) {
 	if tls.enabled() {
 		config.UpdateGlobal(func(conf *config.Config) {
 			conf.Security = config.NewSecurity(tls.CA, tls.Cert, tls.Key, nil)
 		})
 	}
-	c, err := txnkv.NewClient(pdAddrs)
-	if err != nil {
-		return nil, fmt.Errorf("tikv txnkv connect: %w", err)
+	type result struct {
+		c   *txnkv.Client
+		err error
 	}
-	return &TiKVKV{c: txnkvClient{c: c}}, nil
+	res := make(chan result, 1)
+	go func() {
+		c, err := txnkv.NewClient(pdAddrs)
+		res <- result{c, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("tikv txnkv connect: %w", ctx.Err())
+	case r := <-res:
+		if r.err != nil {
+			return nil, fmt.Errorf("tikv txnkv connect: %w", r.err)
+		}
+		return &TiKVKV{c: txnkvClient{c: r.c}}, nil
+	}
 }
 
 // snapshot 取最新时间戳的一致性快照；RC 隔离避免读被残留锁阻塞

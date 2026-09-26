@@ -257,6 +257,15 @@ var serverCmd = &cobra.Command{
 			signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 			<-sig
 			log.Println("shutting down...")
+			// 兜底：GracefulStop 与后续 defer 链（shm 停连 / Pebble Close）若 30s 内
+			// 未完成，强制 os.Exit——Pebble LOCK 随进程退出由内核自动释放，避免停机
+			// 卡死导致同 db 新实例启动报 resource temporarily unavailable。
+			// 正常路径下主流程会先返回、进程正常退出，本 goroutine 随进程终止，不生效。
+			go func() {
+				time.Sleep(30 * time.Second)
+				log.Println("shutdown timed out after 30s, forcing exit")
+				os.Exit(1)
+			}()
 			// 先注销集群注册（避免残留僵尸实例），再停数据面。
 			// clusterCancel 已由上面的 defer 保证调用，这里提前调一次让心跳先停。
 			clusterCancel()
