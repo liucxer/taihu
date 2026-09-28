@@ -26,6 +26,15 @@ type InstanceInfo = cluster.InstanceInfo
 // internal/rpcclient，此处 alias 给外部调用方泛化（唯一实现为本包 Storage）。
 type ObjectStore = rpcclient.ObjectStore
 
+// FdBuf 批量读（GetFdBatch）单 key 的交付结果（internal/rpcclient re-export，
+// 此处再指一层：本包 GetFdBatch 的返回类型对外可命名）。
+type FdBuf = rpcclient.FdBuf
+
+// NewFdBuf 构造带归还回调的 FdBuf（internal/rpcclient.NewFdBuf 的 re-export）。
+func NewFdBuf(fd int, foff uint64, data []byte, release func()) *FdBuf {
+	return rpcclient.NewFdBuf(fd, foff, data, release)
+}
+
 // 客户端可见的库错误。本包的 Storage 把底层错误原样透出（不做包装），故只 import
 // 本包的调用方也需要能命名它们才能做 errors.Is / 相等判断。
 // 定义在 pkg/ierr，internal/rpcclient 已 re-export，此处再指一层以保持单一来源。

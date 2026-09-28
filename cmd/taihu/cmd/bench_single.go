@@ -52,6 +52,7 @@ var benchSingleCmd = &cobra.Command{
 		c.Count, _ = cmd.Flags().GetInt("count")
 		c.ReportEvery, _ = cmd.Flags().GetDuration("report-interval")
 		c.Latency, _ = cmd.Flags().GetBool("latency")
+		c.Verify, _ = cmd.Flags().GetBool("verify")
 		c.Pipeline, _ = cmd.Flags().GetInt("pipeline")
 
 		if err := c.validate(); err != nil {
@@ -71,7 +72,10 @@ var benchSingleCmd = &cobra.Command{
 		case "rpc":
 			s, err = rpcclient.DialPoolMulti(ctx, strings.Split(c.addr, ","), c.conns)
 		case "shm":
-			s, err = rpcclient.DialShmPool(ctx, c.shm, c.conns)
+			// shm 数据面直接以 ShmConn 作为 Store：其实现 benchkit.Batcher（GetBatch
+			// 单流连发 P 个 GetReq），配合服务端 per-stream 异步读流水线摊薄每请求固定
+			// 开销；经 rpcclient.Storage 包装会丢失 Batcher（Storage 不实现 GetBatch）。
+			s, err = transport.DialShm(c.shm, c.conns)
 		}
 		if err != nil {
 			benchkit.StopCPUProfile(cpuFile)
@@ -115,12 +119,13 @@ func init() {
 	f.String("cpuprofile", "", "write cpu profile to this file (pprof)")
 	f.String("mode", "", "write | read | delete")
 	f.Int64("size", 4096, "object size in bytes")
-	f.Int("threads", 1, "number of concurrent goroutines")
+	f.Int("threads", 4, "number of concurrent goroutines (default 4 = 读性能测试标定：4 worker)")
 	f.String("keys-prefix", "sbench", "key prefix, keys are <prefix>/<seq>")
 	f.Int("count", 1000, "total number of distinct objects")
 	f.Duration("report-interval", 2*time.Second, "progress report interval")
 	f.Bool("latency", false, "record per-op latency")
-	f.Int("pipeline", 1, "per-worker in-flight ops (1 = serial; >1 deepens disk queue for single-block objects)")
+	f.Bool("verify", false, "read mode: byte-wise data verification (pattern byte(j & 0xff), regression check)")
+	f.Int("pipeline", 8, "per-worker in-flight ops (8 = 读性能测试标定：单流批深 8，配合服务端 --shm-inflight 8 异步流水线; 1 = serial)")
 }
 
 func (c *singleBenchConfig) validate() error {

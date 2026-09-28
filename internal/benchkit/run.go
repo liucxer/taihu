@@ -28,6 +28,9 @@ type Config struct {
 	ReportEvery time.Duration
 	// Latency 记录每 op 延迟并输出 p50/p90/p99。
 	Latency bool
+	// Verify read 模式逐字节校验数据内容（pattern byte(j & 0xff)，与 write 写入一致）：
+	// 数据一致性回归用，open-loop 性能采集照常。write 模式忽略。
+	Verify bool
 	// Pipeline 每个 worker 保持的在途 op 数（read/write 用 bounded-pump 并发下发，
 	// 让单线程也能同时持有多个在途请求，摊薄同步往返的 per-op 等待；1 表示串行逐 op）。
 	Pipeline int
@@ -40,6 +43,17 @@ type Store interface {
 	Get(ctx context.Context, key string, off, size int64) ([]byte, func(), error)
 	Delete(ctx context.Context, key string) error
 	Close() error
+}
+
+// Batcher 可选接口：支持单流多请求 pipeline 读写的数据面（shm ShmConn 实现）。
+// GetBatch 在一条流上连发 len(keys) 个 GetReq（每请求 off/size 相同）并按序读回
+// 响应，返回的 release() 用毕必调（幂等，归还全部帧 pin 与池缓冲）；PutBatch 在
+// 一条流上连发 len(keys) 个完整 Put（同 size，数据取 in 前 size 字节）并按序读回
+// 响应。benchkit 在 pipeline>1 且数据面支持时自动走批路径（把流级往返固定开销
+// 摊薄到 P 个请求）。
+type Batcher interface {
+	GetBatch(ctx context.Context, keys []string, off, size int64) ([][]byte, func(), error)
+	PutBatch(ctx context.Context, keys []string, size int64, in []byte) error
 }
 
 // Validate 校验公共参数。
@@ -135,6 +149,14 @@ func runWorker(ctx context.Context, s Store, cfg Config, s0, e0 int, ops *atomic
 			if err == nil && int64(len(got)) != cfg.Size {
 				err = fmt.Errorf("key %s: short read %d != %d", key, len(got), cfg.Size)
 			}
+			if err == nil && cfg.Verify {
+				for j := range got {
+					if got[j] != byte(j&0xff) {
+						err = fmt.Errorf("key %s: data mismatch at %d (got %#x)", key, j, got[j])
+						break
+					}
+				}
+			}
 			if got != nil {
 				rel() // Get 返回私有缓冲，校验后即归还
 			}
@@ -158,6 +180,12 @@ func runWorker(ctx context.Context, s Store, cfg Config, s0, e0 int, ops *atomic
 // "每线程在途=Pipeline"，从而加深磁盘队列、摊薄同步往返等待。读模式用；语义与
 // Run/runWorker 完全一致（区间切分、短读校验、Get 缓冲即取即还、延迟与计数）。
 func runPipelinedWorker(ctx context.Context, s Store, cfg Config, s0, e0 int, ops *atomic.Int64, lat *latencyCollector) error {
+	// 单流多请求 pipeline（shm Batcher）：worker 独占 1 条流连发 P 个请求，配合
+	// 服务端 per-stream 异步读/写流水线把单流在途提升到 P（非 shm/TCP 数据面不实现
+	// Batcher，回落旧的多 goroutine 并发路径，行为不变）。
+	if b, ok := s.(Batcher); ok && cfg.Mode != "delete" {
+		return runBatchedWorker(ctx, b, cfg, s0, e0, ops, lat)
+	}
 	payload := make([]byte, int(cfg.Size))
 	for j := range payload {
 		payload[j] = byte(j & 0xff)
@@ -188,6 +216,14 @@ func runPipelinedWorker(ctx context.Context, s Store, cfg Config, s0, e0 int, op
 					if err == nil && int64(len(got)) != cfg.Size {
 						err = fmt.Errorf("key %s: short read %d != %d", key, len(got), cfg.Size)
 					}
+					if err == nil && cfg.Verify {
+						for j := range got {
+							if got[j] != byte(j&0xff) {
+								err = fmt.Errorf("key %s: data mismatch at %d (got %#x)", key, j, got[j])
+								break
+							}
+						}
+					}
 					if got != nil {
 						rel()
 					}
@@ -211,4 +247,68 @@ func runPipelinedWorker(ctx context.Context, s Store, cfg Config, s0, e0 int, op
 	}
 	wg.Wait()
 	return firstErr
+}
+
+// runBatchedWorker 单流多请求 pipeline（Batcher 数据面，shm）：worker 独占 1 条流，
+// 每次把 Pipeline 个 key 连发 GetBatch/PutBatch（单流在途 = Pipeline，配合服务端
+// per-stream 异步读写流水线摊薄每请求固定开销），按序读回响应后校验并整体归还。
+// 区间切分/短读校验/计数语义与 runWorker 一致；延迟按整批记录（P 个 op 共享一批时长）。
+func runBatchedWorker(ctx context.Context, b Batcher, cfg Config, s0, e0 int, ops *atomic.Int64, lat *latencyCollector) error {
+	keys := make([]string, 0, cfg.Pipeline)
+	payload := make([]byte, int(cfg.Size))
+	for j := range payload {
+		payload[j] = byte(j & 0xff)
+	}
+	for k := s0; k < e0; {
+		n := cfg.Pipeline
+		if e0-k < n {
+			n = e0 - k
+		}
+		ks := keys[:n]
+		for i := range ks {
+			ks[i] = KeyFor(cfg.Prefix, k+i)
+		}
+		t0 := time.Now()
+		var err error
+		switch cfg.Mode {
+		case "write":
+			err = b.PutBatch(ctx, ks, cfg.Size, payload)
+		case "read":
+			var outs [][]byte
+			var rel func()
+			outs, rel, err = b.GetBatch(ctx, ks, 0, cfg.Size)
+			if err == nil {
+				for i := range outs {
+					if int64(len(outs[i])) != cfg.Size {
+						err = fmt.Errorf("key %s: short read %d != %d", ks[i], len(outs[i]), cfg.Size)
+						break
+					}
+					if cfg.Verify {
+						for j := range outs[i] {
+							if outs[i][j] != byte(j&0xff) {
+								err = fmt.Errorf("key %s: data mismatch at %d (got %#x)", ks[i], j, outs[i][j])
+								break
+							}
+						}
+						if err != nil {
+							break
+						}
+					}
+				}
+				rel() // 成功返回的批必须归还（幂等）；GetBatch 出错时已自行清理
+			}
+		}
+		if cfg.Latency {
+			d := time.Since(t0)
+			for i := 0; i < n; i++ {
+				lat.add(d)
+			}
+		}
+		if err != nil {
+			return err
+		}
+		ops.Add(int64(n))
+		k += n
+	}
+	return nil
 }

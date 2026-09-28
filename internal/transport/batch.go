@@ -30,6 +30,11 @@ type PipelineConfig struct {
 	// 读（现有 shmBatchReader，仅 shm 路径使用）。
 	ReadBatch   int
 	ReadWorkers int
+	// Inflight 每流在途异步读上限（per-stream 异步流水线，仅 shm 路径）：>0 时对齐
+	// 整块 4MiB 读走「提交不等待 + 按序排空写帧」，配合客户端单流多请求 pipeline
+	// 摊薄每请求固定开销（ring 往返 + meta + flush）；0 关闭（逐请求串行，保持旧行为）。
+	// 与 ReadBatch 互斥：两者都 >0 时 ReadBatch 优先，异步流水线不生效。
+	Inflight int
 	// 写（batchWriter）。
 	WriteBatch   int
 	WriteWorkers int
@@ -99,6 +104,14 @@ func (b *batchWriter) submit(t *writeTask) error {
 	w := (b.rr.Add(1) - 1) % uint64(len(b.queues))
 	b.queues[w] <- t
 	return <-t.done
+}
+
+// submitAsync 非阻塞投递一个写任务（shm 异步写流水线用）：按 rr 轮转送入 worker 队列即返回，
+// 调用方把 t 挂进 pend 保序队列，写结果从 t.done 取回后按序写 OpResp 帧。
+// 与 submit 的区别仅在不等待 done —— 队列有界（batchCap*2），worker 持续 drain 不会阻塞投递。
+func (b *batchWriter) submitAsync(t *writeTask) {
+	w := (b.rr.Add(1) - 1) % uint64(len(b.queues))
+	b.queues[w] <- t
 }
 
 // run 单 worker 主循环：drain 取批 → 一次 AppendBatch → 一次 BatchPutCommit → 逐任务回投。

@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/liucxer/taihu/third_party/shmipc-go"
@@ -127,6 +128,69 @@ type getResult struct {
 	foff    uint64
 	data    []byte
 	release func()
+}
+
+// FdBuf 批量读的单个 key 交付结果：Fd>0 时 Data 零拷贝引用共享内存
+// （memfd(Fd,Foff) 为 splice 源，Data 与 fd/foff 指向同一段内存）；Fd==0 时 Data
+// 为池化拷贝缓冲。两种情况用毕都必须 Release()（幂等）——批内各 FdBuf 独立引用
+// 计数，全部归还后一次性释放帧 pin 并把流 PutBack 复用。
+type FdBuf struct {
+	Fd      int
+	Foff    uint64
+	Data    []byte
+	release func()
+}
+
+// NewFdBuf 构造带归还回调的 FdBuf（供 transport 包外构造：rpcclient 批量回退路径等，
+// 逐 key 的 release 无法在包外直接赋值）。release 可为 nil（此时 Release() 为 no-op）。
+func NewFdBuf(fd int, foff uint64, data []byte, release func()) *FdBuf {
+	return &FdBuf{Fd: fd, Foff: foff, Data: data, release: release}
+}
+
+// Release 归还本 FdBuf 底层缓冲（幂等）。
+func (b *FdBuf) Release() {
+	if b != nil && b.release != nil {
+		b.release()
+		b.release = nil
+	}
+}
+
+// fdBatchReleaser 批量零拷贝读的共享归还器（引用计数）：批内每个 FdBuf 各持一份
+// 引用，全部归还后（或错误路径 force）一次性归还池化缓冲、释放帧 pin 并把流
+// PutBack 复用。幂等（once 保护），与 GetBatch 的单 release 语义等价但支持 per-key 归还。
+type fdBatchReleaser struct {
+	n    int32
+	once sync.Once
+	bufs [][]byte
+	r    shmipc.BufferReader
+	st   *shmipc.Stream
+	sm   *shmipc.SessionManager
+}
+
+func newFdBatchReleaser(refs int, r shmipc.BufferReader, st *shmipc.Stream, sm *shmipc.SessionManager) *fdBatchReleaser {
+	return &fdBatchReleaser{n: int32(refs), r: r, st: st, sm: sm}
+}
+
+// releaseOne 归还一份引用；归零时执行整体清理。
+func (br *fdBatchReleaser) releaseOne() {
+	if atomic.AddInt32(&br.n, -1) == 0 {
+		br.once.Do(br.cleanup)
+	}
+}
+
+// force 错误路径兜底：不待引用归零直接清理（调用后不得再使用批内 FdBuf）。
+func (br *fdBatchReleaser) force() {
+	br.once.Do(br.cleanup)
+}
+
+func (br *fdBatchReleaser) cleanup() {
+	for _, b := range br.bufs {
+		if b != nil {
+			bufpool.Put(b)
+		}
+	}
+	br.r.ReleasePreviousRead()
+	br.sm.PutBack(br.st)
 }
 
 // Get 读取对象内 [off, off+size) 子区间并返回整块数据；size=-1 读至对象结尾。
@@ -273,6 +337,396 @@ func (c *ShmConn) getEx(ctx context.Context, key string, off, size int64) (*getR
 			return nil, fmt.Errorf("taihu: unexpected get frame op %d", op)
 		}
 	}
+}
+
+// GetBatch 在单条流上连发 len(keys) 个 GetReq（每请求 off/size 相同）并按序读回
+// len(keys) 个响应 —— 单流多请求 pipeline：相比逐 key Get（每请求 GetStream/
+// PutBack + 一写一读一个往返），把流级往返固定开销摊薄到 P 个请求上，配合服务端
+// per-stream 异步读流水线把单流在途从 1 提升到 P（benchkit.Batcher，压测用）。
+//
+// 返回 out[i] 对应 keys[i]：单帧响应（整块 4MiB 零拷贝）直接引用共享内存，多帧
+// 响应逐响应汇入 bufpool 缓冲；用毕必须调用返回的 release()（幂等）一次性归还
+// 全部帧 pin 与池缓冲，并把流 PutBack 复用。任一响应出错（服务端错误/短读/畸形帧）
+// 整个调用失败并关闭流（残留帧不污染可复用流）。off/size 须显式给定（size<0 不支持）。
+func (c *ShmConn) GetBatch(ctx context.Context, keys []string, off, size int64) ([][]byte, func(), error) {
+	if len(keys) == 0 || size == 0 {
+		return nil, func() {}, nil
+	}
+	if off < 0 || size < 0 {
+		return nil, nil, ierr.ErrInvalidRange
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	st, err := c.sm.GetStream()
+	if err != nil {
+		return nil, nil, err
+	}
+	if d, ok := ctx.Deadline(); ok {
+		_ = st.SetDeadline(d)
+	}
+	// 单流连发全部 GetReq（整批一次 Flush，帧按序入环）。
+	for i, key := range keys {
+		shmDbg("client batch send k=%d key=%s off=%d size=%d", i, key, off, size)
+		if err := shmWriteFrame(st, protocol.OpGetReq, protocol.EncodeGetReq(key, off, size)); err != nil {
+			_ = st.Close()
+			return nil, nil, err
+		}
+	}
+
+	r := st.BufferReader()
+	out := make([][]byte, len(keys))
+	bufs := make([][]byte, len(keys)) // 多帧响应汇入的 bufpool 缓冲（单帧路径 nil）
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			for _, b := range bufs {
+				if b != nil {
+					bufpool.Put(b)
+				}
+			}
+			r.ReleasePreviousRead()
+			c.sm.PutBack(st)
+		})
+	}
+
+	for k := range keys {
+		// 读第 k 个响应：逐帧直到 final（帧序即响应边界；语义镜像 getEx 单响应）。
+		var resp []byte // 本次响应返回缓冲（零拷贝引用或汇入缓冲）
+		var buf []byte  // 本次响应汇入缓冲
+		var got int
+	readResp: // Go gotcha：switch case 内的无标签 break 只跳出 switch；final 后必须跳出
+		// 本响应帧循环（否则会越界读到下一响应的帧，重则 exceeds、轻则挂死）。
+		for {
+			op, payload, ferr := shmReadFrame(r)
+			shmDbg("client batch recv k=%d op=%d rem=%d got=%d size=%d", k, op, len(payload), got, size)
+			if ferr != nil {
+				release()
+				return nil, nil, ferr
+			}
+			switch op {
+			case protocol.OpGetData, protocol.OpGetDataFinal:
+				final := op == protocol.OpGetDataFinal
+				rem := int64(len(payload))
+				if rem > size-int64(got) {
+					shmDbg("client batch k=%d ERR exceeds: rem=%d got=%d size=%d", k, rem, got, size)
+					release()
+					return nil, nil, fmt.Errorf("taihu: get batch exceeds requested size")
+				}
+				if buf == nil && resp == nil {
+					if rem == size {
+						// 整响应恰一帧：零拷贝引用共享内存，release 前保持有效。
+						recordRxDataFrame(int(rem), true)
+						resp = payload
+						got = int(size)
+						if final {
+							out[k] = resp
+							break readResp
+						}
+						continue // 非 final（协议异常）：等下一帧触发超限报错
+					}
+					recordRxDataFrame(int(rem), false)
+					buf = bufpool.Get(int(size))
+					resp = buf[:size]
+				} else {
+					recordRxDataFrame(int(rem), false)
+				}
+				got += int(copy(resp[got:], payload))
+				r.ReleasePreviousRead()
+				if final {
+					if got != int(size) {
+						release()
+						return nil, nil, fmt.Errorf("taihu: get batch short read: got %d want %d", got, size)
+					}
+					out[k] = resp
+					bufs[k] = buf // 记录汇入缓冲，release 时归还
+					break readResp
+				}
+			case protocol.OpGetErr:
+				code, rerr := protocol.ReadU32(protocol.NewSliceReader(payload))
+				if rerr != nil {
+					release()
+					return nil, nil, rerr
+				}
+				release()
+				return nil, nil, protocol.MapCode(protocol.ErrCode(code))
+			default:
+				release()
+				return nil, nil, fmt.Errorf("taihu: unexpected get batch frame op %d", op)
+			}
+		}
+	}
+	return out, release, nil
+}
+
+// GetFdBatch 在单条流上连发 len(keys) 个 GetReq（每请求 off/size 相同）并按序读回
+// len(keys) 个响应，批内每个 key 尽力交付 memfd (fd, foff) 零拷贝 splice 源——
+// 对称 GetBatch 的批量 pipeline，同时保留单 key GetFd 的零拷贝语义（批量读不汇入
+// 拷贝，否则 splice 优势尽失）。
+//
+// 返回 out[i] 对应 keys[i]（*FdBuf，字段语义见上）：单帧整块响应直接引用共享内存
+// 并解析出 (fd, foff)；多帧/跨切片响应回退为池化拷贝缓冲（fd==0）。批内每个 FdBuf
+// 各持一份引用：用毕逐个 FdBuf.Release()（推荐，per-key 归还，全部归还后整体回收）
+// 或一次性调用返回的 release 兜底（调用后不得再使用批内 FdBuf）。任一响应出错整个
+// 调用失败并关闭流（残留帧不污染可复用流），不返回任何 FdBuf。
+func (c *ShmConn) GetFdBatch(ctx context.Context, keys []string, off, size int64) ([]*FdBuf, func(), error) {
+	if len(keys) == 0 || size == 0 {
+		return nil, func() {}, nil
+	}
+	if off < 0 || size < 0 {
+		return nil, nil, ierr.ErrInvalidRange
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	st, err := c.sm.GetStream()
+	if err != nil {
+		return nil, nil, err
+	}
+	if d, ok := ctx.Deadline(); ok {
+		_ = st.SetDeadline(d)
+	}
+	// 单流连发全部 GetReq（整批一次 Flush，帧按序入环）。
+	for i, key := range keys {
+		shmDbg("client batch fd send k=%d key=%s off=%d size=%d", i, key, off, size)
+		if err := shmWriteFrame(st, protocol.OpGetReq, protocol.EncodeGetReq(key, off, size)); err != nil {
+			_ = st.Close()
+			return nil, nil, err
+		}
+	}
+
+	r := st.BufferReader()
+	out := make([]*FdBuf, len(keys))
+	bufs := make([][]byte, len(keys)) // 多帧响应汇入的池化缓冲（单帧路径 nil）
+	br := newFdBatchReleaser(len(keys), r, st, c.sm)
+	br.bufs = bufs // 清理时统一归还（错误路径也可见已汇入的缓冲）
+	abort := br.force
+	// 整批兜底：直接强制归还（幂等）。正常路径只逐个 FdBuf.Release()。
+	batchRel := abort
+
+	for k := range keys {
+		// 读第 k 个响应：逐帧直到 final（帧序即响应边界；语义镜像 GetBatch 单响应）。
+		var resp []byte // 本次响应返回缓冲（零拷贝引用或汇入缓冲）
+		var buf []byte  // 本次响应汇入缓冲
+		var got int
+	readResp: // Go gotcha：switch case 内的无标签 break 只跳出 switch；final 后必须跳出
+		// 本响应帧循环（否则会越界读到下一响应的帧，重则 exceeds、轻则挂死）。
+		for {
+			op, payload, ferr := shmReadFrame(r)
+			shmDbg("client batch fd recv k=%d op=%d rem=%d got=%d size=%d", k, op, len(payload), got, size)
+			if ferr != nil {
+				abort()
+				return nil, nil, ferr
+			}
+			switch op {
+			case protocol.OpGetData, protocol.OpGetDataFinal:
+				final := op == protocol.OpGetDataFinal
+				rem := int64(len(payload))
+				if rem > size-int64(got) {
+					shmDbg("client batch fd k=%d ERR exceeds: rem=%d got=%d size=%d", k, rem, got, size)
+					abort()
+					return nil, nil, fmt.Errorf("taihu: get fd batch exceeds requested size")
+				}
+				if buf == nil && resp == nil {
+					if rem == size {
+						// 整响应恰一帧：零拷贝引用共享内存，并解析 memfd (fd, foff)。
+						recordRxDataFrame(int(rem), true)
+						resp = payload
+						got = int(size)
+						if final {
+							fd, foff, _ := shmipc.ResolveBufferRef(r, resp)
+							out[k] = &FdBuf{Fd: fd, Foff: foff, Data: resp, release: br.releaseOne}
+							break readResp
+						}
+						continue // 非 final（协议异常）：不释放，等下一帧触发超限报错
+					}
+					recordRxDataFrame(int(rem), false)
+					buf = bufpool.Get(int(size))
+					resp = buf[:size]
+				} else {
+					recordRxDataFrame(int(rem), false)
+				}
+				got += int(copy(resp[got:], payload))
+				r.ReleasePreviousRead()
+				if final {
+					if got != int(size) {
+						abort()
+						return nil, nil, fmt.Errorf("taihu: get fd batch short read: got %d want %d", got, size)
+					}
+					out[k] = &FdBuf{Fd: 0, Foff: 0, Data: resp, release: br.releaseOne}
+					bufs[k] = buf // 记录汇入缓冲，release 时归还
+					break readResp
+				}
+			case protocol.OpGetErr:
+				code, rerr := protocol.ReadU32(protocol.NewSliceReader(payload))
+				if rerr != nil {
+					abort()
+					return nil, nil, rerr
+				}
+				abort()
+				return nil, nil, protocol.MapCode(protocol.ErrCode(code))
+			default:
+				abort()
+				return nil, nil, fmt.Errorf("taihu: unexpected get fd batch frame op %d", op)
+			}
+		}
+	}
+	return out, batchRel, nil
+}
+
+// PutBatch 在单条流上连发 len(keys) 个完整 Put（每 key 一个 OpPutHeader + OpPutData* +
+// OpPutEnd）并按序读回 len(keys) 个 OpResp —— 单流多请求 pipeline（对称 GetBatch）：
+// 相比逐 key Put（每请求 GetStream/PutBack + 一写一读一个往返），把流级往返固定开销
+// 摊薄到 P 个请求上，配合服务端 per-stream 异步写流水线（inflight>0 + batchWriter）把
+// 单流在途写从 1 提升到 P。各 key 数据均取 in 的前 size 字节（与逐 key Put 同 payload 语义）。
+//
+// 任一响应为业务错误（写失败）或帧畸形时整个调用失败并关闭流：残留的后续响应帧会
+// 污染可复用流，不能 PutBack（下次 GetStream 会读到脏帧）。成功时 PutBack 复用。
+func (c *ShmConn) PutBatch(ctx context.Context, keys []string, size int64, in []byte) error {
+	if len(keys) == 0 || size == 0 {
+		return nil
+	}
+	if int64(len(in)) < size {
+		return ierr.ErrShortWrite
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	st, err := c.sm.GetStream()
+	if err != nil {
+		return err
+	}
+	if d, ok := ctx.Deadline(); ok {
+		_ = st.SetDeadline(d)
+	}
+	// 单流连发全部 Put（整批一次 Flush，帧按序入环）。
+	for _, key := range keys {
+		if err := shmWriteFrame(st, protocol.OpPutHeader, protocol.EncodePutHeader(key, size)); err != nil {
+			_ = st.Close()
+			return err
+		}
+		var off int64
+		for off < size {
+			end := off + protocol.ChunkSize
+			if end > size {
+				end = size
+			}
+			if err := shmWriteFrame(st, protocol.OpPutData, in[off:end]); err != nil {
+				_ = st.Close()
+				return err
+			}
+			off = end
+		}
+		if err := shmWriteFrame(st, protocol.OpPutEnd, nil); err != nil {
+			_ = st.Close()
+			return err
+		}
+	}
+	// 按序读回 P 个 OpResp；每帧读完即释放 pin（控制帧，payload 解析后不再引用）。
+	r := st.BufferReader()
+	for range keys {
+		op, payload, err := shmReadFrame(r)
+		if err != nil {
+			_ = st.Close()
+			return err
+		}
+		if op != protocol.OpResp {
+			_ = st.Close()
+			return fmt.Errorf("taihu: unexpected put batch response op %d", op)
+		}
+		code, err := protocol.ReadU32(protocol.NewSliceReader(payload))
+		if err != nil {
+			_ = st.Close()
+			return err
+		}
+		if e := protocol.MapCode(protocol.ErrCode(code)); e != nil {
+			// 业务错误：流上仍残留未读响应帧，关闭丢弃（不能 PutBack 复用）。
+			_ = st.Close()
+			return e
+		}
+		r.ReleasePreviousRead()
+	}
+	c.sm.PutBack(st)
+	return nil
+}
+
+// PutBatchKeys 在单条流上连发 len(keys) 个完整 Put（每 key 数据取自 datas[i]，各 key
+// 内容相互独立）并按序读回 len(keys) 个 OpResp —— 对称 GetFdBatch 的批量写 pipeline。
+// 与 PutBatch 的差异仅在数据来源：PutBatch 各 key 均取 in 的前 size 字节（bench 用，
+// 全 key 同内容）；PutBatchKeys 各 key 写 datas[i] 的前 size 字节（FUSE 数据面用，
+// 每块内容不同，供攒批器 concat 后一次下发）。其余语义一致：任一响应为业务错误或
+// 帧畸形时整个调用失败并关闭流（残留响应帧不能 PutBack 复用）。
+func (c *ShmConn) PutBatchKeys(ctx context.Context, keys []string, size int64, datas [][]byte) error {
+	if len(keys) == 0 || size == 0 {
+		return nil
+	}
+	if len(datas) != len(keys) {
+		return fmt.Errorf("taihu: put batch keys %d != datas %d", len(keys), len(datas))
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	st, err := c.sm.GetStream()
+	if err != nil {
+		return err
+	}
+	if d, ok := ctx.Deadline(); ok {
+		_ = st.SetDeadline(d)
+	}
+	// 单流连发全部 Put（整批一次 Flush，帧按序入环）。
+	for i, key := range keys {
+		in := datas[i]
+		if int64(len(in)) < size {
+			_ = st.Close()
+			return ierr.ErrShortWrite
+		}
+		if err := shmWriteFrame(st, protocol.OpPutHeader, protocol.EncodePutHeader(key, size)); err != nil {
+			_ = st.Close()
+			return err
+		}
+		var off int64
+		for off < size {
+			end := off + protocol.ChunkSize
+			if end > size {
+				end = size
+			}
+			if err := shmWriteFrame(st, protocol.OpPutData, in[off:end]); err != nil {
+				_ = st.Close()
+				return err
+			}
+			off = end
+		}
+		if err := shmWriteFrame(st, protocol.OpPutEnd, nil); err != nil {
+			_ = st.Close()
+			return err
+		}
+	}
+	// 按序读回 P 个 OpResp；每帧读完即释放 pin（控制帧，payload 解析后不再引用）。
+	r := st.BufferReader()
+	for range keys {
+		op, payload, err := shmReadFrame(r)
+		if err != nil {
+			_ = st.Close()
+			return err
+		}
+		if op != protocol.OpResp {
+			_ = st.Close()
+			return fmt.Errorf("taihu: unexpected put batch keys response op %d", op)
+		}
+		code, err := protocol.ReadU32(protocol.NewSliceReader(payload))
+		if err != nil {
+			_ = st.Close()
+			return err
+		}
+		if e := protocol.MapCode(protocol.ErrCode(code)); e != nil {
+			// 业务错误：流上仍残留未读响应帧，关闭丢弃（不能 PutBack 复用）。
+			_ = st.Close()
+			return e
+		}
+		r.ReleasePreviousRead()
+	}
+	c.sm.PutBack(st)
+	return nil
 }
 
 // PutBegin 开始共享内存零拷贝写：GetStream + 发 OpPutHeader，返回 ShmPutWriter。

@@ -10,12 +10,24 @@ package transport
 
 import (
 	"encoding/binary"
+	"fmt"
+	"os"
 
 	"github.com/liucxer/taihu/pkg/ierr"
 	"github.com/liucxer/taihu/third_party/shmipc-go"
 
 	"github.com/liucxer/taihu/internal/transport/protocol"
 )
+
+// shmDebug 帧级调试插桩（TAIHU_SHM_DEBUG=1 开启）：GetBatch 定位用，仅打帧编解码
+// 事实（op/长度），不影响协议语义。排查完成后移除。
+var shmDebug = os.Getenv("TAIHU_SHM_DEBUG") != ""
+
+func shmDbg(format string, args ...interface{}) {
+	if shmDebug {
+		fmt.Printf("[shm-debug] "+format+"\n", args...)
+	}
+}
 
 // shm 帧常量：长度前缀 4B + op 1B；负载上限与 TCP 路径 ChunkSize 对齐。
 const (
@@ -53,6 +65,7 @@ func shmReadFrame(r shmipc.BufferReader) (op protocol.OpCode, payload []byte, er
 		}
 	}
 	payload, err = r.ReadBytes(n - shmOpLen)
+	shmDbg("read op=%d len=%d payloadLen=%d", op, n, n-shmOpLen)
 	return op, payload, err
 }
 
@@ -90,6 +103,7 @@ func shmWriteFrame(st *shmipc.Stream, op protocol.OpCode, payload []byte) error 
 		payloadOff = shmLenPrefixLen + shmOpLen
 	}
 	copy(buf[payloadOff:], payload)
+	shmDbg("write op=%d payloadLen=%d", op, len(payload))
 	return st.Flush(false)
 }
 

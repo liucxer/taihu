@@ -220,6 +220,251 @@ func (s *Storage) GetFd(ctx context.Context, key string, off, size int64) (int, 
 	return 0, 0, data, rel, err
 }
 
+// GetBatch 批量读取多个对象 [off, off+size) 子区间（语义与 Get 一致）。
+// 仅经路由缓存定位实例（不打 TiKV 索引）：缓存命中的 key 按实例分组后在各自实例
+// 连接上批量读（连接不支持批量则整组逐 key 回退）；路由未命中的 key 逐 key 走原
+// Get（含 TiKV 索引定位 + 回源重建），并顺带预热路由缓存。
+// 返回 out[i] 对应 keys[i]；用毕必须调用返回的 release()（幂等）归还全部缓冲。
+func (s *Storage) GetBatch(ctx context.Context, keys []string, off, size int64) ([][]byte, func(), error) {
+	if len(keys) == 0 || size == 0 {
+		return nil, func() {}, nil
+	}
+	if off < 0 || size < 0 {
+		return nil, nil, rpcclient.ErrInvalidRange
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	// 按路由缓存命中分组到实例名；未命中的 key 逐 key 原 Get。
+	groups := make(map[string][]int) // 实例名 → keys 下标
+	var miss []int
+	for i, key := range keys {
+		if name, ok := s.cache.get(key); ok {
+			if _, ok2 := s.registry.lookup(name); ok2 {
+				groups[name] = append(groups[name], i)
+				continue
+			}
+		}
+		miss = append(miss, i)
+	}
+	out := make([][]byte, len(keys))
+	var rels []func()
+	var once sync.Once
+	releaseAll := func() {
+		once.Do(func() {
+			for _, rel := range rels {
+				if rel != nil {
+					rel()
+				}
+			}
+		})
+	}
+	// 路由 miss 的 key：逐 key 原 Get（含索引定位 + 回源重建 + 预热路由缓存）。
+	for _, i := range miss {
+		data, rel, err := s.Get(ctx, keys[i], off, size)
+		if err != nil {
+			releaseAll()
+			return nil, nil, err
+		}
+		out[i], rels = data, append(rels, rel)
+	}
+	// 缓存命中的实例分组：整组批量失败则组内逐 key 原 Get 回退。
+	for name, idxs := range groups {
+		inst, ok := s.registry.lookup(name)
+		if !ok {
+			for _, i := range idxs {
+				data, rel, err := s.Get(ctx, keys[i], off, size)
+				if err != nil {
+					releaseAll()
+					return nil, nil, err
+				}
+				out[i], rels = data, append(rels, rel)
+			}
+			continue
+		}
+		c, err := s.clientFor(inst)
+		if err != nil {
+			for _, i := range idxs {
+				data, rel, err2 := s.Get(ctx, keys[i], off, size)
+				if err2 != nil {
+					releaseAll()
+					return nil, nil, err2
+				}
+				out[i], rels = data, append(rels, rel)
+			}
+			continue
+		}
+		gkeys := make([]string, len(idxs))
+		for j, i := range idxs {
+			gkeys[j] = keys[i]
+		}
+		gout, grel, berr := c.GetBatch(ctx, gkeys, off, size)
+		if berr != nil {
+			// 整组回退逐 key 原 Get（失败后的流已由下层关闭，不复用）。
+			for j, i := range idxs {
+				data, rel, err2 := s.Get(ctx, gkeys[j], off, size)
+				if err2 != nil {
+					releaseAll()
+					return nil, nil, err2
+				}
+				out[i], rels = data, append(rels, rel)
+			}
+			continue
+		}
+		for j, i := range idxs {
+			out[i] = gout[j]
+		}
+		rels = append(rels, grel)
+	}
+	return out, releaseAll, nil
+}
+
+// GetFdBatch 批量读取多个对象并逐个交付共享内存 fd（splice 零拷贝源），定位与
+// 分组语义同 GetBatch；路由 miss 与实例连接非批量均逐 key 原 GetFd 回退。
+// 返回 out[i] 对应 keys[i]（FdBuf 各持独立引用，用毕逐个 Release()）；返回的
+// release 为整批兜底（幂等，调用后不得再使用/释放批内 FdBuf）。
+func (s *Storage) GetFdBatch(ctx context.Context, keys []string, off, size int64) ([]*rpcclient.FdBuf, func(), error) {
+	if len(keys) == 0 || size == 0 {
+		return nil, func() {}, nil
+	}
+	if off < 0 || size < 0 {
+		return nil, nil, rpcclient.ErrInvalidRange
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	groups := make(map[string][]int)
+	var miss []int
+	for i, key := range keys {
+		if name, ok := s.cache.get(key); ok {
+			if _, ok2 := s.registry.lookup(name); ok2 {
+				groups[name] = append(groups[name], i)
+				continue
+			}
+		}
+		miss = append(miss, i)
+	}
+	out := make([]*rpcclient.FdBuf, len(keys))
+	var once sync.Once
+	// 整批兜底：逐个归还已交付的 FdBuf（幂等）。
+	releaseAll := func() {
+		once.Do(func() {
+			for _, b := range out {
+				if b != nil {
+					b.Release()
+				}
+			}
+		})
+	}
+	for _, i := range miss {
+		fd, foff, data, rel, err := s.GetFd(ctx, keys[i], off, size)
+		if err != nil {
+			releaseAll()
+			return nil, nil, err
+		}
+		out[i] = rpcclient.NewFdBuf(fd, foff, data, rel)
+	}
+	for name, idxs := range groups {
+		inst, ok := s.registry.lookup(name)
+		if !ok {
+			for _, i := range idxs {
+				fd, foff, data, rel, err := s.GetFd(ctx, keys[i], off, size)
+				if err != nil {
+					releaseAll()
+					return nil, nil, err
+				}
+				out[i] = rpcclient.NewFdBuf(fd, foff, data, rel)
+			}
+			continue
+		}
+		c, err := s.clientFor(inst)
+		if err != nil {
+			for _, i := range idxs {
+				fd, foff, data, rel, err2 := s.GetFd(ctx, keys[i], off, size)
+				if err2 != nil {
+					releaseAll()
+					return nil, nil, err2
+				}
+				out[i] = rpcclient.NewFdBuf(fd, foff, data, rel)
+			}
+			continue
+		}
+		gkeys := make([]string, len(idxs))
+		for j, i := range idxs {
+			gkeys[j] = keys[i]
+		}
+		gout, grel, berr := c.GetFdBatch(ctx, gkeys, off, size)
+		if berr != nil {
+			for j, i := range idxs {
+				fd, foff, data, rel, err2 := s.GetFd(ctx, gkeys[j], off, size)
+				if err2 != nil {
+					releaseAll()
+					return nil, nil, err2
+				}
+				out[i] = rpcclient.NewFdBuf(fd, foff, data, rel)
+			}
+			continue
+		}
+		for j, i := range idxs {
+			out[i] = gout[j]
+		}
+		_ = grel // 批内 FdBuf 各持引用；调用方逐 key Release 即可整体回收
+	}
+	return out, releaseAll, nil
+}
+
+// PutBatch 批量写（同内容）：Picker 本地优先一次定实例，全部 key 均写 in 前
+// size 字节（bench 语义，见 rpcclient.Storage.PutBatch）；成功后批量写索引与路由
+// 缓存。实例连接不支持批量时逐 key Put 回退（同一实例）。
+func (s *Storage) PutBatch(ctx context.Context, keys []string, size int64, in []byte) error {
+	if len(keys) == 0 || size == 0 {
+		return nil
+	}
+	inst, ok := s.picker.pick()
+	if !ok {
+		return ErrNoInstances
+	}
+	c, err := s.clientFor(inst)
+	if err != nil {
+		return err
+	}
+	if err := c.PutBatch(ctx, keys, size, in); err != nil {
+		return err
+	}
+	for _, key := range keys {
+		s.index.put(key, inst.Name)
+		s.cache.put(key, inst.Name)
+	}
+	return nil
+}
+
+// PutBatchKeys 批量写（每 key 不同内容，FUSE 数据面用）：每 key 写 datas[i] 前
+// size 字节（见 rpcclient.Storage.PutBatchKeys）。其余语义与 PutBatch 一致。
+func (s *Storage) PutBatchKeys(ctx context.Context, keys []string, size int64, datas [][]byte) error {
+	if len(keys) == 0 || size == 0 {
+		return nil
+	}
+	if len(datas) != len(keys) {
+		return rpcclient.ErrInvalidRange
+	}
+	inst, ok := s.picker.pick()
+	if !ok {
+		return ErrNoInstances
+	}
+	c, err := s.clientFor(inst)
+	if err != nil {
+		return err
+	}
+	if err := c.PutBatchKeys(ctx, keys, size, datas); err != nil {
+		return err
+	}
+	for _, key := range keys {
+		s.index.put(key, inst.Name)
+		s.cache.put(key, inst.Name)
+	}
+	return nil
+}
+
 // PreloadRoute 预热路由缓存：逐个 key 查索引/路由并填充 routeCache（不读数据）。
 // 压测/预热场景用：热缓存下 Get 首查 routeCache 命中，不再打 TiKV 索引，
 // 消除"每 key 先查 TiKV"的冷启动开销。串行预热大 key 集时 TiKV 查询延迟

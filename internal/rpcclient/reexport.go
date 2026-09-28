@@ -2,6 +2,7 @@ package rpcclient
 
 import (
 	"github.com/liucxer/taihu/internal/metastore"
+	"github.com/liucxer/taihu/internal/transport"
 	"github.com/liucxer/taihu/pkg/ierr"
 )
 
@@ -61,3 +62,13 @@ const (
 	SegmentStateReclaiming = metastore.SegmentStateReclaiming
 	SegmentStateCompacting = metastore.SegmentStateCompacting
 )
+
+// FdBuf 批量读（GetFdBatch）单 key 的交付结果（internal/transport 定义，
+// 此处 re-export 使 GetFdBatch 的返回类型对外可命名）。
+type FdBuf = transport.FdBuf
+
+// NewFdBuf 构造带归还回调的 FdBuf（transport.NewFdBuf 的 re-export）：批量回退路径
+// 需要逐 key 设置 release，而 FdBuf.release 未导出、外部包无法直接赋值。
+func NewFdBuf(fd int, foff uint64, data []byte, release func()) *FdBuf {
+	return transport.NewFdBuf(fd, foff, data, release)
+}

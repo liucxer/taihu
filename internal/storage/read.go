@@ -160,6 +160,59 @@ func (s *Storage) ReadAtIntoMeta(ctx context.Context, meta metastore.ObjectMeta,
 	return want, nil
 }
 
+// AsyncReadAt 一次异步直读的句柄：SubmitReadAtIntoMeta 提交后立即返回，段读引用由
+// 句柄持有；Await 阻塞至完成并归还引用。语义镜像 ReadAtIntoMeta（短读截断 + io.EOF），
+// 句柄一次性使用（Await 后即弃，不可重复调用）。
+type AsyncReadAt struct {
+	s         *Storage
+	segmentID int64
+	ar        *device.AsyncRead
+	want      int64
+	size      int64
+}
+
+// SubmitReadAtIntoMeta 异步版 ReadAtIntoMeta：映射由调用方以快照形式提供，调用方须
+// 保证快照存活至 Await 返回（句柄内部对 meta.SegmentID 持读引用并在 Await 时归还）。
+// dst 为 4K 对齐直读目标（首地址 4K 对齐、cap ≥ align4K(want)），须由调用方持有到
+// Await 返回。校验/提交失败立即返回 nil 句柄，不遗留段引用。
+func (s *Storage) SubmitReadAtIntoMeta(meta metastore.ObjectMeta, off, size int64, dst []byte) (*AsyncReadAt, error) {
+	// off 4K 对齐 + meta.Offset 4K 对齐（写入保证）→ skip==0，dstart = relStart。
+	relStart, dlen, want, _, err := readWindow(meta, off, size, true)
+	if err != nil {
+		return nil, err // ierr.ErrInvalidRange 或 io.EOF（空窗口）
+	}
+	if int64(len(dst)) < dlen {
+		return nil, fmt.Errorf("taihu: readinto dst %d < dlen %d", len(dst), dlen)
+	}
+
+	// 读引用计数：防 GC 在读在途时回收并复用该段（迟到读读错数据）。
+	s.db.RefSegment(meta.SegmentID)
+	ar, err := s.dev.SubmitReadAsync(meta.SegmentID, relStart, dlen, dst[:dlen])
+	if err != nil {
+		s.db.UnrefSegment(meta.SegmentID)
+		return nil, err
+	}
+	return &AsyncReadAt{s: s, segmentID: meta.SegmentID, ar: ar, want: want, size: size}, nil
+}
+
+// Await 阻塞至读完成，返回实际读入的请求窗口字节数（读到对象末尾不足时截断），
+// 不足 size 时附 io.EOF。返回时归还本句柄持有的段读引用。
+func (a *AsyncReadAt) Await() (int64, error) {
+	defer a.s.db.UnrefSegment(a.segmentID)
+	n, err := a.ar.Await()
+	if err != nil {
+		return 0, err
+	}
+	if n < a.want {
+		// 设备不足（对象末尾）：返回已读前缀，调用方按 EOF 收尾。
+		a.want = n
+	}
+	if a.want < a.size {
+		return a.want, io.EOF
+	}
+	return a.want, nil
+}
+
 // BatchRead 一次性批读多个对象块：把各块解析为设备直读 job 后，交给 device 以一次
 // io_submit 批量提交（摊薄系统调用），完成后再返回各块结果。逐块语义与 ReadAtInto
 // 完全等价（cost 短读截断 + io.EOF）。供服务端"多 stream 一 worker 聚合读"使用。

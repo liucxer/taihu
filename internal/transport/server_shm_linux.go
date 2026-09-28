@@ -49,6 +49,7 @@ type shmServer struct {
 	batched   *shmBatchReader // 非 nil 时启用"多 stream 一 worker"批读（4MiB 整块聚合 io_submit）
 	writer    *batchWriter    // 非 nil 时启用整对象攒批写（一次 AppendBatch + BatchPutCommit）
 	deleter   *batchDeleter   // 非 nil 时启用批量删（一次 BatchDelete）
+	inflight  int             // 每流在途异步读上限（--shm-inflight；0 = 关闭 per-stream 异步流水线）
 
 	// sessions 已 accept 的 shmipc Session 集合（serveConn 增删，Close 逐个关闭）。
 	// 不能只关 unix listener：shmipc.Server 内部 dup fd 后已关闭传入的 net.Conn，
@@ -220,6 +221,7 @@ func ServeShmWithConfig(storage *storage.Storage, uds string, cfg PipelineConfig
 		batched:  newShmBatchReader(storage, cfg.ReadBatch, cfg.ReadWorkers),
 		writer:   newBatchWriter(storage, cfg.WriteWorkers, cfg.WriteBatch),
 		deleter:  newBatchDeleter(storage, cfg.DeleteWorkers, cfg.DeleteBatch),
+		inflight: cfg.Inflight,
 	}
 	go s.acceptLoop()
 	return s, nil
@@ -305,9 +307,21 @@ func (s *shmServer) serveConn(conn net.Conn) {
 // 共享内存（读缓冲与写缓冲相互独立，无冲突）。任何错误（协议畸形/写失败）都
 // st.Close() 通知对端流关闭，客户端池将丢弃该流（下次 GetStream 自动重开），
 // 避免残留未消费帧污染可复用流导致对端阻塞。
+//
+// per-stream 异步流水线（s.inflight > 0 且未启用批读时）：对齐整块 4MiB Get 提交
+// 后不等待完成（pend 在途），由循环按到达顺序排空写帧 —— 配合客户端单流多请求
+// pipeline 把单流在途从 1 提升到 P，摊薄每请求固定开销（ring 往返 + meta + flush）。
+// 保序地基：响应帧只能按请求到达顺序写出，乱序完成只允许在队列内（HOL stall，
+// 顺序读近似有序，代价可接受）。三条防死锁规则：
+//  1. 填掉已完成的在途响应帧头，全部完成时整链一次 Flush（响应只能整批可见，
+//     原因见 drainCompleted 注释）；
+//  2. 在途达上限时等全部在途完成、整链一次 Flush 腾出额度（backpressure）；
+//  3. 无新请求可读（r.Len()==0）且仍有在途时，先排空再阻塞读下一帧 —— 否则响应
+//     滞留环上、双方互相等待（老客户端单在途：发一请求即停手等响应，必中此坑）。
 func (s *shmServer) handleStream(st *shmipc.Stream) {
 	r := st.BufferReader()
 	var err error
+	var pend []*pendingOp // 在途异步项（get：直读；put：batchWriter 异步写；队列顺序==请求到达顺序==响应写出顺序）
 	for {
 		// 停机分支：s.closed 后尽快收尾（读帧阻塞由 Close 关 session 唤醒，此处
 		// 兜住两帧之间未阻塞的空窗，避免多读一轮请求）。
@@ -316,30 +330,298 @@ func (s *shmServer) handleStream(st *shmipc.Stream) {
 			return
 		default:
 		}
+		// 规则 1：填掉已完成的在途响应帧头；全部完成时整链一次 Flush。
+		if err = s.drainCompleted(st, r, &pend); err != nil {
+			break
+		}
+		// 规则 2：在途达上限，等全部在途完成、整链一次 Flush 腾出额度。
+		if s.inflight > 0 && len(pend) >= s.inflight {
+			if err = s.drainAll(st, r, &pend); err != nil {
+				break
+			}
+		}
+		// 规则 3：无新请求可读且仍有在途 → 先排空再阻塞读下一帧。
+		if len(pend) > 0 && r.Len() == 0 {
+			if err = s.drainAll(st, r, &pend); err != nil {
+				break
+			}
+		}
 		op, payload, rerr := shmReadFrame(r)
+		shmDbg("server stream recv op=%d payloadLen=%d", op, len(payload))
 		if rerr != nil {
 			err = rerr
 			break
 		}
 		switch op {
 		case protocol.OpPutHeader:
-			err = s.handleShmPut(st, r, payload)
+			// 写异步流水线（writer != nil 且启用 inflight 异步写）：PutEnd 后不写响应、
+			// 任务投 batchWriter 异步排空（pend 保序，响应由 drain 写出）；否则先排空
+			// 全部在途（保序）再同步处理（写响应 + 立即回读）。
+			if s.inflight > 0 && s.writer != nil {
+				err = s.handleShmPut(st, r, payload, &pend)
+			} else {
+				err = s.drainAll(st, r, &pend)
+				if err == nil {
+					err = s.handleShmPut(st, r, payload, &pend)
+				}
+			}
 		case protocol.OpGetReq:
-			err = s.handleShmGet(st, payload)
+			if s.inflight > 0 && s.batched == nil {
+				if h, ok := s.trySubmitAsyncGet(st, payload); ok {
+					pend = append(pend, h)
+				} else {
+					// 非异步场景（非单块/非对齐/储备失败等）回退：排空在途保序后
+					// 走原同步路径（错误语义与帧型由原路径保证）。
+					err = s.drainAll(st, r, &pend)
+					if err == nil {
+						err = s.handleShmGet(st, payload)
+					}
+				}
+			} else {
+				err = s.handleShmGet(st, payload)
+			}
 		case protocol.OpDelReq:
-			err = s.handleShmDelete(st, payload)
+			err = s.drainAll(st, r, &pend)
+			if err == nil {
+				err = s.handleShmDelete(st, payload)
+			}
 		case protocol.OpStatReq:
-			err = s.handleShmStat(st, payload)
+			err = s.drainAll(st, r, &pend)
+			if err == nil {
+				err = s.handleShmStat(st, payload)
+			}
 		default:
 			err = ierr.ErrShmStreamBroken
 		}
 
-		r.ReleasePreviousRead()
+		// 延迟批量释放：数据帧切片须存活到对应异步写完成，仅当无在途项时才可释放本批
+		// 已消费的读缓冲（drain 排空时统一 ReleasePreviousRead）。同步路径下 len(pend)==0
+		// 恒成立，行为与旧版逐请求释放一致。
+		if len(pend) == 0 {
+			r.ReleasePreviousRead()
+		}
 		if err != nil {
 			break
 		}
 	}
+	// 退出前等完剩余在途（归还段读引用 / 取回写结果；帧不写 —— 流即将关闭，对端按流关闭重开）。
+	for _, h := range pend {
+		if !h.done {
+			s.awaitPending(h)
+		}
+	}
 	_ = st.Close()
+}
+
+// pendingKind 在途异步项类型：get（直读，Reserve 响应切片）与 put（直写，batchWriter 异步排空）。
+type pendingKind uint8
+
+const (
+	pendingGet pendingKind = iota + 1
+	pendingPut
+)
+
+// pendingOp 一条在途异步 Get/Put（per-stream 流水线）：已 Reserve 的响应切片（get，含占位
+// 帧头）与已提交的异步读句柄 / 已投递 batchWriter 的写任务（put）。完成结果在 drain 取回后
+// 写入 done/n/rerr（get）/ code（put）；响应帧由 handleStream 按请求到达顺序写出
+// （保序地基：乱序完成只允许在队列内，不能越序写帧）。
+type pendingOp struct {
+	kind pendingKind
+	done bool // get：Await 已取回；put：wt.done 已回投（或立即完成项）
+	// get 侧字段（kind==pendingGet）
+	buf  []byte // 共享内存切片整区 [pad][帧头][数据区]（O_DIRECT DMA 目标）
+	pos  int64  // 请求窗口起点（对象内）
+	end  int64  // 请求窗口终点（对象内），final 判定
+	ar   *storage.AsyncReadAt
+	n    int64
+	rerr error
+	// put 侧字段（kind==pendingPut）
+	wt   *writeTask
+	code protocol.ErrCode // 立即完成项（size==0）预置；wt 项由 drain 从 wt.done 取
+}
+
+// trySubmitAsyncGet 尝试把 Get 投入 per-stream 异步流水线（快路径专用）：
+//   - 请求须为单个对齐整 4MiB 块（off 4K 对齐、size == ChunkSize、对象剩余 ≥ ChunkSize）；
+//   - 同步解析映射快照（pebble Get）→ 持段读引用（AsyncReadAt 内部）→ Reserve 响应
+//     切片 + 写 OpGetErr 占位帧头 → storage.SubmitReadAtIntoMeta 异步提交，不等待完成。
+// 成功返回 (h, true)，响应帧由 handleStream 按序排空写出。参数/映射/储备/提交失败：
+// Meta 与提交失败以「已完成错误项」入队（复用已 Reserve 切片，错误帧按序写出）；
+// 仅 Reserve 失败（共享内存池不足）返回 (nil, false)，调用方排空在途后走原同步路径。
+func (s *shmServer) trySubmitAsyncGet(st *shmipc.Stream, payload []byte) (*pendingOp, bool) {
+	key, off, size, err := protocol.ParseGetReq(protocol.NewSliceReader(payload))
+	if err != nil || size != protocol.ChunkSize || off%layout.BlockSize != 0 {
+		shmDbg("server async get key=%s err=%v size=%d off=%d -> fallback", key, err, size, off)
+		return nil, false
+	}
+	meta, err := s.storage.Meta(context.Background(), key)
+	if err != nil {
+		shmDbg("server async get key=%s meta err=%v -> fallback", key, err)
+		return nil, false
+	}
+	if meta.Size-off < protocol.ChunkSize {
+		shmDbg("server async get key=%s meta.size=%d off=%d < chunk -> fallback", key, meta.Size, off)
+		return nil, false
+	}
+	dlen := layout.Align4k(protocol.ChunkSize)
+	buf, err := st.BufferWriter().Reserve(protocol.ShmDataPad + int(dlen))
+	if err != nil {
+		shmDbg("server async get key=%s reserve err=%v -> fallback", key, err)
+		return nil, false
+	}
+	// 占位帧头（与 shmWriteDataFrameDirect 一致）：DMA 直写期间对端不可读。
+	binary.BigEndian.PutUint32(buf[:shmLenPrefixLen], uint32(shmOpLen+4))
+	buf[shmLenPrefixLen] = byte(protocol.OpGetErr)
+	copy(buf[shmLenPrefixLen+shmOpLen:], protocol.EncCode(protocol.CodeInternal))
+
+	h := &pendingOp{kind: pendingGet, buf: buf, pos: off, end: off + protocol.ChunkSize}
+	ar, err := s.storage.SubmitReadAtIntoMeta(meta, off, protocol.ChunkSize,
+		buf[protocol.ShmDataPad:protocol.ShmDataPad+dlen])
+	if err != nil {
+		shmDbg("server async get key=%s submit err=%v -> done-err", key, err)
+		h.done, h.rerr = true, err
+		return h, true
+	}
+	h.ar = ar
+	shmDbg("server async get key=%s submitted seg=%d", key, meta.SegmentID)
+	return h, true
+}
+
+// drainCompleted 填掉全部已完成的在途响应（get 填帧头 / put 写 OpResp 帧，纯共享内存写，
+// 未 Flush 前对端不可见），且仅当全部在途都完成时才 Flush 一次（整条响应链一次性暴露），
+// 随后释放本批已消费的读缓冲切片（数据切片须存活到对应异步写完成，队列排空时方可释放）。
+// 返回写错误。
+//
+// 不能逐帧 Flush：Stream.Flush → done() 会把 front→writeSlice 整条链（含全部已 Reserve
+// 但帧头尚未填的在途切片）的切片头更新并链接，对端沿 next 指针整链可见。异步流水线中
+// 后到的在途切片帧头仍为 trySubmitAsyncGet 写的占位 OpGetErr（[5][8][CodeInternal]），
+// 若在其完成前 Flush，客户端会读到错误帧（实测 GetBatch k=1 报 taihu: rpc error）。
+// 故响应只能整批（全部在途完成、帧头全部填好）一起可见；DMA 提交仍随请求到达即时
+// 异步下发，磁盘队列深度不受影响。
+func (s *shmServer) drainCompleted(st *shmipc.Stream, r shmipc.BufferReader, pend *[]*pendingOp) error {
+	allDone := true
+	for i := range *pend {
+		h := (*pend)[i]
+		if !h.done {
+			allDone = false
+			continue
+		}
+		if err := s.fillPendingResp(st, h); err != nil {
+			return err
+		}
+	}
+	if !allDone {
+		return nil
+	}
+	if err := st.Flush(false); err != nil {
+		return err
+	}
+	r.ReleasePreviousRead()
+	*pend = nil
+	return nil
+}
+
+// drainAll 等全部在途完成、填响应并整链一次 Flush（排空）。backpressure（在途达上限）
+// 与"无新请求可读仍有余帧"共用：必须整批排空后才能继续 —— 逐帧写会把未完成切片的
+// 占位帧头暴露给对端（见 drainCompleted 注释）。排空后统一释放已消费读缓冲切片。
+// 返回写错误。
+func (s *shmServer) drainAll(st *shmipc.Stream, r shmipc.BufferReader, pend *[]*pendingOp) error {
+	for i := range *pend {
+		h := (*pend)[i]
+		if !h.done {
+			if err := s.awaitPending(h); err != nil {
+				return err
+			}
+		}
+		if err := s.fillPendingResp(st, h); err != nil {
+			return err
+		}
+	}
+	if err := st.Flush(false); err != nil {
+		return err
+	}
+	r.ReleasePreviousRead()
+	*pend = nil
+	return nil
+}
+
+// awaitPending 等一个在途项完成：get 取回异步读结果（n/rerr），put 取回 batchWriter
+// 回投的写错误（映射为响应码）。await 返回错误仅表示底层异常（流须关闭）。
+func (s *shmServer) awaitPending(h *pendingOp) error {
+	switch h.kind {
+	case pendingGet:
+		n, rerr := h.ar.Await()
+		h.n, h.rerr, h.done = n, rerr, true
+		shmDbg("server drainAll Await n=%d rerr=%v", n, rerr)
+	case pendingPut:
+		werr := <-h.wt.done
+		if werr != nil {
+			h.code = protocol.MapStorageErr(werr)
+		} else {
+			h.code = protocol.CodeOK
+		}
+		h.done = true
+		shmDbg("server drainAll put done code=%d err=%v", h.code, werr)
+	}
+	return nil
+}
+
+// fillPendingResp 把一条已完成的在途项填成响应：
+//   - get：写响应帧头（数据区已由 DMA 直写），成功 OpGetData/OpGetDataFinal（len 按实际
+//     读入 n 更新），读错误 OpGetErr；
+//   - put：Reserve 控制帧写 OpResp + 4B 错误码（成功 CodeOK）。
+// 不做 Flush —— 连续完成的帧由 drain 合并一次 Flush。
+func (s *shmServer) fillPendingResp(st *shmipc.Stream, h *pendingOp) error {
+	if h.kind == pendingPut {
+		return s.fillPutResp(st, h)
+	}
+	return s.fillPendingHeader(h)
+}
+
+// fillPutResp 把一个已完成的异步写结果填成 OpResp 控制帧（[4B len][1B op=OpResp][4B code]，
+// 环上共 4+5=9 字节，len=5；与 shmWriteFrame 控制帧布局一致），并入 sendBuf 响应链（不
+// Flush）。成功 code=CodeOK，写失败 code=MapStorageErr(err)。
+// 注意 Reserve 必须为完整帧长（shmLenPrefixLen+shmOpLen+4）：只 Reserve 5 字节时
+// buf[5:9] 是空切片，copy 会静默丢弃 code 字节，对端把下一帧的 len 前缀读成错误码
+// （单响应时直接双方互等死锁）。
+func (s *shmServer) fillPutResp(st *shmipc.Stream, h *pendingOp) error {
+	buf, err := st.BufferWriter().Reserve(shmLenPrefixLen + shmOpLen + 4)
+	if err != nil {
+		return err
+	}
+	binary.BigEndian.PutUint32(buf[:shmLenPrefixLen], uint32(shmOpLen+4))
+	buf[shmLenPrefixLen] = byte(protocol.OpResp)
+	copy(buf[shmLenPrefixLen+shmOpLen:], protocol.EncCode(h.code))
+	statTxFrames.Add(1)
+	statTxBytes.Add(4)
+	return nil
+}
+
+// fillPendingHeader 把一个已完成的在途读结果填成响应帧头（数据区已由 DMA 直写）：
+// 成功写 OpGetData/OpGetDataFinal（len 按实际读入 n 更新），读错误写 OpGetErr。
+// 不做 Flush —— 连续完成的帧由 drainCompleted 合并一次 Flush。
+func (s *shmServer) fillPendingHeader(h *pendingOp) error {
+	n, rerr := h.n, h.rerr
+	if rerr != nil && rerr != io.EOF {
+		shmDbg("server fillPendingHeader ERR n=%d rerr=%v", n, rerr)
+		copy(h.buf[shmLenPrefixLen+shmOpLen:], protocol.EncCode(protocol.MapStorageErr(rerr)))
+		statTxFrames.Add(1)
+		statTxBytes.Add(4)
+		return nil
+	}
+	op := byte(protocol.OpGetData)
+	if h.pos+n >= h.end || rerr == io.EOF {
+		op = byte(protocol.OpGetDataFinal)
+	}
+	binary.BigEndian.PutUint32(h.buf[:shmLenPrefixLen], uint32(shmOpLen+n))
+	h.buf[shmLenPrefixLen] = op
+	statTxFrames.Add(1)
+	statTxBytes.Add(n)
+	statTxDataFrames.Add(1)
+	statTxDataBytes.Add(n)
+	if n == protocol.ChunkSize {
+		statTxData4M.Add(1)
+	}
+	return nil
 }
 
 // ierr.ErrShmStreamBroken 哨兵错误：流上残留未消费请求帧，无法继续复用，须关闭通知对端。
@@ -357,9 +639,12 @@ func (s *shmServer) shmRespErr(st *shmipc.Stream, op protocol.OpCode, code proto
 // 写流水线路径（s.writer != nil）：PutBegin 在 PutHeader 后立即串行分配段内位置（游标连续），
 // 各 PutData 帧的共享内存切片直引攒入 jobs（不逐帧放回共享内存），PutEnd 后把整对象投递到
 // 写队列，由 worker 一次 AppendBatch 排空数据帧 + 一次 BatchPutCommit 批量建映射；
-// submit 同步等磁盘写回，返回后 handleStream 统一 ReleasePreviousRead 归还全部 pin 切片。
+// 提交完成后 handleStream 统一 ReleasePreviousRead 归还全部 pin 切片。
+//   - 同步（inflight==0）：submit 阻塞等磁盘写回，返回后立即写 OpResp 帧；
+//   - 异步（inflight>0）：submitAsync 非阻塞投递，任务入 pend 保序队列，OpResp 帧由
+//     drain 按请求到达顺序写出 —— 数据帧切片存活到异步写完成（延迟批量释放）。
 // 旧路径（writer == nil）：逐帧 PutAppend 直写 + PutEnd 时 PutCommit（保持原行为）。
-func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, payload []byte) error {
+func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, payload []byte, pend *[]*pendingOp) error {
 	key, size, err := protocol.ParsePutHeader(protocol.NewSliceReader(payload))
 	if err != nil {
 		return s.shmRespErr(st, protocol.OpResp, protocol.CodeInvalidArgument)
@@ -386,6 +671,11 @@ func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, paylo
 		if err := s.storage.PutCommit(context.Background(), key, seg, off, 0); err != nil {
 			return s.shmRespErr(st, protocol.OpResp, protocol.MapStorageErr(err))
 		}
+		if s.inflight > 0 && s.writer != nil {
+			// 异步保序：size==0 立即完成项入队，OpResp 由 drain 按序写出（不越序）。
+			*pend = append(*pend, &pendingOp{kind: pendingPut, done: true, code: protocol.CodeOK})
+			return nil
+		}
 		return shmWriteFrame(st, protocol.OpResp, protocol.EncCode(protocol.CodeOK))
 	}
 
@@ -411,6 +701,13 @@ func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, paylo
 			}
 			if s.writer != nil {
 				wt := &writeTask{key: key, seg: seg, off: off, size: size, jobs: jobs, done: make(chan error, 1)}
+				if s.inflight > 0 {
+					// 异步：非阻塞投递，任务入 pend 保序队列，OpResp 由 drain 按序写出
+					//（数据帧切片由延迟批量释放归还）。不在此写响应。
+					s.writer.submitAsync(wt)
+					*pend = append(*pend, &pendingOp{kind: pendingPut, wt: wt})
+					return nil
+				}
 				if err := s.writer.submit(wt); err != nil {
 					return shmWriteFrame(st, protocol.OpResp, protocol.EncCode(protocol.MapStorageErr(err)))
 				}
@@ -444,6 +741,7 @@ func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, paylo
 // 一次请求的全部帧共用入口解析的同一映射快照（meta），并全程持有该段引用。
 func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 	key, off, size, err := protocol.ParseGetReq(protocol.NewSliceReader(payload))
+	shmDbg("server get key=%s off=%d size=%d", key, off, size)
 	if err != nil {
 		return shmWriteFrame(st, protocol.OpGetErr, protocol.EncCode(protocol.CodeInvalidArgument))
 	}

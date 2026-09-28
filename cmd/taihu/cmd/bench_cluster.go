@@ -59,6 +59,7 @@ var benchClusterCmd = &cobra.Command{
 		c.Count, _ = cmd.Flags().GetInt("count")
 		c.ReportEvery, _ = cmd.Flags().GetDuration("report-interval")
 		c.Latency, _ = cmd.Flags().GetBool("latency")
+		c.Verify, _ = cmd.Flags().GetBool("verify")
 
 		c.clientName = global.clientName
 		c.tikvPD = global.pd
@@ -161,6 +162,7 @@ func init() {
 	f.Int("count", 1000, "total number of distinct objects")
 	f.Duration("report-interval", 2*time.Second, "progress report interval")
 	f.Bool("latency", false, "record per-op latency")
+	f.Bool("verify", false, "read mode: byte-wise data verification (pattern byte(j & 0xff), regression check)")
 }
 
 func (c *clusterBenchConfig) validate() error {

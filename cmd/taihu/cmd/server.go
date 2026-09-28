@@ -211,10 +211,12 @@ var serverCmd = &cobra.Command{
 		// TCP 服务照常，使服务端能在 macOS 上跑起来做本机联调。
 		batchTarget, _ := cmd.Flags().GetInt("batch")
 		batchWorkers, _ := cmd.Flags().GetInt("batch-workers")
+		shmInflight, _ := cmd.Flags().GetInt("shm-inflight")
 		if transport.ShmSupported() {
 			shmCloser, err := transport.ServeShmWithConfig(st, shmPath, transport.PipelineConfig{
 				ReadBatch:     batchTarget,
 				ReadWorkers:   batchWorkers,
+				Inflight:      shmInflight,
 				WriteBatch:    writeBatch,
 				WriteWorkers:  writeWorkers,
 				DeleteBatch:   delBatch,
@@ -299,6 +301,7 @@ func init() {
 	f.String("server-name", "", "unique server name, e.g. TAIHU-0 (required)")
 	f.Int("batch", 0, "shm 批读批量：>0 启用\"多 stream 多 worker\"聚合批读（一次 io_submit 提交多个任务）；0 关闭")
 	f.Int("batch-workers", 8, "shm 批读 worker 池大小（并行批提交，K×batch 即整机在途批读数）")
+	f.Int("shm-inflight", 8, "每流在途异步读上限：>0 启用 per-stream 异步流水线（对齐整块 4MiB 读提交不等待、按序排空写帧，配合客户端单流多请求 pipeline；默认 8 开启，覆盖逐请求串行）；0 显式关闭（逐请求串行）。与 -batch 互斥，两者都 >0 时 -batch 优先")
 	f.Int("write-batch", 0, "写流水线批量：>0 启用整对象攒批写（一次 AppendBatch 排空 + 一次 BatchPutCommit）；0 关闭（逐请求串行）")
 	f.Int("write-workers", 4, "写流水线 worker 池大小（并行批提交;K×batch 即整机在途写对象数）")
 	f.Int("del-batch", 0, "删流水线批量：>0 启用批量删（一次 BatchDelete,per-key 结果独立）；0 关闭（逐请求串行）")

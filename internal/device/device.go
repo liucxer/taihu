@@ -187,16 +187,52 @@ func (d *Device) submitOp(buf []byte, off int64, read bool) (aio.Event, error) {
 func (d *Device) submitOpN(buf []byte, off int64, read bool, count bool) (aio.Event, error) {
 	var retries int
 	for {
+		_, ch, err := d.submitOne(buf, off, read)
+		if err != nil {
+			return aio.Event{}, err
+		}
+		// 仅统计首次成功提交的 IO（ErrFull 与完成侧重试均不重复计数）。
+		if count {
+			d.recordIO(int64(len(buf)))
+			count = false
+		}
+		ev := <-ch
+
+		errno, retriable := retriableErrno(ev.Res)
+		if !retriable {
+			return ev, nil
+		}
+		if retries >= complRetryMax {
+			d.logComplRetry(read, off, int64(len(buf)), errno, retries, true)
+			return ev, nil
+		}
+		retries++
+		if retries == 1 {
+			d.logComplRetry(read, off, int64(len(buf)), errno, retries, false)
+		}
+		time.Sleep(complRetryBackoff(retries))
+	}
+}
+
+// submitOne 提交一次异步 IO 并注册完成通道（完成泵把事件投递到 ch），不等待完成。
+// 与同步路径共用同一「与泵的同步点」：提交前锁内检查 closed（未提交则快速失败）
+// 并自增 inSubmit，提交成功后锁内自减 inSubmit 并注册（消费 pending 或登记 m[seq]）
+// —— 泵不会在「已 io_submit、事件尚未落定」的窗口内退出，Close 不漏事件、提交方
+// 不永久阻塞。ErrFull（提交队列满）让出后重试；其余提交错误（无在途 IO）直接返回。
+func (d *Device) submitOne(buf []byte, off int64, read bool) (uint64, chan aio.Event, error) {
+	for {
 		d.mu.Lock()
 		if d.closed {
 			d.mu.Unlock()
-			return aio.Event{}, ierr.ErrDeviceClosed
+			return 0, nil, ierr.ErrDeviceClosed
 		}
 		d.inSubmit++
 		d.mu.Unlock()
 
-		var seq uint64
-		var err error
+		var (
+			seq uint64
+			err error
+		)
 		if read {
 			seq, err = d.ring.SubmitRead(buf, off)
 		} else {
@@ -213,37 +249,17 @@ func (d *Device) submitOpN(buf []byte, off int64, read bool, count bool) (aio.Ev
 				time.Sleep(submitRetry)
 				continue
 			}
-			return aio.Event{}, err
+			return 0, nil, err
 		}
-		// 仅统计首次成功提交的 IO（ErrFull 与完成侧重试均不重复计数）。
-		if count {
-			d.recordIO(int64(len(buf)))
-			count = false
-		}
-		var ev aio.Event
-		if p, ok := d.pending[seq]; ok { // 泵已取回本事件，直接消费
+		if p, ok := d.pending[seq]; ok { // 泵已取回本事件，直接投递（cap=1 不阻塞）
 			delete(d.pending, seq)
 			d.mu.Unlock()
-			ev = p
-		} else {
-			d.m[seq] = ch
-			d.mu.Unlock()
-			ev = <-ch
+			ch <- p
+			return seq, ch, nil
 		}
-
-		errno, retriable := retriableErrno(ev.Res)
-		if !retriable {
-			return ev, nil
-		}
-		if retries >= complRetryMax {
-			d.logComplRetry(read, off, int64(len(buf)), errno, retries, true)
-			return ev, nil
-		}
-		retries++
-		if retries == 1 {
-			d.logComplRetry(read, off, int64(len(buf)), errno, retries, false)
-		}
-		time.Sleep(complRetryBackoff(retries))
+		d.m[seq] = ch
+		d.mu.Unlock()
+		return seq, ch, nil
 	}
 }
 
@@ -313,6 +329,62 @@ func (d *Device) submitWrite(buf []byte, off int64) (aio.Event, error) {
 
 func (d *Device) submitRead(buf []byte, off int64) (aio.Event, error) {
 	return d.submitOp(buf, off, true)
+}
+
+// AsyncRead 一次异步读的句柄：SubmitReadAsync 提交后立即返回，DMA 与完成取回在后台
+// 进行；Await 阻塞至完成。buf 须由调用方持有到 Await 返回（O_DIRECT 下内核直读
+// 调用方缓冲）。
+type AsyncRead struct {
+	d   *Device
+	buf []byte
+	off int64
+	ch  chan aio.Event
+}
+
+// SubmitReadAsync 异步提交一次读（O_DIRECT 直读 dst）：布局校验同 ReadAtInto
+// （off/size 4K 对齐、dst 首地址 4K 对齐且 cap ≥ size），提交后立即返回句柄。
+// 尺寸统计在首次成功提交时计入（重提不重复计数，与 submitOpN 一致）。
+func (d *Device) SubmitReadAsync(segmentID, off, size int64, dst []byte) (*AsyncRead, error) {
+	if off < 0 || off%layout.BlockSize != 0 {
+		return nil, fmt.Errorf("taihu: read offset %d not 4K aligned", off)
+	}
+	if size <= 0 || size%layout.BlockSize != 0 {
+		return nil, fmt.Errorf("taihu: read size %d not 4K aligned", size)
+	}
+	if int64(len(dst)) < size {
+		return nil, fmt.Errorf("taihu: read dst %d < size %d", len(dst), size)
+	}
+	if !bufAligned(dst) {
+		return nil, fmt.Errorf("taihu: read dst not 4K aligned")
+	}
+	pos := d.segmentBase(segmentID) + off
+	_, ch, err := d.submitOne(dst[:size], pos, true)
+	if err != nil {
+		return nil, err
+	}
+	d.recordIO(size)
+	return &AsyncRead{d: d, buf: dst[:size], off: pos, ch: ch}, nil
+}
+
+// Await 阻塞至本次异步读完成，返回实际读入字节数（读到设备/对象末尾不足时短读，
+// 不附错误；n==0 返回 io.EOF，语义同 ReadAtInto）。完成侧瞬时错误（EAGAIN/EINTR）
+// 按原参数阻塞重提（submitOpN 全权处理内部重试预算，不重复统计尺寸）。
+func (ar *AsyncRead) Await() (int64, error) {
+	ev := <-ar.ch
+	if _, retriable := retriableErrno(ev.Res); retriable {
+		var err error
+		ev, err = ar.d.submitOpN(ar.buf, ar.off, true, false)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if ev.Res < 0 {
+		return 0, syscall.Errno(-ev.Res)
+	}
+	if ev.Res == 0 {
+		return 0, io.EOF
+	}
+	return ev.Res, nil
 }
 
 // checkWrite 校验写完成事件：res<0 为 -errno；res 必须等于 want（整块写出）。
