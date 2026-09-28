@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>taihu 集群管理</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>taihu 集群管理</h1>
+  <nav id="nav">
+    <button class="tab-btn active" data-tab="overview">概览</button>
+    <button class="tab-btn" data-tab="cluster">集群</button>
+    <button class="tab-btn" data-tab="instance">实例</button>
+    <button class="tab-btn" data-tab="key">Key</button>
+    <button class="tab-btn" data-tab="client">客户端</button>
+    <button class="tab-btn" data-tab="version">版本</button>
+  </nav>
+</header>
+
+<main>
+  <!-- 概览：cluster status 轮询 -->
+  <section id="tab-overview" class="tab active">
+    <h2>集群概览 <button class="btn" id="ov-refresh">刷新</button>
+      <span class="hint" id="ov-ts"></span></h2>
+    <div id="ov-cards" class="cards"></div>
+    <div id="ov-err" class="errbox hidden"></div>
+  </section>
+
+  <!-- 集群：list / index / purge -->
+  <section id="tab-cluster" class="tab">
+    <h2>实例列表 <button class="btn" id="cl-list-refresh">刷新</button></h2>
+    <div id="cl-list" class="panel"></div>
+
+    <h2>索引概览</h2>
+    <div class="row">
+      <input id="cl-index-prefix" type="text" placeholder="key 前缀（可空）">
+      <button class="btn" id="cl-index-refresh">查询</button>
+      <span class="hint">扫描 /taihu/index/ 按实例归组计数</span>
+    </div>
+    <div id="cl-index" class="panel"></div>
+
+    <h2>清空元数据（cluster purge）</h2>
+    <div class="panel warn">
+      <p>删除 /taihu/ 命名空间全部元数据：实例注册、索引、SDK 客户端注册。<b>不可恢复，谨慎操作。</b></p>
+      <div class="row">
+        <input id="cl-purge-confirm" type="text" placeholder="输入 PURGE 确认">
+        <button class="btn danger" id="cl-purge-btn" disabled>清空元数据</button>
+        <button class="btn" id="cl-purge-preview">预览计数</button>
+      </div>
+      <div id="cl-purge-res" class="hint"></div>
+    </div>
+  </section>
+
+  <!-- 实例：segments -->
+  <section id="tab-instance" class="tab">
+    <h2>实例 segment 信息</h2>
+    <div class="row">
+      <select id="in-instance"></select>
+      <label><input type="checkbox" id="in-detail"> 显示每段明细</label>
+      <button class="btn" id="in-query">查询</button>
+      <span class="hint" id="in-note"></span>
+    </div>
+    <div id="in-res" class="panel"></div>
+  </section>
+
+  <!-- Key -->
+  <section id="tab-key" class="tab">
+    <h2>Key 操作</h2>
+    <div class="panel">
+      <div class="row">
+        <label>目标模式</label>
+        <select id="key-mode">
+          <option value="route">集群路由（-pd）</option>
+          <option value="addr">直连地址（-addr）</option>
+          <option value="inst">按实例名（-instance）</option>
+        </select>
+        <input id="key-addr" type="text" placeholder="addr: IP:port" class="hidden">
+        <input id="key-inst" type="text" placeholder="instance 名称" class="hidden">
+        <button class="btn" id="key-op-reload-inst">载入实例</button>
+        <span class="hint" id="key-target-hint"></span>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="panel">
+        <h3>上传（put）</h3>
+        <div class="row"><input id="k-put-key" type="text" placeholder="key"><input id="k-put-size" type="text" placeholder="size（可空）"></div>
+        <div class="row"><input id="k-put-file" type="file"><button class="btn" id="k-put-btn">上传</button></div>
+        <div id="k-put-res" class="res"></div>
+      </div>
+      <div class="panel">
+        <h3>下载（get）</h3>
+        <div class="row"><input id="k-get-key" type="text" placeholder="key">
+          <input id="k-get-off" type="text" placeholder="off">
+          <input id="k-get-size" type="text" placeholder="size(-1=全量)"></div>
+        <div class="row"><button class="btn" id="k-get-btn">下载</button><span class="hint">区间读取，浏览器另存为</span></div>
+        <div id="k-get-res" class="res"></div>
+      </div>
+      <div class="panel">
+        <h3>大小 / 元数据 / 枚举</h3>
+        <div class="row"><input id="k-stat-key" type="text" placeholder="key"><button class="btn" id="k-stat-btn">stat</button></div>
+        <div class="row"><input id="k-meta-key" type="text" placeholder="key"><button class="btn" id="k-meta-btn">meta（仅直连）</button></div>
+        <div class="row"><input id="k-list-prefix" type="text" placeholder="prefix"><input id="k-list-limit" type="text" placeholder="limit"></div>
+        <div class="row"><button class="btn" id="k-list-btn">list（仅直连）</button></div>
+        <div id="k-stat-res" class="res"></div>
+        <div id="k-meta-res" class="res"></div>
+        <div id="k-list-res" class="res"></div>
+      </div>
+      <div class="panel">
+        <h3>删除（delete）</h3>
+        <div class="row"><input id="k-del-key" type="text" placeholder="key"><input id="k-del-confirm" type="text" placeholder="输入相同 key 确认"></div>
+        <div class="row"><button class="btn danger" id="k-del-btn" disabled>删除</button><span class="hint">需二次确认 + confirm=true</span></div>
+        <div id="k-del-res" class="res"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 客户端 -->
+  <section id="tab-client" class="tab">
+    <h2>SDK 客户端清单 <button class="btn" id="clients-refresh">刷新</button></h2>
+    <div id="clients-list" class="panel"></div>
+    <h2>环境与连通性</h2>
+    <div class="row"><button class="btn" id="clients-info-btn">查看</button></div>
+    <div id="clients-info" class="panel"></div>
+  </section>
+
+  <!-- 版本 -->
+  <section id="tab-version" class="tab">
+    <h2>版本</h2>
+    <div id="ver-info" class="panel"></div>
+  </section>
+</main>
+
+<footer>
+  <span id="foot"></span>
+</footer>
+<script src="/app.js"></script>
+</body>
+</html>
