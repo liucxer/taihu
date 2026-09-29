@@ -59,7 +59,7 @@ func (k *errKV) BatchPut(ctx context.Context, kvs map[string][]byte) error {
 // newClusterWithKV 用给定 KV 构造集群客户端（不注册实例）；Close 由 Cleanup 兜底。
 func newClusterWithKV(t *testing.T, kv cluster.KV, tweak func(*ClusterConfig)) *Storage {
 	t.Helper()
-	cfg := ClusterConfig{KV: kv, ClientName: "test-client"}
+	cfg := ClusterConfig{KV: kv, ClientName: "test-client", ClientID: "test-client-id"}
 	if tweak != nil {
 		tweak(&cfg)
 	}

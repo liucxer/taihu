@@ -92,6 +92,7 @@ var benchClusterCmd = &cobra.Command{
 		s, err := taihuclient.NewCluster(taihuclient.ClusterConfig{
 			KV:         kv,
 			ClientName: c.clientName,
+			ClientID:   derivedClientID(),
 			// 每地址连接数：同机实例 shm 会话数、跨节点每 TCP 地址连接数（-conns；多 IP 实例总连接数=地址数×conns）。
 			Conns: c.conns,
 			// 写路由算法（-write-routing）：local 默认优先本地，round-robin 轮询全部实例。

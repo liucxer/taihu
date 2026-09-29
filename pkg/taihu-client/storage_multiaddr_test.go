@@ -91,6 +91,7 @@ func newClientForStorage(t *testing.T, inst *cluster.InstanceInfo) *Storage {
 	s, err := NewCluster(ClusterConfig{
 		KV:         kv,
 		ClientName: "test-client",
+		ClientID:   "test-client-id",
 		Conns:      1,
 	})
 	if err != nil {

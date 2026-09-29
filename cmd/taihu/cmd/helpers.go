@@ -23,6 +23,20 @@ func requirePD() error {
 	return nil
 }
 
+// derivedClientID 供内部建集群客户端的命令派生出 SDK 注册 ID。格式
+// clientName+hostname+pid，保证本进程唯一（同一 host 多进程用 pid 区分）。
+func derivedClientID() string {
+	name := global.clientName
+	if name == "" {
+		name = "taihu"
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		host = "unknown"
+	}
+	return fmt.Sprintf("%s+%s+%d", name, host, os.Getpid())
+}
+
 // connectKV 连接注册区 KV（TiKV TxnKV）；实现可替换，见 kvConnect。
 func connectKV(ctx context.Context) (cluster.KV, error) { return kvConnect(ctx) }
 

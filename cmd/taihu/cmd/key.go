@@ -56,7 +56,7 @@ func resolveKeyTarget(ctx context.Context, addr, instName string, kv cluster.KV,
 		return c, &keyTarget{inst: &inst}, nil
 	}
 	// 集群路由模式（taihuclient）：put 选实例、get/delete/stat 按索引定位。
-	store, err := taihuclient.NewCluster(taihuclient.ClusterConfig{KV: kv, ClientName: global.clientName})
+	store, err := taihuclient.NewCluster(taihuclient.ClusterConfig{KV: kv, ClientName: global.clientName, ClientID: derivedClientID()})
 	if err != nil {
 		return nil, nil, err
 	}

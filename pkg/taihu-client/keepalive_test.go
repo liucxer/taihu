@@ -2,6 +2,7 @@ package taihuclient
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -87,22 +88,12 @@ func TestClientKeepalive(t *testing.T) {
 	t.Fatalf("client %q 未在 Close 后注销", "cache-svc-01")
 }
 
-// 未配置 ClientID 时不得产生注册记录。
-func TestClientKeepaliveDisabled(t *testing.T) {
+// 未配置 ClientID 时构造须拒绝（必传），不得静默跳过注册。
+func TestClientClientIDRequired(t *testing.T) {
 	kv := cluster.NewMemoryKV()
 	defer kv.Close()
 
-	s, err := NewCluster(ClusterConfig{KV: kv, ClientName: "n"})
-	if err != nil {
-		t.Fatalf("NewCluster: %v", err)
-	}
-	defer s.Close()
-	time.Sleep(300 * time.Millisecond)
-	clients, err := cluster.ListClients(context.Background(), kv)
-	if err != nil {
-		t.Fatalf("ListClients: %v", err)
-	}
-	if len(clients) != 0 {
-		t.Fatalf("unexpected clients registered: %v", clients)
+	if _, err := NewCluster(ClusterConfig{KV: kv, ClientName: "n"}); !errors.Is(err, ErrClientIDRequired) {
+		t.Fatalf("NewCluster without ClientID: want ErrClientIDRequired, got %v", err)
 	}
 }

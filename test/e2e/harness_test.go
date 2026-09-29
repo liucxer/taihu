@@ -37,6 +37,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -359,6 +360,7 @@ func (h *harness) newSDK(mut func(*taihuclient.ClusterConfig)) *taihuclient.Stor
 	cfg := taihuclient.ClusterConfig{
 		KV:               h.kv,
 		ClientName:       "e2e-" + h.tag,
+		ClientID:         "e2e-sdk-" + h.tag + "-" + strconv.FormatInt(time.Now().UnixNano(), 10),
 		RefreshInterval:  200 * time.Millisecond,
 		HeartbeatTimeout: 3 * time.Second,
 		Conns:            1,

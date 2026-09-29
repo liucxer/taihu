@@ -420,6 +420,7 @@ func TestC5KVUnavailableDegrades(t *testing.T) {
 	st, err := taihuclient.NewCluster(taihuclient.ClusterConfig{
 		KV:               cDownKV{},
 		ClientName:       "e2e-c5",
+		ClientID:         "e2e-c5-client",
 		RefreshInterval:  100 * time.Millisecond,
 		HeartbeatTimeout: 2 * time.Second,
 		Conns:            1,

@@ -20,6 +20,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/liucxer/taihu/pkg/taihu-client"
@@ -41,11 +42,13 @@ var _ clusterClient = (*taihuclient.Storage)(nil)
 
 // newClusterClient 构造集群客户端（生产恒为 NewFromTiKV；单测可替换注入假实现）。
 var newClusterClient = func(ctx context.Context, pd string) (clusterClient, error) {
+	host, _ := os.Hostname()
 	return taihuclient.NewFromTiKV(ctx, taihuclient.TiKVOptions{
 		PDAddrs:    strings.Split(pd, ","),
 		ClientName: "billing-app",
-		// 可选参数（不设即默认）：
-		//   ClientID:       非空则向注册区注册 SDK 客户端并保活（taihu client list 可见），Close 时注销
+		// ClientID 必填：本应用唯一注册 ID，向注册区注册并保活（taihu client list 可见），Close 时注销。
+		ClientID: "billing-app+" + host + "+" + strconv.Itoa(os.Getpid()),
+		// 其它可选参数（不设即默认）：
 		//   Conns:          每地址数据面连接数（默认 1；实例通告多地址时总连接 = 地址数 × Conns，读写均分）
 		//   UsageThreshold: 选实例水位阈值百分比（默认 80，超过则跳过该实例）
 		//   WriteRouting:   写路由："local"（默认，本地优先）/ "round-robin"（全在线实例轮询）

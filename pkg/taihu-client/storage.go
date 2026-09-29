@@ -2,6 +2,7 @@ package taihuclient
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,10 @@ import (
 
 // ErrNoInstances 集群无在线实例可写（唯一定义在 pkg/ierr，此处 re-export）。
 var ErrNoInstances = ierr.ErrNoInstances
+
+// ErrClientIDRequired ClusterConfig.ClientID 为必填。SDK 客户端必须注册唯一 ID，
+// 否则不参与心跳与 web「客户端清单」展示。
+var ErrClientIDRequired = errors.New("taihuclient: ClientID is required")
 
 // Storage 集群对象存储：写=本地优先选实例（首写锚定），读=本地实例直查 →
 // 索引定位远端 → 回源重建。满足 rpcclient.ObjectStore。
@@ -45,9 +50,13 @@ type Storage struct {
 var _ rpcclient.ObjectStore = (*Storage)(nil)
 
 // NewCluster 构建集群客户端并启动发现/索引后台任务。
+// ClientID 为必填：集群客户端必须带唯一注册 ID以便心跳与 web「客户端清单」识别。
 func NewCluster(cfg ClusterConfig) (*Storage, error) {
 	if cfg.KV == nil {
 		return nil, ierr.ErrKVRequired
+	}
+	if cfg.ClientID == "" {
+		return nil, ErrClientIDRequired
 	}
 	hostname, _ := os.Hostname()
 	reg := newInstanceRegistry(cfg.KV, hostname, cfg.RefreshInterval, cfg.HeartbeatTimeout)
@@ -66,12 +75,9 @@ func NewCluster(cfg ClusterConfig) (*Storage, error) {
 	return s, nil
 }
 
-// startClientKeepalive 配置了 ClientID 时自动向 KV 注册 SDK 客户端并周期心跳续约
-// （taihu-cli 设计文档 §5）。注册失败不阻断（心跳每周期重试注册，自愈）。
+// startClientKeepalive 向 KV 注册 SDK 客户端并周期心跳续约（taihu-cli 设计文档 §5）。
+// ClientID 必填：不满足的客户端无法通过 NewCluster 构造。注册失败不阻断（心跳每周期重试注册，自愈）。
 func (s *Storage) startClientKeepalive(cfg ClusterConfig) {
-	if cfg.ClientID == "" || cfg.KV == nil {
-		return
-	}
 	host, _ := os.Hostname()
 	info := &cluster.ClientInfo{
 		ID:         cfg.ClientID,
