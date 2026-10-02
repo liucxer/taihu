@@ -107,6 +107,9 @@ func (r *ring) SubmitWriteBatch(specs []WriteSpec) (uint64, int, error) {
 }
 
 // submit 填充 iocb 并 io_submit。内核在 io_submit 内深拷贝 iocb，返回后 iocb 可复用。
+// 失败（含 EAGAIN 队列满）时在锁内回滚 seq：与 submitBatch 的「seq 只推进已排队条数」
+// 不变量一致（device 层据 seq 关联完成事件，跳过未排队的号才不产生空洞/错配）。
+// 回滚必须在持锁期间完成——锁外自减会让并发 submit 取到已回滚的号（序号重叠）。
 func (r *ring) submit(buf []byte, off int64, op uint16) (uint64, error) {
 	r.mu.Lock()
 	r.seq++
@@ -123,13 +126,15 @@ func (r *ring) submit(buf []byte, off int64, op uint16) (uint64, error) {
 	}
 	cbpp := [1]*iocb{cb}
 	_, _, errno := unix.Syscall(unix.SYS_IO_SUBMIT, uintptr(r.ctx), 1, uintptr(unsafe.Pointer(&cbpp[0])))
-	r.mu.Unlock()
 	if errno != 0 {
+		r.seq-- // 未排队：回滚序号，保持「seq 只推进已排队条数」
+		r.mu.Unlock()
 		if errno == unix.EAGAIN {
 			return 0, ierr.ErrFull
 		}
 		return 0, errno
 	}
+	r.mu.Unlock()
 	// 缓冲交由调用方持有到 Wait 取回事件（O_DIRECT 下内核直读 buf）。
 	return seq, nil
 }

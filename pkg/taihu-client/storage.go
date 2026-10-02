@@ -203,7 +203,7 @@ func (s *Storage) Put(ctx context.Context, key string, size int64, in []byte) er
 func (s *Storage) Get(ctx context.Context, key string, off, size int64) ([]byte, func(), error) {
 	// 1) 路由缓存优先（写路径已记录 key→实例名），2) 未命中查 TiKV 索引
 	if inst, ok := s.lookup(ctx, key); ok {
-		if data, rel, err := s.getFrom(ctx, key, off, size, []cluster.InstanceInfo{inst}); err != rpcclient.ErrNotFound {
+		if data, rel, err := s.getFrom(ctx, key, off, size, []cluster.InstanceInfo{inst}); !errors.Is(err, rpcclient.ErrNotFound) {
 			return data, rel, err
 		}
 	}
@@ -218,7 +218,7 @@ func (s *Storage) Get(ctx context.Context, key string, off, size int64) ([]byte,
 // 拷贝缓冲，用毕 release()。回源重建仅走拷贝路径。
 func (s *Storage) GetFd(ctx context.Context, key string, off, size int64) (int, uint64, []byte, func(), error) {
 	if inst, ok := s.lookup(ctx, key); ok {
-		if fd, foff, data, rel, err := s.getFromFd(ctx, key, off, size, []cluster.InstanceInfo{inst}); err != rpcclient.ErrNotFound {
+		if fd, foff, data, rel, err := s.getFromFd(ctx, key, off, size, []cluster.InstanceInfo{inst}); !errors.Is(err, rpcclient.ErrNotFound) {
 			return fd, foff, data, rel, err
 		}
 	}
@@ -509,7 +509,7 @@ func (s *Storage) getFrom(ctx context.Context, key string, off, size int64, inst
 		if err == nil {
 			return data, rel, nil
 		}
-		if err != rpcclient.ErrNotFound {
+		if !errors.Is(err, rpcclient.ErrNotFound) {
 			return nil, nil, err
 		}
 	}
@@ -527,7 +527,7 @@ func (s *Storage) getFromFd(ctx context.Context, key string, off, size int64, in
 		if err == nil {
 			return fd, foff, data, rel, nil
 		}
-		if err != rpcclient.ErrNotFound {
+		if !errors.Is(err, rpcclient.ErrNotFound) {
 			return 0, 0, nil, nil, err
 		}
 	}
@@ -578,14 +578,14 @@ func (s *Storage) getFromSource(ctx context.Context, key string, off, size int64
 func (s *Storage) Delete(ctx context.Context, key string) error {
 	if inst, ok := s.lookup(ctx, key); ok {
 		if c, err := s.clientFor(inst); err == nil {
-			if err := c.Delete(ctx, key); err != nil && err != rpcclient.ErrNotFound {
+			if err := c.Delete(ctx, key); err != nil && !errors.Is(err, rpcclient.ErrNotFound) {
 				return err
 			}
 		}
 	} else {
 		for _, inst := range s.registry.snapshot().local {
 			if c, err := s.clientFor(inst); err == nil {
-				if err := c.Delete(ctx, key); err != nil && err != rpcclient.ErrNotFound {
+				if err := c.Delete(ctx, key); err != nil && !errors.Is(err, rpcclient.ErrNotFound) {
 					return err
 				}
 			}
@@ -602,7 +602,7 @@ func (s *Storage) Stat(ctx context.Context, key string) (int64, error) {
 		if c, err := s.clientFor(inst); err == nil {
 			if n, err := c.Stat(ctx, key); err == nil {
 				return n, nil
-			} else if err != rpcclient.ErrNotFound {
+			} else if !errors.Is(err, rpcclient.ErrNotFound) {
 				return 0, err
 			}
 		}

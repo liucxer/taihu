@@ -136,15 +136,39 @@ func (k *TiKVKV) snapshot(ctx context.Context) (tikvSnapshot, error) {
 	return snap, nil
 }
 
+// txRetries 写事务提交重试上限：TiKV 2PC 提交遇写冲突（同一 key 被并发事务先行提交）
+// 时事务作废，必须重开新事务重放写入。本层写入均为整条覆盖或幂等删除，重放安全；
+// 重试上限避免高争抢下长时间自旋（调用方为注册/容量记录/索引等非热路径写）。
+const txRetries = 3
+
+// commitWithRetry 在「新建事务 → fn 写入 → 提交」整链上重试写冲突：冲突时换新事务重放
+// （覆盖写/幂等删除可安全重放）；其余错误立即返回，不重试。
+func (k *TiKVKV) commitWithRetry(ctx context.Context, fn func(tikvTxn) error) error {
+	var lastErr error
+	for i := 0; i < txRetries; i++ {
+		txn, err := k.c.Begin()
+		if err != nil {
+			return err
+		}
+		if err := fn(txn); err != nil {
+			return err
+		}
+		err = txn.Commit(ctx)
+		if err == nil {
+			return nil
+		}
+		if !tikverr.IsErrWriteConflict(err) {
+			return err
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("tikv commit: write conflict after %d retries: %w", txRetries, lastErr)
+}
+
 func (k *TiKVKV) Put(ctx context.Context, key, value []byte) error {
-	txn, err := k.c.Begin()
-	if err != nil {
-		return err
-	}
-	if err := txn.Set(key, value); err != nil {
-		return err
-	}
-	return txn.Commit(ctx)
+	return k.commitWithRetry(ctx, func(txn tikvTxn) error {
+		return txn.Set(key, value)
+	})
 }
 
 // Get 单 key 读取；key 不存在返回 (nil, nil)（对齐 KV 接口约定）。
@@ -164,14 +188,9 @@ func (k *TiKVKV) Get(ctx context.Context, key []byte) ([]byte, error) {
 }
 
 func (k *TiKVKV) Delete(ctx context.Context, key []byte) error {
-	txn, err := k.c.Begin()
-	if err != nil {
-		return err
-	}
-	if err := txn.Delete(key); err != nil {
-		return err
-	}
-	return txn.Commit(ctx)
+	return k.commitWithRetry(ctx, func(txn tikvTxn) error {
+		return txn.Delete(key)
+	})
 }
 
 // DeleteRange 删除 [start, end) 区间全部 key。txnkv 无服务端范围删除，
@@ -185,16 +204,14 @@ func (k *TiKVKV) DeleteRange(ctx context.Context, start, end []byte) error {
 		if len(keys) == 0 {
 			return nil
 		}
-		txn, err := k.c.Begin()
-		if err != nil {
-			return err
-		}
-		for _, key := range keys {
-			if err := txn.Delete(key); err != nil {
-				return err
+		if err := k.commitWithRetry(ctx, func(txn tikvTxn) error {
+			for _, key := range keys {
+				if err := txn.Delete(key); err != nil {
+					return err
+				}
 			}
-		}
-		if err := txn.Commit(ctx); err != nil {
+			return nil
+		}); err != nil {
 			return err
 		}
 	}
@@ -226,16 +243,14 @@ func (k *TiKVKV) Scan(ctx context.Context, start, end []byte, limit int) ([][]by
 }
 
 func (k *TiKVKV) BatchPut(ctx context.Context, kvs map[string][]byte) error {
-	txn, err := k.c.Begin()
-	if err != nil {
-		return err
-	}
-	for key, v := range kvs {
-		if err := txn.Set([]byte(key), v); err != nil {
-			return err
+	return k.commitWithRetry(ctx, func(txn tikvTxn) error {
+		for key, v := range kvs {
+			if err := txn.Set([]byte(key), v); err != nil {
+				return err
+			}
 		}
-	}
-	return txn.Commit(ctx)
+		return nil
+	})
 }
 
 // BatchGet 批量读取；返回切片与 keys 等长对齐，缺失 key 对应位置为 nil。

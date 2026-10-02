@@ -12,6 +12,7 @@ package device
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -142,7 +143,7 @@ func (d *Device) pump() {
 	timeout := pumpTimeout
 	for {
 		evs, err := d.ring.Wait(1, 64, &timeout)
-		if err != nil && err != ierr.ErrTimeout {
+		if err != nil && !errors.Is(err, ierr.ErrTimeout) {
 			// 硬错误：仅记录并继续轮询，避免 m 非空时提交方永久阻塞。
 			fmt.Fprintf(os.Stderr, "taihu: aio pump wait: %v\n", err)
 		}
@@ -245,7 +246,7 @@ func (d *Device) submitOne(buf []byte, off int64, read bool) (uint64, chan aio.E
 		if err != nil {
 			// 提交失败（含队列满）：无在途 IO，可直接返回；ErrFull 让出后重试。
 			d.mu.Unlock()
-			if err == ierr.ErrFull {
+			if errors.Is(err, ierr.ErrFull) {
 				time.Sleep(submitRetry)
 				continue
 			}
@@ -580,7 +581,7 @@ func (d *Device) AppendBatch(ctx context.Context, jobs []WriteJob) error {
 			rs[i] = aio.WriteSpec{Buf: chunk[i].buf, Off: chunk[i].off}
 		}
 		first, n, err := d.ring.SubmitWriteBatch(rs)
-		if err == ierr.ErrFull || n == 0 {
+		if errors.Is(err, ierr.ErrFull) || n == 0 {
 			// 队列满且一条未排入：让出后重试整块（未推进 seq，不丢 IO）。
 			d.mu.Lock()
 			d.inSubmit -= len(chunk)
