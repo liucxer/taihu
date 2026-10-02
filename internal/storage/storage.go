@@ -91,6 +91,14 @@ func (s *Storage) Close() error {
 func (s *Storage) RefSegment(segmentID int64)   { s.db.RefSegment(segmentID) }
 func (s *Storage) UnrefSegment(segmentID int64) { s.db.UnrefSegment(segmentID) }
 
+// MetaRef 解析 key 的映射快照并同时对该段取读引用（一次 GET 取一次），闭合
+// 「取快照 → 取引用」之间 key 被删/搬移导致的 GC 回收复用窗口（见 metastore.Store.GetMappingRef：
+// 取引用后以 pebble 权威读复验快照仍有效，失效返回 ierr.ErrNotFound）。
+// 成功后调用方须在读取结束后 UnrefSegment(meta.SegmentID)。
+func (s *Storage) MetaRef(ctx context.Context, key string) (metastore.ObjectMeta, error) {
+	return s.db.GetMappingRef(ctx, key)
+}
+
 // BatchReadBlock 批读的一个对象块（直读快路径前置：Off/Size 4K 对齐，Size 为整块）。
 type BatchReadBlock struct {
 	Key  string

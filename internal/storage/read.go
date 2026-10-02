@@ -30,10 +30,13 @@ func (s *Storage) Meta(ctx context.Context, key string) (metastore.ObjectMeta, e
 //   - 请求超出对象结尾：截断到剩余字节，返回的部分不足 size 时附 io.EOF；
 //   - off == Size（剩余 0）：返回 (nil, io.EOF)。
 func (s *Storage) ReadAt(ctx context.Context, key string, off, size int64) ([]byte, error) {
-	meta, err := s.db.GetMapping(ctx, key)
+	// 取快照的同时取段读引用（并在 Store 内复验快照仍有效），闭合删/搬移与 GC
+	// 回收之间的窗口；数据读入内存后即可释放引用。
+	meta, err := s.db.GetMappingRef(ctx, key)
 	if err != nil {
 		return nil, err
 	}
+	defer s.db.UnrefSegment(meta.SegmentID)
 	return s.ReadAtMeta(ctx, meta, off, size)
 }
 
@@ -123,10 +126,12 @@ func (s *Storage) ReadAtMeta(ctx context.Context, meta metastore.ObjectMeta, off
 // 返回实际读入的请求窗口字节数（读到对象末尾不足 size 时截断；remaining==0 返回
 // (0, io.EOF)）。dst 中 [0, 返回 n) 为有效数据。
 func (s *Storage) readAtInto(ctx context.Context, key string, off, size int64, dst []byte) (int64, error) {
-	meta, err := s.db.GetMapping(ctx, key)
+	// 同 ReadAt：取快照同时取段读引用并复验，读入 dst 后释放引用。
+	meta, err := s.db.GetMappingRef(ctx, key)
 	if err != nil {
 		return 0, err
 	}
+	defer s.db.UnrefSegment(meta.SegmentID)
 	return s.ReadAtIntoMeta(ctx, meta, off, size, dst)
 }
 

@@ -2,6 +2,7 @@ package metastore
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/cockroachdb/pebble"
@@ -55,6 +56,43 @@ func (s *pebbleStore) GetMapping(ctx context.Context, key string) (ObjectMeta, e
 	}
 	s.cache.put(key, m)
 	return m, nil
+}
+
+// getMappingRefRetries 复验重试上限：极端并发覆盖同一 key 时避免无限自旋。
+const getMappingRefRetries = 8
+
+// GetMappingRef 读 mapping 并对其所在段取读引用（语义见 Store 接口）。
+//
+// 首读走加速缓存（热 key 廉价）；复验一律以 pebble 权威读——缓存相对 pebble 存在
+// 「已落盘、缓存尚未失效」的短暂滞后窗口，若用它复验会把已删/已搬移的旧映射误判有效。
+func (s *pebbleStore) GetMappingRef(_ context.Context, key string) (ObjectMeta, error) {
+	meta, err := s.GetMapping(context.Background(), key)
+	if err != nil {
+		return ObjectMeta{}, err
+	}
+	for i := 0; i < getMappingRefRetries; i++ {
+		s.segs.Ref(meta.SegmentID)
+		cur, found, gerr := s.mapping().get(key)
+		if gerr != nil {
+			s.segs.Unref(meta.SegmentID)
+			return ObjectMeta{}, gerr
+		}
+		if !found {
+			// key 在取引用期间被删除：快照已失效，释放引用报 NotFound。
+			s.segs.Unref(meta.SegmentID)
+			return ObjectMeta{}, ierr.ErrNotFound
+		}
+		if cur == meta {
+			return meta, nil // 引用与快照一致：该段在读取期间不会被回收复用
+		}
+		// 快照在取引用期间被并发覆盖/搬移到别处：释放旧引用，以最新快照重试。
+		s.segs.Unref(meta.SegmentID)
+		meta = cur
+	}
+	// 极端并发覆盖下仍无法取得稳定快照：持最新快照引用返回（快照语义允许单一旧版本，
+	// 引用保证该段在读取期间不被回收复用）。
+	s.segs.Ref(meta.SegmentID)
+	return meta, nil
 }
 
 // PutMapping 写 mapping（WriteBatch 原子含段存活计数更新），写穿：pebble 成功后回填缓存。
@@ -170,7 +208,7 @@ func (s *pebbleStore) BatchDeleteMapping(ctx context.Context, keys []string) ([]
 	for i, key := range keys {
 		m, err := s.GetMapping(ctx, key)
 		if err != nil {
-			if err == ierr.ErrNotFound {
+			if errors.Is(err, ierr.ErrNotFound) {
 				errs[i] = ierr.ErrNotFound
 				continue
 			}
@@ -392,25 +430,30 @@ func (s *pebbleStore) MarkCompacting(ctx context.Context, segmentID int64) error
 // 一致则原子切换为 new 并转移段存活计数（new 段 +1、old 段 −1，同一 WriteBatch），成功后回填缓存。
 // 不一致或 key 不存在返回 ierr.ErrConflict，不修改任何数据（并发 Put/Delete 冲突由调用方跳过重试）。
 func (s *pebbleStore) MoveMapping(ctx context.Context, key string, old, new ObjectMeta) error {
-	cur, found, err := s.mapping().get(key)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return ierr.ErrConflict
-	}
-	if cur != old {
-		return ierr.ErrConflict
-	}
-
 	b := s.db.NewBatch()
 	defer b.Close()
+
+	// CAS 复验与段计数转移必须与并发 Put/Delete 的 mapping 写入互斥：若在加锁前校验、
+	// 锁内不复验，同一 key 被并发搬移会 double 加减两段存活计数（旧段提前归零转
+	// Reclaiming 被 GC 回收复用 → 活对象被覆盖丢失）。故持锁内以 pebble 权威读复验，
+	// 并在锁内提交 batch（搬移仅在 compaction 后台低频路径，锁内一次 sync 写可接受）。
 	s.segs.mu.Lock()
-	s.segs.putObjectLocked(b, key, new, &old)
-	s.segs.mu.Unlock()
-	if err := s.db.Apply(b, syncWO); err != nil {
+	cur, found, err := s.mapping().get(key)
+	if err != nil {
+		s.segs.mu.Unlock()
 		return err
 	}
+	if !found || cur != old {
+		s.segs.mu.Unlock()
+		return ierr.ErrConflict
+	}
+	s.segs.putObjectLocked(b, key, new, &old)
+	if err := s.db.Apply(b, syncWO); err != nil {
+		s.segs.mu.Unlock()
+		return err
+	}
+	s.segs.mu.Unlock()
+
 	s.cache.put(key, new)
 	return nil
 }

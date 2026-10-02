@@ -3,6 +3,7 @@ package metastore
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -166,7 +167,7 @@ func (m *mappingModel) key(userKey string) []byte { return keyMapping(userKey) }
 func (m *mappingModel) get(userKey string) (ObjectMeta, bool, error) {
 	v, closer, err := m.db.Get(keyMapping(userKey))
 	if err != nil {
-		if err == pebble.ErrNotFound {
+		if errors.Is(err, pebble.ErrNotFound) {
 			return ObjectMeta{}, false, nil
 		}
 		return ObjectMeta{}, false, err
@@ -252,7 +253,7 @@ func (m *segmentModel) key(segmentID int64) []byte { return keyState(segmentKey(
 func (m *segmentModel) get(segmentID int64) (SegmentMeta, bool, error) {
 	v, closer, err := m.db.Get(keyState(segmentKey(segmentID)))
 	if err != nil {
-		if err == pebble.ErrNotFound {
+		if errors.Is(err, pebble.ErrNotFound) {
 			return SegmentMeta{}, false, nil
 		}
 		return SegmentMeta{}, false, err
@@ -314,7 +315,7 @@ func (c *cursorModel) set(pos writeCursor) error {
 func (c *cursorModel) get() (writeCursor, bool, error) {
 	v, closer, err := c.db.Get(c.key())
 	if err != nil {
-		if err == pebble.ErrNotFound {
+		if errors.Is(err, pebble.ErrNotFound) {
 			return writeCursor{}, false, nil
 		}
 		return writeCursor{}, false, err

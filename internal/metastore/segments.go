@@ -317,41 +317,80 @@ func (m *segmentManager) popFree(ctx context.Context) (int64, bool) {
 	return id, true
 }
 
-// reclaimOnce 执行一轮回收：所有 AliveCount==0 且无在途读者的 Reclaiming 段 → Free 入池。
-// 返回本次回收段数。
+// reclaimOnce 执行一轮回收：AliveCount==0、无在途读者、且「转 Reclaiming」已持久化的
+// Reclaiming 段 → Free 入池。返回本次回收段数。
+//
+// 三段式：锁内挑候选 → 锁外回查持久化状态 → 锁内复核并写 batch + 落盘。
 func (m *segmentManager) reclaimOnce(ctx context.Context) int {
+	// Phase 1：锁内挑候选（Reclaiming 且无在途读者）。
 	m.mu.Lock()
-	var cands []*segEntry
 	var ids []int64
 	for id, e := range m.segs {
 		if e.meta.State == SegmentStateReclaiming && e.refCount == 0 {
-			cands = append(cands, e)
 			ids = append(ids, id)
 		}
 	}
-	if len(cands) == 0 {
-		m.mu.Unlock()
+	m.mu.Unlock()
+	if len(ids) == 0 {
 		return 0
 	}
-	for i, id := range ids {
-		e := cands[i]
+
+	// Phase 2：确认「转 Reclaiming」已落盘——该状态与 mapping 删除同处一个 sync
+	// WriteBatch，未落盘意味着 mapping 删除可能仍在途：此刻回收复用会让「已读到旧
+	// mapping 快照」的迟到读者读到他人数据（静默损坏）。留待下一轮（落盘后）再收。
+	// 候选极少，逐个回查的开销可忽略。
+	durable := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if meta, found, err := m.segment().get(id); err == nil && found && meta.State == SegmentStateReclaiming {
+			durable = append(durable, id)
+		}
+	}
+	if len(durable) == 0 {
+		return 0
+	}
+
+	// Phase 3：锁内复核（Phase 1~3 之间可能被重新激活/取引用）→ 置 Free 入池，并把
+	// meta 序列化进本地副本；锁外只读副本，不再触碰 e.meta（与分配器 popFree 改写
+	// State 构成的数据竞争由此消除）。
+	b := m.db.NewBatch()
+	defer b.Close()
+	m.mu.Lock()
+	finalized := make([]int64, 0, len(durable))
+	metas := make([]SegmentMeta, 0, len(durable))
+	for _, id := range durable {
+		e := m.segs[id]
+		if e == nil || e.meta.State != SegmentStateReclaiming || e.refCount != 0 {
+			continue
+		}
 		e.meta.State = SegmentStateFree
 		e.meta.AliveCount = 0
 		e.meta.ReclaimSeq++ // 回收一代，世代号递增
 		m.free = append(m.free, id)
+		finalized = append(finalized, id)
+		metas = append(metas, e.meta)
 	}
-	m.mu.Unlock()
-
-	b := m.db.NewBatch()
-	defer b.Close()
-	for i, e := range cands {
-		m.segment().setBatch(b, ids[i], e.meta)
-	}
-	if err := m.db.Apply(b, syncWO); err != nil {
-		// 持久化失败：段留在 Free（内存态），下轮 GC 重试写入。
+	if len(finalized) == 0 {
+		m.mu.Unlock()
 		return 0
 	}
-	return len(ids)
+	for i, id := range finalized {
+		m.segment().setBatch(b, id, metas[i])
+	}
+	// 锁内提交：失败时回滚为 Reclaiming 并移出空闲池，使「下轮 GC 重试」的承诺成立
+	// （锁内提交同时保证回滚期间该段不会被分配器取用复用）。
+	if err := m.db.Apply(b, syncWO); err != nil {
+		for _, id := range finalized {
+			if e := m.segs[id]; e != nil && e.meta.State == SegmentStateFree {
+				e.meta.State = SegmentStateReclaiming
+				e.meta.ReclaimSeq--
+				m.removeFree(id)
+			}
+		}
+		m.mu.Unlock()
+		return 0
+	}
+	m.mu.Unlock()
+	return len(finalized)
 }
 
 // stats 返回段状态汇总（管理/测试用）。

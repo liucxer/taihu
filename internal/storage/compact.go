@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -118,7 +119,7 @@ func (c *Compactor) compactOnce(ctx context.Context) (int, error) {
 		}
 		for _, key := range cd.keys {
 			n, err := c.moveObject(ctx, key)
-			if err == ierr.ErrConflict {
+			if errors.Is(err, ierr.ErrConflict) {
 				continue // 并发 Put/Delete 改动该 key，跳过（下轮重扫）
 			}
 			if err != nil {
@@ -142,7 +143,7 @@ func (c *Compactor) compactOnce(ctx context.Context) (int, error) {
 func (c *Compactor) moveObject(ctx context.Context, key string) (int, error) {
 	meta, err := c.st.db.GetMapping(ctx, key)
 	if err != nil {
-		if err == ierr.ErrNotFound {
+		if errors.Is(err, ierr.ErrNotFound) {
 			return 0, nil // 已被并发删除
 		}
 		return 0, err

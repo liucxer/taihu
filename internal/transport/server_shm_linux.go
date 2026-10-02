@@ -745,11 +745,12 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 	if err != nil {
 		return shmWriteFrame(st, protocol.OpGetErr, protocol.EncCode(protocol.CodeInvalidArgument))
 	}
-	// GET 级映射快照（语义同 TCP handleGet）：一次请求内所有数据帧共用同一 meta，使整段
-	// 响应严格来自单一版本；size==-1 的 size 亦由该快照推导。多帧路径全程持有快照段引用，
-	// 防止该段被 GC 回收复用。单块请求（下方 batch 快路径）由 BatchRead 内部一次解析并
-	// 持引用，不存在跨块混合，无需快照。
-	meta, err := s.storage.Meta(context.Background(), key)
+	// GET 级映射快照 + 段读引用（语义同 TCP handleGet）：一次请求内所有数据帧共用同一
+	// meta，使整段响应严格来自单一版本；size==-1 的 size 亦由该快照推导。
+	// MetaRef 读映射的同时取该段读引用，并以 pebble 权威读
+	// 复验快照仍有效（闭合「取快照 → 取引用」之间的回收复用窗口）。整段响应复用同一
+	// 快照与同一引用，读取结束（或错误返回）时释放。
+	meta, err := s.storage.MetaRef(context.Background(), key)
 	if err != nil {
 		return shmWriteFrame(st, protocol.OpGetErr, protocol.EncCode(protocol.MapStorageErr(err)))
 	}
@@ -757,18 +758,19 @@ func (s *shmServer) handleShmGet(st *shmipc.Stream, payload []byte) error {
 		size = meta.Size - off
 	}
 	if size < 0 {
+		s.storage.UnrefSegment(meta.SegmentID)
 		return shmWriteFrame(st, protocol.OpGetErr, protocol.EncCode(protocol.CodeInvalidRange))
 	}
 	pos, end := off, off+size
 
 	if s.batched != nil && pos%layout.BlockSize == 0 && end-pos == protocol.ChunkSize {
 		_, rerr := s.shmWriteDataFrameBatch(st, s.batched, key, pos, end-pos, end)
-
+		// 批路径在 BatchRead 内部自行解析映射并持引用；此处释放入口快照引用。
+		s.storage.UnrefSegment(meta.SegmentID)
 		_ = rerr
 		return nil
 	}
 
-	s.storage.RefSegment(meta.SegmentID)
 	defer s.storage.UnrefSegment(meta.SegmentID)
 
 	if off%layout.BlockSize == 0 {

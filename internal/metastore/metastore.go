@@ -90,6 +90,13 @@ type SegmentSummary struct {
 // Store 是元数据存储接口，供 Storage 层调用。
 type Store interface {
 	GetMapping(ctx context.Context, key string) (ObjectMeta, error) // 不存在返回 ErrNotFound
+
+	// GetMappingRef 读取 key 的映射并同时对其所在段取读引用（一次 GET 只取一次），
+	// 闭合「解析映射快照」与「取段读引用」之间的回收复用窗口：取引用后以 pebble 权威读
+	// 复验映射仍指向同一版本，不一致则释放引用并返回 ierr.ErrNotFound（key 已删）或按
+	// 最新快照重试（已被搬移/覆盖）。成功后调用方须 UnrefSegment(meta.SegmentID)。
+	GetMappingRef(ctx context.Context, key string) (ObjectMeta, error)
+
 	PutMapping(ctx context.Context, key string, m ObjectMeta) error
 	DeleteMapping(ctx context.Context, key string) error
 	IterMapping(ctx context.Context, fn func(key string, m ObjectMeta) error) error // 遍历全部分映射
