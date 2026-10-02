@@ -3,8 +3,9 @@
 // 服务端以 net/http 提供 /api/* JSON 端点与内嵌静态页，能力实现 webService 复用
 // cmd 包既有的 CLI helper（listAllInstances/dialInstance/pingInstance/probeSegments/
 // resolveKeyTarget/targetName 等），语义与各 CLI 子命令一致：
-//   cluster list|status|index|purge、client list|info、instance segments、
-//   key put|get|delete|stat|meta|list、version。
+//
+//	cluster list|status|index|purge、client list|info、instance segments、
+//	key put|get|delete|stat|meta|list、version。
 package cmd
 
 import (

@@ -75,7 +75,8 @@ var benchSingleCmd = &cobra.Command{
 			// shm 数据面直接以 ShmConn 作为 Store：其实现 benchkit.Batcher（GetBatch
 			// 单流连发 P 个 GetReq），配合服务端 per-stream 异步读流水线摊薄每请求固定
 			// 开销；经 rpcclient.Storage 包装会丢失 Batcher（Storage 不实现 GetBatch）。
-			s, err = transport.DialShm(c.shm, c.conns)
+			// 拨号按平台拆分（bench_single_shm_{linux,other}.go）：非 Linux 返回 ErrShmUnsupported。
+			s, err = dialShmBenchStore(c.shm, c.conns)
 		}
 		if err != nil {
 			benchkit.StopCPUProfile(cpuFile)

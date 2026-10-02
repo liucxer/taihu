@@ -1,7 +1,9 @@
 // Package bufpool 提供按 2 的幂分桶（4KB~8GB）的 4K 对齐缓冲池，供各层热路径复用，
 // 消除每次 make 大块缓冲带来的高频堆分配与 GC 压力（设计 v3 中 server/rpcclient 的 IO 缓冲
-// 与 device 的 O_DIRECT 对齐缓冲共用本池）。包位于 pkg/ 下，SDK/外部调用方可复用同一套
-// 对齐缓冲与 bufpool.Put 归还契约。
+// 与 device 的 O_DIRECT 对齐缓冲共用本池）。包位于 internal/ 下：唯一的使用方是引擎内部
+// （transport/storage/device），不对外构成契约 —— 2026-09-24 曾迁至 pkg/bufpool 以备 SDK
+// 复用，但该复用从未发生（零外部引用），2026-10-02 迁回，以维持 check-layering 门禁
+// 「internal/ 只允许依赖 pkg/ierr 这一个共享事实源」的窄边界。
 //
 // 约定：
 //   - Get 返回 4K 对齐、len>=n 的切片，len 为 2 的幂（分桶容量）；n<=0 返回 nil；

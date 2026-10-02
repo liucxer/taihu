@@ -28,12 +28,12 @@ import (
 
 	"github.com/liucxer/taihu/third_party/netpoll"
 
+	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/device"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
 	"github.com/liucxer/taihu/internal/storage"
 	"github.com/liucxer/taihu/internal/transport/protocol"
-	"github.com/liucxer/taihu/pkg/bufpool"
 )
 
 // Server 基于 netpoll EventLoop 的 taihu RPC 服务端（对应旧 gRPC rpcserver.New 的
@@ -326,11 +326,11 @@ type tcpGetPending struct {
 	pos, end int64 // 请求窗口 [pos, end)（对象内）：pos 为块起点，end 恒为整个 GetReq
 	// 窗口终点（off+size，跨块共享）——final 判定必须基于整个请求而非单块，
 	// 否则多块请求的首块会被误打成 final、客户端提前收流报 short read
-	buf      []byte
-	ar       *storage.AsyncReadAt
-	done     bool
-	n        int64
-	rerr     error
+	buf  []byte
+	ar   *storage.AsyncReadAt
+	done bool
+	n    int64
+	rerr error
 	// unrefSeg ≥0：写出/丢弃该项时释放该段读引用。一次 GetReq 的 GET 级段引用
 	// （由入口 MetaRef 取得并复验）挂在该请求最后一个在途项上，写出（或退出兜底）
 	// 时释放；-1 表示该项不持有引用。

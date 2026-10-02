@@ -24,12 +24,12 @@ import (
 	"github.com/liucxer/taihu/pkg/ierr"
 	"github.com/liucxer/taihu/third_party/shmipc-go"
 
+	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/device"
 	"github.com/liucxer/taihu/internal/layout"
 	"github.com/liucxer/taihu/internal/metastore"
 	"github.com/liucxer/taihu/internal/storage"
 	"github.com/liucxer/taihu/internal/transport/protocol"
-	"github.com/liucxer/taihu/pkg/bufpool"
 )
 
 // ShmSupported 报告本平台是否支持 shmipc 共享内存 IPC。调用方据此决定是跳过
@@ -444,6 +444,7 @@ type pendingOp struct {
 //   - 请求须为单个对齐整 4MiB 块（off 4K 对齐、size == ChunkSize、对象剩余 ≥ ChunkSize）；
 //   - 同步解析映射快照（pebble Get）→ 持段读引用（AsyncReadAt 内部）→ Reserve 响应
 //     切片 + 写 OpGetErr 占位帧头 → storage.SubmitReadAtIntoMeta 异步提交，不等待完成。
+//
 // 成功返回 (h, true)，响应帧由 handleStream 按序排空写出。参数/映射/储备/提交失败：
 // Meta 与提交失败以「已完成错误项」入队（复用已 Reserve 切片，错误帧按序写出）；
 // 仅 Reserve 失败（共享内存池不足）返回 (nil, false)，调用方排空在途后走原同步路径。
@@ -569,6 +570,7 @@ func (s *shmServer) awaitPending(h *pendingOp) error {
 //   - get：写响应帧头（数据区已由 DMA 直写），成功 OpGetData/OpGetDataFinal（len 按实际
 //     读入 n 更新），读错误 OpGetErr；
 //   - put：Reserve 控制帧写 OpResp + 4B 错误码（成功 CodeOK）。
+//
 // 不做 Flush —— 连续完成的帧由 drain 合并一次 Flush。
 func (s *shmServer) fillPendingResp(st *shmipc.Stream, h *pendingOp) error {
 	if h.kind == pendingPut {
@@ -643,6 +645,7 @@ func (s *shmServer) shmRespErr(st *shmipc.Stream, op protocol.OpCode, code proto
 //   - 同步（inflight==0）：submit 阻塞等磁盘写回，返回后立即写 OpResp 帧；
 //   - 异步（inflight>0）：submitAsync 非阻塞投递，任务入 pend 保序队列，OpResp 帧由
 //     drain 按请求到达顺序写出 —— 数据帧切片存活到异步写完成（延迟批量释放）。
+//
 // 旧路径（writer == nil）：逐帧 PutAppend 直写 + PutEnd 时 PutCommit（保持原行为）。
 func (s *shmServer) handleShmPut(st *shmipc.Stream, r shmipc.BufferReader, payload []byte, pend *[]*pendingOp) error {
 	key, size, err := protocol.ParsePutHeader(protocol.NewSliceReader(payload))

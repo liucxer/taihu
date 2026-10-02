@@ -34,7 +34,7 @@ type fakeService struct {
 	putRes     KeyWriteResult
 	delRes     KeyWriteResult
 
-	listErr error
+	listErr  error
 	purgeErr error
 	statErr  error
 	getErr   error

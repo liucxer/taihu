@@ -349,15 +349,16 @@ func tcpBatchPayload(k int, size int) []byte {
 //   - Inflight>0 时对齐整块 4MiB 走 per-stream 异步流水线（提交不等待 + 按序排空写帧）；
 //   - Inflight>0 但 size 非 ChunkSize 整数倍（对齐）走排空在途后的同步路径；
 //   - Inflight==0 时整体退化为逐请求同步（批帧仍被 handleGetStream 正确消费）。
+//
 // 验证响应帧按请求到达顺序一一对位（保序地基），且批读后连接/流仍健康。
 func TestTCPGetBatchInflight(t *testing.T) {
 	ctx := context.Background()
 
 	// 每个分支独立 server（inflight 4 / 0），各写 5 个 4MiB key + 5 个 1MiB key。
 	const (
-		bigN   = 5
-		bigSz  = protocol.ChunkSize
-		smallN = 5
+		bigN    = 5
+		bigSz   = protocol.ChunkSize
+		smallN  = 5
 		smallSz = 1 << 20
 	)
 	run := func(t *testing.T, cfg PipelineConfig) {

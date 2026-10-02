@@ -28,24 +28,32 @@ check-fmt:
 	echo "check-fmt: OK"
 
 # ── 分层不变量 ────────────────────────────────────────────────────────────────
-# pkg/ 只放**客户端 SDK**（外部调用方唯一入口），非客户端面一律下沉 internal/。
-# 引擎（internal/storage）、传输层、元数据层都是服务端与客户端共用的下层实现。
+# pkg/ 放两类包：
+#   1. 对外 SDK（pkg/taihu-client）——外部调用方唯一入口；
+#   2. 引擎与 SDK 共享的错误唯一事实源（pkg/ierr）——SDK 直接 import，
+#      外部调用方用同一批 sentinel 做 errors.Is。
+# 其余非客户端面一律下沉 internal/（如 bufpool：2026-09-24 曾以「SDK 可复用」
+# 迁至 pkg/，复用从未发生，2026-10-02 迁回 internal/bufpool）。
 #
 # 两条方向都要守，少一条边界就会被绕回来：
-#   check-layering  internal/ 不得反向依赖 pkg/ —— 违反即成环，也说明引擎又爬回了对外目录
-#   check-sdk-only  pkg/ 不得直接依赖存储引擎 —— SDK 只应依赖 transport/cluster/metastore/ierr/version
+#   check-layering  internal/ 不得反向依赖 pkg/ —— 违反即成环，也说明引擎又爬回了对外目录；
+#                   唯一例外 pkg/ierr（上面第 2 类，内外共享的错误契约）
+#   check-sdk-only  pkg/ 不得直接依赖存储引擎 —— SDK 库代码只应依赖
+#                   internal/{cluster,rpcclient,version} 与 pkg/ierr
 #
 # 两条都用 grep 源码，**不用 go list**：go list 在本机（darwin）看不见
 # `//go:build linux` 的文件，而 internal/transport/server_shm.go 恰恰是最容易漏改的那个 ——
 # 用 go list 会本机通过、Linux 上炸。grep 对 build tag 无感。代价是注释/字符串里的
 # 路径字面量会误报，这里可接受（宁可误报）。
 #
-# check-sdk-only 排除 _test.go：同模块测试里 pkg/rpcclient、pkg/rpccluster 需要起一个
-# 真实引擎+server 做端到端接线，那是合法的；这条只约束库代码。
+# check-sdk-only 排除 _test.go：同模块测试里 pkg/taihu-client 需要起一个
+# 真实引擎+server 做端到端接线（storage_multiaddr_test.go 依赖 internal/storage、
+# internal/layout），那是合法的；这条只约束库代码。
 check-layering:
-	@viol=$$(grep -rn '"github.com/liucxer/taihu/pkg/' --include='*.go' internal/ || true); \
+	@viol=$$(grep -rn '"github.com/liucxer/taihu/pkg/' --include='*.go' internal/ \
+	  | grep -v '"github.com/liucxer/taihu/pkg/ierr"' || true); \
 	if [ -n "$$viol" ]; then \
-	  echo "违规：internal/ 不得依赖 pkg/（pkg/ 只放客户端 SDK）："; echo "$$viol"; exit 1; \
+	  echo "违规：internal/ 不得依赖 pkg/（唯一例外 pkg/ierr）："; echo "$$viol"; exit 1; \
 	fi; \
 	echo "check-layering: OK"
 

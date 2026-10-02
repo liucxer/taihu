@@ -16,8 +16,8 @@ import (
 
 	"github.com/liucxer/taihu/third_party/shmipc-go"
 
+	"github.com/liucxer/taihu/internal/bufpool"
 	"github.com/liucxer/taihu/internal/transport/protocol"
-	"github.com/liucxer/taihu/pkg/bufpool"
 	"github.com/liucxer/taihu/pkg/ierr"
 )
 
@@ -128,31 +128,6 @@ type getResult struct {
 	foff    uint64
 	data    []byte
 	release func()
-}
-
-// FdBuf 批量读的单个 key 交付结果：Fd>0 时 Data 零拷贝引用共享内存
-// （memfd(Fd,Foff) 为 splice 源，Data 与 fd/foff 指向同一段内存）；Fd==0 时 Data
-// 为池化拷贝缓冲。两种情况用毕都必须 Release()（幂等）——批内各 FdBuf 独立引用
-// 计数，全部归还后一次性释放帧 pin 并把流 PutBack 复用。
-type FdBuf struct {
-	Fd      int
-	Foff    uint64
-	Data    []byte
-	release func()
-}
-
-// NewFdBuf 构造带归还回调的 FdBuf（供 transport 包外构造：rpcclient 批量回退路径等，
-// 逐 key 的 release 无法在包外直接赋值）。release 可为 nil（此时 Release() 为 no-op）。
-func NewFdBuf(fd int, foff uint64, data []byte, release func()) *FdBuf {
-	return &FdBuf{Fd: fd, Foff: foff, Data: data, release: release}
-}
-
-// Release 归还本 FdBuf 底层缓冲（幂等）。
-func (b *FdBuf) Release() {
-	if b != nil && b.release != nil {
-		b.release()
-		b.release = nil
-	}
 }
 
 // fdBatchReleaser 批量零拷贝读的共享归还器（引用计数）：批内每个 FdBuf 各持一份

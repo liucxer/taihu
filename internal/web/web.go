@@ -98,8 +98,8 @@ type IndexInstCount struct {
 
 // IndexResult /api/cluster/index。
 type IndexResult struct {
-	Prefix    string          `json:"prefix,omitempty"`
-	Total     int             `json:"total"`
+	Prefix    string           `json:"prefix,omitempty"`
+	Total     int              `json:"total"`
 	Instances []IndexInstCount `json:"instances"`
 }
 

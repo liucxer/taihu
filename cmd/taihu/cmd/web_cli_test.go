@@ -39,13 +39,13 @@ func TestWebServiceErrPD(t *testing.T) {
 	ws := newWebService(nil)
 	ctx := context.Background()
 	kvEndpoints := map[string]func() error{
-		"ClusterList":    func() error { _, err := ws.ClusterList(ctx); return err },
-		"ClusterStatus":  func() error { _, err := ws.ClusterStatus(ctx); return err },
-		"ClusterIndex":   func() error { _, err := ws.ClusterIndex(ctx, ""); return err },
-		"ClusterPurge":   func() error { _, err := ws.ClusterPurge(ctx, false); return err },
-		"ClientList":     func() error { _, err := ws.ClientList(ctx); return err },
-		"InstanceSeg":    func() error { _, err := ws.InstanceSegments(ctx, "", false); return err },
-		"KeyStatNoTgt":   func() error { _, err := ws.KeyStat(ctx, "k", "", ""); return err },
+		"ClusterList":   func() error { _, err := ws.ClusterList(ctx); return err },
+		"ClusterStatus": func() error { _, err := ws.ClusterStatus(ctx); return err },
+		"ClusterIndex":  func() error { _, err := ws.ClusterIndex(ctx, ""); return err },
+		"ClusterPurge":  func() error { _, err := ws.ClusterPurge(ctx, false); return err },
+		"ClientList":    func() error { _, err := ws.ClientList(ctx); return err },
+		"InstanceSeg":   func() error { _, err := ws.InstanceSegments(ctx, "", false); return err },
+		"KeyStatNoTgt":  func() error { _, err := ws.KeyStat(ctx, "k", "", ""); return err },
 	}
 	for name, fn := range kvEndpoints {
 		if err := fn(); err == nil {

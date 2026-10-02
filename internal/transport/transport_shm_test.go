@@ -987,8 +987,8 @@ func TestShmClientProtocolAnomalies(t *testing.T) {
 func shmAsyncServer(t *testing.T, st *storage.Storage) (*shmServer, string) {
 	t.Helper()
 	return shmStartServer(t, st, PipelineConfig{
-		Inflight:    8,
-		WriteBatch:  4,
+		Inflight:     8,
+		WriteBatch:   4,
 		WriteWorkers: 2,
 	})
 }
