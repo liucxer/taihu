@@ -30,10 +30,11 @@ type PipelineConfig struct {
 	// 读（现有 shmBatchReader，仅 shm 路径使用）。
 	ReadBatch   int
 	ReadWorkers int
-	// Inflight 每流在途异步读上限（per-stream 异步流水线，仅 shm 路径）：>0 时对齐
-	// 整块 4MiB 读走「提交不等待 + 按序排空写帧」，配合客户端单流多请求 pipeline
-	// 摊薄每请求固定开销（ring 往返 + meta + flush）；0 关闭（逐请求串行，保持旧行为）。
-	// 与 ReadBatch 互斥：两者都 >0 时 ReadBatch 优先，异步流水线不生效。
+	// Inflight 每流在途异步读上限（per-stream 异步流水线，shm/TCP 路径共用）：
+	// >0 时对齐整块 4MiB 读走「提交不等待 + 按序排空写帧」，配合客户端单流多请求
+	// pipeline 摊薄每请求固定开销（ring 往返 + meta + flush）；0 关闭（逐请求串行，
+	// 保持旧行为）。shm 侧与 ReadBatch 互斥：两者都 >0 时 ReadBatch 优先，异步
+	// 流水线不生效；TCP 侧无 ReadBatch，始终由本字段控制。
 	Inflight int
 	// 写（batchWriter）。
 	WriteBatch   int

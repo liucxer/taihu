@@ -231,6 +231,136 @@ func (c *Conn) Get(ctx context.Context, key string, off, size int64) ([]byte, fu
 	}
 }
 
+// GetBatch 在单条流上连发 len(keys) 个 GetReq（每请求 off/size 相同）并按序读回
+// len(keys) 个响应 —— 单流多请求 pipeline：相比逐 key Get（每请求开流/关流 +
+// 一写一读一个往返），把流级往返固定开销摊薄到 P 个请求上，配合服务端 per-stream
+// 异步读流水线（-tcp-inflight）把单流在途从 1 提升到 P（benchkit.Batcher，压测用）。
+//
+// 返回 out[i] 对应 keys[i]（对齐汇入 bufpool 缓冲，语义与 Get 一致）；用毕必须调用
+// 返回的 release()（幂等）一次性归还全部缓冲并关流。任一响应出错（服务端错误/短读/
+// 畸形帧）整个调用失败并释放已分配缓冲。off/size 须显式给定（size<0 不支持，与
+// 单 Get 的 size==-1 推导不同 —— 批量各 key 尺寸未知，须调用方显式限定）。
+func (c *Conn) GetBatch(ctx context.Context, keys []string, off, size int64) ([][]byte, func(), error) {
+	if len(keys) == 0 || size == 0 {
+		return nil, func() {}, nil
+	}
+	if off < 0 || size < 0 {
+		return nil, nil, ierr.ErrInvalidRange
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	st := c.newStream()
+
+	var bufs [][]byte // 各 key 汇入缓冲（未分配为 nil），release 时统一归还
+	disposed := false
+	release := func() {
+		if disposed {
+			return
+		}
+		disposed = true
+		for _, b := range bufs {
+			if b != nil {
+				bufpool.Put(b)
+			}
+		}
+		c.removeStream(st)
+	}
+	fail := func(err error) ([][]byte, func(), error) {
+		release()
+		return nil, nil, err
+	}
+
+	// 单流连发全部 GetReq：持 wmu 连发（writeFrameLocked 不做 Flush）后整批一次
+	// Flush，摊薄 Flush/waitFlush 固定开销。EncodeGetReq 每次分配新负载，WriteBinary
+	// 零拷贝引用安全（Flush 排空后即可复用）。
+	c.wmu.Lock()
+	for _, key := range keys {
+		if err := c.writeFrameLocked(st.id, protocol.OpGetReq, protocol.EncodeGetReq(key, off, size)); err != nil {
+			c.wmu.Unlock()
+			return fail(err)
+		}
+	}
+	err := c.c.Writer().Flush()
+	c.wmu.Unlock()
+	if err != nil {
+		return fail(err)
+	}
+
+	out := make([][]byte, len(keys))
+	bufs = make([][]byte, len(keys))
+	for k := range keys {
+		// 读第 k 个响应：逐帧直到 final（帧序即响应边界；语义镜像 Get 单响应）。
+		var resp []byte // 本次响应返回缓冲（汇入缓冲）
+		var buf []byte  // 本次响应汇入缓冲
+		var got int64
+	readResp: // Go gotcha：switch case 内的无标签 break 只跳出 switch；final 后必须跳出
+		// 本响应帧循环（否则会越界读到下一响应的帧，重则 exceeds、轻则挂死）。
+		for {
+			msg, err := c.await(ctx, st)
+			if err != nil {
+				return fail(err)
+			}
+			switch msg.op {
+			case protocol.OpGetData, protocol.OpGetDataFinal:
+				final := msg.op == protocol.OpGetDataFinal
+				rem := int64(msg.r.Len())
+				statRxFrames.Add(1)
+				statRxBytes.Add(rem)
+				if rem == protocol.ChunkSize {
+					statRxData4M.Add(1)
+				}
+				if rem > size-got {
+					msg.r.Release()
+					return fail(fmt.Errorf("taihu: get batch exceeds requested size"))
+				}
+				if buf == nil {
+					buf = bufpool.Get(int(size))
+					resp = buf[:size]
+				}
+
+				if rc, ok := msg.r.(interface{ ReadCopy([]byte) (int, error) }); ok {
+					statRxCopy.Add(1)
+					n, err := rc.ReadCopy(resp[got : got+rem])
+					if err != nil {
+						msg.r.Release()
+						return fail(err)
+					}
+					got += int64(n)
+				} else {
+					statRxCopy.Add(1)
+					p, err := msg.r.Next(int(rem))
+					if err != nil {
+						msg.r.Release()
+						return fail(err)
+					}
+					got += int64(copy(resp[got:], p))
+				}
+				msg.r.Release()
+				if final {
+					if got != size {
+						return fail(fmt.Errorf("taihu: get batch short read: got %d want %d", got, size))
+					}
+					out[k] = resp
+					bufs[k] = buf
+					break readResp
+				}
+			case protocol.OpGetErr:
+				code, rerr := protocol.ReadU32(msg.r)
+				msg.r.Release()
+				if rerr != nil {
+					return fail(rerr)
+				}
+				return fail(protocol.MapCode(protocol.ErrCode(code)))
+			default:
+				msg.r.Release()
+				return fail(fmt.Errorf("taihu: unexpected get batch frame op %d", msg.op))
+			}
+		}
+	}
+	return out, release, nil
+}
+
 // Delete 删除对象映射（key 不存在返回 ErrNotFound）。
 func (c *Conn) Delete(ctx context.Context, key string) error {
 	st := c.newStream()

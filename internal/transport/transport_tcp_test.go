@@ -336,6 +336,112 @@ func TestTCPMultiFrameRoundTrip(t *testing.T) {
 	}
 }
 
+// tcpBatchPayload 生成确定性负载：内容 = byte(i*13+k)，供批读内容校验。
+func tcpBatchPayload(k int, size int) []byte {
+	p := make([]byte, size)
+	for i := range p {
+		p[i] = byte(i*13 + k)
+	}
+	return p
+}
+
+// TestTCPGetBatchInflight 覆盖 GetBatch 单流多请求 pipeline：
+//   - Inflight>0 时对齐整块 4MiB 走 per-stream 异步流水线（提交不等待 + 按序排空写帧）；
+//   - Inflight>0 但 size 非 ChunkSize 整数倍（对齐）走排空在途后的同步路径；
+//   - Inflight==0 时整体退化为逐请求同步（批帧仍被 handleGetStream 正确消费）。
+// 验证响应帧按请求到达顺序一一对位（保序地基），且批读后连接/流仍健康。
+func TestTCPGetBatchInflight(t *testing.T) {
+	ctx := context.Background()
+
+	// 每个分支独立 server（inflight 4 / 0），各写 5 个 4MiB key + 5 个 1MiB key。
+	const (
+		bigN   = 5
+		bigSz  = protocol.ChunkSize
+		smallN = 5
+		smallSz = 1 << 20
+	)
+	run := func(t *testing.T, cfg PipelineConfig) {
+		st := tcpNewTestStorage(t)
+		addr := tcpServe(t, st, &cfg)
+		c := tcpDial(t, addr)
+
+		writeKeys := func(n int, size int64, prefix string) []string {
+			keys := make([]string, n)
+			for i := 0; i < n; i++ {
+				keys[i] = fmt.Sprintf("tcp/batch/%s/%d", prefix, i)
+				p := tcpBatchPayload(i, int(size))
+				if err := c.Put(ctx, keys[i], size, p); err != nil {
+					t.Fatalf("Put %s: %v", keys[i], err)
+				}
+			}
+			return keys
+		}
+		verify := func(keys []string, size int64, prefix string) {
+			out, rel, err := c.GetBatch(ctx, keys, 0, size)
+			if err != nil {
+				t.Fatalf("GetBatch %s: %v", prefix, err)
+			}
+			for i, key := range keys {
+				want := tcpBatchPayload(i, int(size))
+				if !bytes.Equal(out[i], want) {
+					t.Fatalf("GetBatch %s key=%s: content mismatch (batch 顺序/对位错误)", prefix, key)
+				}
+			}
+			rel()
+			// 批读后逐 key Get 仍正常（流已正确关闭，连接健康）。
+			for i, key := range keys {
+				got, relOne, err := c.Get(ctx, key, 0, size)
+				if err != nil || !bytes.Equal(got, tcpBatchPayload(i, int(size))) {
+					t.Fatalf("Get after batch %s key=%s: len=%d err=%v", prefix, key, len(got), err)
+				}
+				relOne()
+			}
+		}
+
+		bigKeys := writeKeys(bigN, bigSz, "big")
+		smallKeys := writeKeys(smallN, smallSz, "small")
+		verify(bigKeys, bigSz, "big")
+		verify(smallKeys, smallSz, "small")
+	}
+
+	t.Run("inflight=4", func(t *testing.T) {
+		run(t, PipelineConfig{Inflight: 4})
+	})
+	t.Run("inflight=0", func(t *testing.T) {
+		run(t, PipelineConfig{Inflight: 0})
+	})
+}
+
+// TestTCPGetBatchMultiChunk 覆盖 GetBatch 单请求多块（size 为 ChunkSize 整数倍，
+// 服务端逐块提交多个在途项）：整块跨多帧响应汇入同一缓冲，final 帧收尾。
+func TestTCPGetBatchMultiChunk(t *testing.T) {
+	st := tcpNewTestStorage(t)
+	addr := tcpServe(t, st, &PipelineConfig{Inflight: 4})
+	c := tcpDial(t, addr)
+	ctx := context.Background()
+
+	const nKeys = 3
+	size := int64(2 * protocol.ChunkSize) // 每个 key 读 8MiB = 两块
+	keys := make([]string, nKeys)
+	for i := 0; i < nKeys; i++ {
+		keys[i] = fmt.Sprintf("tcp/batch/mc/%d", i)
+		p := tcpBatchPayload(i, int(size))
+		if err := c.Put(ctx, keys[i], size, p); err != nil {
+			t.Fatalf("Put %s: %v", keys[i], err)
+		}
+	}
+	out, rel, err := c.GetBatch(ctx, keys, 0, size)
+	if err != nil {
+		t.Fatalf("GetBatch multi-chunk: %v", err)
+	}
+	for i, key := range keys {
+		if !bytes.Equal(out[i], tcpBatchPayload(i, int(size))) {
+			t.Fatalf("GetBatch multi-chunk key=%s: content mismatch", key)
+		}
+	}
+	rel()
+}
+
 // TestTCPPutValidation 覆盖 Put 的长度校验（客户端短路 + 服务端错误码）。
 func TestTCPPutValidation(t *testing.T) {
 	addr, st := tcpServerAndStorage(t)

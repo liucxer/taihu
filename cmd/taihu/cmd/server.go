@@ -64,6 +64,7 @@ var serverCmd = &cobra.Command{
 		writeWorkers, _ := cmd.Flags().GetInt("write-workers")
 		delBatch, _ := cmd.Flags().GetInt("del-batch")
 		delWorkers, _ := cmd.Flags().GetInt("del-workers")
+		tcpInflight, _ := cmd.Flags().GetInt("tcp-inflight")
 
 		if db == "" || dev == "" {
 			return fmt.Errorf("-db and -dev are required")
@@ -201,6 +202,7 @@ var serverCmd = &cobra.Command{
 			WriteWorkers:  writeWorkers,
 			DeleteBatch:   delBatch,
 			DeleteWorkers: delWorkers,
+			Inflight:      tcpInflight,
 		})
 
 		// 同机共享内存 IPC（shmipc）：unix socket 固定 /dev/<server-name>，与 TCP 监听并行（默认开启）。
@@ -302,6 +304,7 @@ func init() {
 	f.Int("batch", 0, "shm 批读批量：>0 启用\"多 stream 多 worker\"聚合批读（一次 io_submit 提交多个任务）；0 关闭")
 	f.Int("batch-workers", 8, "shm 批读 worker 池大小（并行批提交，K×batch 即整机在途批读数）")
 	f.Int("shm-inflight", 8, "每流在途异步读上限：>0 启用 per-stream 异步流水线（对齐整块 4MiB 读提交不等待、按序排空写帧，配合客户端单流多请求 pipeline；默认 8 开启，覆盖逐请求串行）；0 显式关闭（逐请求串行）。与 -batch 互斥，两者都 >0 时 -batch 优先")
+	f.Int("tcp-inflight", 0, "TCP 每流在途异步读上限：>0 启用 per-stream 异步读流水线（对齐整块 4MiB 读提交不等待、按序排空写帧，配合客户端 GetBatch 单流多请求 pipeline，把单流在途从 1 提升到 P，摊薄每请求固定开销）；0 关闭（逐请求串行，保持旧行为）")
 	f.Int("write-batch", 0, "写流水线批量：>0 启用整对象攒批写（一次 AppendBatch 排空 + 一次 BatchPutCommit）；0 关闭（逐请求串行）")
 	f.Int("write-workers", 4, "写流水线 worker 池大小（并行批提交;K×batch 即整机在途写对象数）")
 	f.Int("del-batch", 0, "删流水线批量：>0 启用批量删（一次 BatchDelete,per-key 结果独立）；0 关闭（逐请求串行）")

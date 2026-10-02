@@ -177,9 +177,32 @@ func (c *Conn) await(ctx context.Context, st *stream) (frameMsg, error) {
 	}
 }
 
+// tryAwait 非阻塞取本流的下一帧；无帧可读时返回 ok=false（不等待）。
+// 供流处理器在「无新请求可读仍有在途」时先排空在途再阻塞 await（防双方互等死锁）。
+func (c *Conn) tryAwait(st *stream) (frameMsg, bool) {
+	select {
+	case msg := <-st.in:
+		return msg, true
+	default:
+		return frameMsg{}, false
+	}
+}
+
 // writeFrame 串行写一帧。payload > 4K 时 WriteBinary 零拷贝引用原缓冲，
 // Flush 阻塞至输出排空（waitFlush），返回后调用方即可安全复用/归还 payload。
 func (c *Conn) writeFrame(sid uint32, op protocol.OpCode, payload []byte) error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if err := c.writeFrameLocked(sid, op, payload); err != nil {
+		return err
+	}
+	return c.c.Writer().Flush()
+}
+
+// writeFrameLocked 在调用方已持 wmu 时写一帧（帧统计 + 帧头 + 负载两段 WriteBinary），
+// 不做 Flush。批量连发场景（GetBatch 单流 P 个 GetReq）由调用方持锁连发后一次 Flush，
+// 摊薄 Flush/waitFlush 固定开销。
+func (c *Conn) writeFrameLocked(sid uint32, op protocol.OpCode, payload []byte) error {
 	statTxFrames.Add(1)
 	statTxBytes.Add(int64(len(payload)))
 	if op == protocol.OpGetData || op == protocol.OpGetDataFinal {
@@ -189,8 +212,6 @@ func (c *Conn) writeFrame(sid uint32, op protocol.OpCode, payload []byte) error 
 			statTxData4M.Add(1)
 		}
 	}
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
 	var hdr [4 + protocol.FrameHeaderLen]byte // len(4)+sid(4)+op(1)
 	binary.BigEndian.PutUint32(hdr[0:4], uint32(protocol.FrameHeaderLen+len(payload)))
 	binary.BigEndian.PutUint32(hdr[4:8], sid)
@@ -203,5 +224,5 @@ func (c *Conn) writeFrame(sid uint32, op protocol.OpCode, payload []byte) error 
 			return err
 		}
 	}
-	return c.c.Writer().Flush()
+	return nil
 }

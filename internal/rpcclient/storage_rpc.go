@@ -80,8 +80,14 @@ func (s *Storage) GetFd(ctx context.Context, key string, off, size int64) (int, 
 	return 0, 0, data, rel, err
 }
 
-// batchConn 可选接口：底层连接支持单流多请求批量读写时实现（仅 shm 连接；
-// TCP 连接无对应批量帧协议，不实现，Storage 逐 key 回退）。
+// batchGetter 可选接口：底层连接支持单流多请求批量读时实现。TCP（transport.Conn）
+// 与 shm（ShmConn）连接均已实现 GetBatch，Storage.GetBatch 优先走批量路径。
+type batchGetter interface {
+	GetBatch(ctx context.Context, keys []string, off, size int64) ([][]byte, func(), error)
+}
+
+// batchConn 可选接口：底层连接支持完整批量读写时实现（仅 shm 连接；TCP 仅支持
+// 批量读 GetBatch，见 batchGetter，其余批量操作逐 key 回退）。
 type batchConn interface {
 	GetBatch(ctx context.Context, keys []string, off, size int64) ([][]byte, func(), error)
 	GetFdBatch(ctx context.Context, keys []string, off, size int64) ([]*transport.FdBuf, func(), error)
@@ -99,12 +105,13 @@ func connGetFd(c rpcConn, ctx context.Context, key string, off, size int64) (int
 }
 
 // GetBatch 批量读取：在单条流上连发 len(keys) 个 Get 请求并读回全部响应（语义见
-// transport.ShmConn.GetBatch）。底层连接不支持批量（TCP）时在同连接上逐 key Get 回退。
+// transport.ShmConn.GetBatch / transport.Conn.GetBatch）。底层连接支持批量读
+// （TCP 与 shm 均已实现）时走批量路径；否则在同连接上逐 key Get 回退。
 // 返回 out[i] 对应 keys[i]；用毕必须调用返回的 release()（幂等）归还全部缓冲。
 func (s *Storage) GetBatch(ctx context.Context, keys []string, off, size int64) ([][]byte, func(), error) {
 	c := s.pick()
-	if bc, ok := c.(batchConn); ok {
-		return bc.GetBatch(ctx, keys, off, size)
+	if bg, ok := c.(batchGetter); ok {
+		return bg.GetBatch(ctx, keys, off, size)
 	}
 	out := make([][]byte, len(keys))
 	rels := make([]func(), len(keys))
