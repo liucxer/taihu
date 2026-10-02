@@ -14,7 +14,7 @@
 // sync.Pool 会在每次 GC 时清空其中的对象，导致 4M/8M 大缓冲被整批丢弃、
 // 每轮重走对齐分配（mallocgcLarge）与清零（memclr），实测读路径该冷分配
 // 约占服务端 CPU 36%。自管理 freelist 不受 GC 影响：大缓冲常驻长期复用，
-// 首次分配完成清零后，后续 Get 零分配、零清零；每桶以 maxKeep 上限约束驻留内存。
+// 首次分配完成清零后，后续 Get 零分配、零清零；每桶以字节预算约束驻留内存。
 package bufpool
 
 import (
@@ -28,9 +28,13 @@ const (
 	logBlockSize = 12
 	// maxBufBucket 覆盖到 2^33 = 8GB >= SegmentSizeBytes。
 	maxBufBucket = logBlockSize + 21 // 33，8GB
-	// maxKeep 每桶常驻缓冲数量上限：约束驻留内存（如 4M 桶 32×4M=128MB），
-	// 超出上限的归还缓冲直接丢弃交由 GC 回收。
-	maxKeep = 32
+	// numBuckets 桶数组档数：log 指数 12..33 共 22 档，桶索引范围 0..numBuckets-1。
+	numBuckets = maxBufBucket - logBlockSize + 1
+	// retainBudget 每桶常驻缓冲的字节预算上限：约束大桶驻留内存
+	// （如 8G 桶至多留存 1 个，而非固定 32 个 × 8G = 256GB）。
+	retainBudget = 128 << 20 // 128MB
+	// maxKeepCount 每桶常驻缓冲数量硬上限：约束小桶 freelist 指针切片膨胀。
+	maxKeepCount = 32
 )
 
 // bytePool 单桶 freelist：mu 串行化 Get/Put，LIFO 复用最近归还的缓冲（缓存热）。
@@ -41,14 +45,14 @@ type bytePool struct {
 
 // alignedBufPool 是对齐缓冲桶池，各桶独立 freelist，可并行 Get/Put。
 type alignedBufPool struct {
-	pools [maxBufBucket - logBlockSize + 1]*bytePool
+	pools [numBuckets]*bytePool
 }
 
 var pool = newAlignedPool()
 
-// newAlignedPool 一次性构建全部桶，避免运行期并发懒初始化（poolFor 写有时序竞态，
+// newAlignedPool 一次性构建全部桶，避免运行期并发懒初始化（懒初始化写有时序竞态，
 // netpoll 对齐分配器会让多个 goroutine 同时首次触达同一新桶而触发 -race）。此后
-// poolFor 退化为纯读，线程安全。
+// 桶数组退化为纯读，线程安全。
 func newAlignedPool() *alignedBufPool {
 	p := &alignedBufPool{}
 	for i := range p.pools {
@@ -77,7 +81,8 @@ func Put(buf []byte) {
 // bufBucket 返回 n 向上取 2 的幂（下限 4KB、上限 8GB）对应的桶索引。
 // 前置条件 n > 0：n<=0 时 uint64(n-1) 会下溢成 2^64-1，bits.Len64 得 64，
 // 算出的索引超出 pools 数组（曾表现为 Get(0) 索引越界 panic）。两个调用方
-// （Get 经 get、Put 经 put）均已在前置处挡住 n<=0。
+// （Get 经 get、Put 经 put）均已在前置处挡住 n<=0；超上限（索引 >= numBuckets）
+// 由 get/put 各自的对称边界保护挡下。
 func bufBucket(n int) int {
 	b := bits.Len64(uint64(n - 1)) // n>0 时向上取整 2 幂的指数
 	if b < logBlockSize {
@@ -86,11 +91,32 @@ func bufBucket(n int) int {
 	return b - logBlockSize
 }
 
+// keepFor 返回某尺寸桶的常驻上限：keep = clamp(retainBudget/size, 1, maxKeepCount)。
+// 小桶受数量硬上限约束（4K 桶留存 32 个），大桶受字节预算约束（8G 桶至多 1 个），
+// 使驻留内存与桶尺寸解耦、单桶不再随尺寸线性膨胀。
+func keepFor(size int) int {
+	if size <= 0 {
+		return 1
+	}
+	k := retainBudget / size
+	if k < 1 {
+		return 1
+	}
+	if k > maxKeepCount {
+		return maxKeepCount
+	}
+	return k
+}
+
 // get 返回 4K 对齐、len>=n 的缓冲。优先复用 freelist 尾部（LIFO），
 // 池空时才对齐分配一次（唯一一次清零成本）。
 func (p *alignedBufPool) get(n int) []byte {
 	b := bufBucket(n)
-	bp := p.poolFor(b)
+	if b >= numBuckets {
+		// 超出池上限（>8GB）：直接对齐分配，不池化（与 put 边界对称，避免越界）。
+		return alignedBuffer(n)
+	}
+	bp := p.pools[b]
 	bp.mu.Lock()
 	if m := len(bp.freelist); m > 0 {
 		buf := bp.freelist[m-1]
@@ -103,7 +129,7 @@ func (p *alignedBufPool) get(n int) []byte {
 }
 
 // put 将切片归还池：先按 cap 归一化到整桶容量（子切片也能回到正确桶），再入桶。
-// 桶内驻留达到 maxKeep 上限时丢弃该缓冲（交由 GC 回收），避免驻留内存无限增长。
+// 桶内驻留达到该桶字节预算上限时丢弃该缓冲（交由 GC 回收），避免驻留内存无限增长。
 func (p *alignedBufPool) put(buf []byte) {
 	if cap(buf) == 0 {
 		return
@@ -112,27 +138,18 @@ func (p *alignedBufPool) put(buf []byte) {
 		buf = buf[:cap(buf)]
 	}
 	b := bufBucket(len(buf))
-	if b > maxBufBucket-logBlockSize {
+	if b >= numBuckets {
 		return
 	}
-	bp := p.poolFor(b)
+	keep := keepFor(int(int64(1) << uint(b+logBlockSize)))
+	bp := p.pools[b]
 	bp.mu.Lock()
-	if len(bp.freelist) < maxKeep {
+	if len(bp.freelist) < keep {
 		bp.freelist = append(bp.freelist, buf)
 		bp.mu.Unlock()
 		return
 	}
 	bp.mu.Unlock()
-}
-
-// poolFor 懒初始化获取桶（并发调用幂等，可能重复建桶但无正确性影响）。
-func (p *alignedBufPool) poolFor(b int) *bytePool {
-	bp := p.pools[b]
-	if bp == nil {
-		bp = new(bytePool)
-		p.pools[b] = bp
-	}
-	return bp
 }
 
 // alignedBuffer 返回长度 n 且首地址按 4K 对齐的字节切片，
@@ -153,15 +170,45 @@ func alignedBuffer(n int) []byte {
 
 // ---------- 精确尺寸对齐池（零拷贝 Take 收流节点/移交缓冲共用） ----------
 
-// exactSizePool 按 len（==cap）分桶的精确尺寸对齐池：容量不按 2 幂取整。
-// 服务对象是 netpoll 收流节点与客户端 Get 零拷贝移交缓冲：两者容量一致（=帧长），
-// 节点缓冲经 TakeTry 移交后由调用方 PutExact 归还，即可被后续 Get/收流节点复用。
-type exactSizePool struct {
-	mu       sync.Mutex
-	freelist map[int][][]byte
+// exactSizeShards 精确尺寸池分片数。分片锁把原先「单 map + 单全局锁」
+// 在收流热路径上的全局竞争拆到各分片。
+const exactSizeShards = 16
+
+// exactSizeShard 一个精确尺寸分片：独立互斥锁 + 按尺寸分桶的 freelist。
+type exactSizeShard struct {
+	mu   sync.Mutex
+	list map[int][][]byte
 }
 
-var exactPool = &exactSizePool{freelist: make(map[int][][]byte)}
+// exactSizePool 按 len（==cap）精确尺寸分桶的对齐池：容量不按 2 幂取整。
+// 服务对象是 netpoll 收流节点与客户端 Get 零拷贝移交缓冲：两者容量一致（=帧长，
+// 由 netpoll 自适应 book 决定、上限 InputNodeSize≈4MiB）。节点缓冲经 TakeTry 移交后
+// 由调用方 PutExact 归还，即可被后续 Get/收流节点复用。
+//
+// 实现说明：沿用 freelist 直接持有 []byte（而非 sync.Pool）—— 帧长可达数 MB，
+// sync.Pool 每轮 GC 清空会导致大缓冲冷分配 + memclr（与 aligned 池同样的取舍）；
+// 分片锁仅用于消除全局锁竞争，不影响 GC 抗性。
+type exactSizePool struct {
+	shards [exactSizeShards]exactSizeShard
+}
+
+var exactPool = newExactSizePool()
+
+// newExactSizePool 预建全部分片及其尺寸表，避免运行期并发懒初始化竞态。
+func newExactSizePool() *exactSizePool {
+	p := &exactSizePool{}
+	for i := range p.shards {
+		p.shards[i].list = make(map[int][][]byte)
+	}
+	return p
+}
+
+// shardFor 按尺寸散列选分片：用乘法散列，避免 2 的幂尺寸（帧长多为 2 的幂）
+// 全部落到同一下标。
+func (p *exactSizePool) shardFor(n int) *exactSizeShard {
+	h := uint32(n) * 2654435761 // Knuth 乘法散列常数
+	return &p.shards[h%exactSizeShards]
+}
 
 // GetExact 返回 4K 对齐、len==n、cap==n 的精确尺寸缓冲（不按 2 幂取整）。
 // n<=0 返回 nil。供 netpoll 收流节点（book 一帧一节点）与 Get 移交缓冲共用。
@@ -169,14 +216,15 @@ func GetExact(n int) []byte {
 	if n <= 0 {
 		return nil
 	}
-	exactPool.mu.Lock()
-	if fl := exactPool.freelist[n]; len(fl) > 0 {
+	sh := exactPool.shardFor(n)
+	sh.mu.Lock()
+	if fl := sh.list[n]; len(fl) > 0 {
 		buf := fl[len(fl)-1]
-		exactPool.freelist[n] = fl[:len(fl)-1]
-		exactPool.mu.Unlock()
+		sh.list[n] = fl[:len(fl)-1]
+		sh.mu.Unlock()
 		return buf
 	}
-	exactPool.mu.Unlock()
+	sh.mu.Unlock()
 	return alignedBuffer(n)
 }
 
@@ -192,10 +240,10 @@ func PutExact(buf []byte) {
 		buf = buf[:cap(buf)]
 	}
 	n := len(buf)
-	exactPool.mu.Lock()
-	fl := exactPool.freelist[n]
-	if len(fl) < maxKeep {
-		exactPool.freelist[n] = append(fl, buf)
+	sh := exactPool.shardFor(n)
+	sh.mu.Lock()
+	if fl := sh.list[n]; len(fl) < keepFor(n) {
+		sh.list[n] = append(fl, buf)
 	}
-	exactPool.mu.Unlock()
+	sh.mu.Unlock()
 }
