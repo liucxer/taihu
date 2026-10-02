@@ -4,8 +4,8 @@
 
 核心设计取向：**O_DIRECT 裸盘直写直读 + 异步 IO + 全程零拷贝**，配合纯 Go 元数据层（Pebble）与共享内存（shmipc）同机加速，追求极致的端到端读写带宽。
 
-> 设计迭代详见 **[doc/README.md](doc/README.md)**（57 篇文档的索引，逐篇标注【现行】/【历史存档】）：
-> `设计文档_v1/v2/v3` 与 segment 级 GC、Compaction、集群支持等专项设计，以及 46 篇读写性能测试报告。
+> 设计迭代详见 **[doc/README.md](doc/README.md)**（75 篇文档的索引，逐篇标注【现行】/【历史存档】）：
+> `设计文档_v1/v2/v3` 与 segment 级 GC、Compaction、集群支持等专项设计，以及 63 篇读写性能测试报告。
 
 ---
 
@@ -89,7 +89,7 @@ doc/                  README.md 是全目录索引；下分 设计文档 / 性�
 
 目录骨架对齐 [golang-standards/project-layout](https://github.com/golang-standards/project-layout)
 （`cmd/`、`internal/`、`pkg/`、`third_party/`、`scripts/`、`configs/`、`Makefile`）。
-文档目录采用 `doc/` 而非标准的 `docs/`，属有意取舍：57 篇文档互相引用相对链接，改名会造成全量断链。
+文档目录采用 `doc/` 而非标准的 `docs/`，属有意取舍：75 篇文档互相引用相对链接，改名会造成全量断链。
 
 对外公共接口（[pkg/taihu-client/reexport.go](pkg/taihu-client/reexport.go)）：`ObjectStore` 类型（type alias，定义见 [internal/rpcclient/objectstore.go](internal/rpcclient/objectstore.go)）声明 `Put / Get / Delete / Stat / Close`，唯一实现是本包 `Storage`（集群路由）；调用方持该接口即可泛化访问 taihu 集群。
 
@@ -216,8 +216,8 @@ taihu --pd 10.0.0.10:2379 instance segments --instance TAIHU-0 --detail   # 段�
 
 ## 相关文档
 
-- **[doc/README.md](doc/README.md) —— 全部 57 篇文档的索引与状态标注**：10 篇设计文档 +
-  46 篇性能测试报告（按主题分了系列，每系列标明「现行结论看哪一篇」）+ 1 篇部署记录。
+- **[doc/README.md](doc/README.md) —— 全部 75 篇文档的索引与状态标注**：11 篇设计文档 +
+  63 篇性能测试报告（按主题分了系列，每系列标明「现行结论看哪一篇」）+ 1 篇部署记录。
   逐篇标注【现行】/【部分被取代】/【历史存档】，并注明标注所依据的原文。
 
 先看这几篇就够：
