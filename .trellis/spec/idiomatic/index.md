@@ -13,10 +13,10 @@
 
 | 写法 | 出现次数 | 判定 |
 |---|---|---|
-| `ClientID` | 14 | ✅ |
+| `ClientID` | 25 | ✅ |
 | `ClientId` | **0** | ✅ 没有人写成驼峰变体 |
 
-**要点**：`ID`（26 处）、`JSON`（19 处）、`API`（3 处）这类缩写**一律全大写**。`Id` / `Json` / `Api` 是错。
+**要点**：`ID`、`JSON`、`API` 这类缩写**一律全大写**。2026-10-02 按**独立缩写词**口径实测（`grep -rhoE '\bID\b'`，排除测试文件）：`ID` 38 处、`JSON` 26 处、`API` 6 处；`Id` / `Json` / `Api` 是错。（注：旧版 26/19/3 是「标识符后缀」口径，两种口径不要混用，文末核查脚本用的是独立词口径。）
 
 **包名**：本仓库包名一律小写单词，无下划线、无驼峰。注意**目录名与包名可以不同**：`pkg/taihu-client/` 的包名是 `taihuclient`（目录用连字符、包名不能有连字符）。
 
@@ -33,7 +33,7 @@
 
 **「删掉无信息量的注释」在本仓库的具体含义**：`// 增加 i` 这类复述代码的注释不要；但**解释约束、时序、陷阱的注释必须有**。判据是：**删掉这行注释，下一个人会不会踩坑？** 会 → 留着。
 
-本仓库最该留的那类注释的例子：`internal/aio/aio_fallback_other.go:105-109` 那一段（解释为什么**绝不能**用 `os.NewFile(fd)` 包装后再丢——会给调用方持有的同一个 fd 挂 finalizer，GC 一跑就关掉别人的 fd）。
+本仓库最该留的那类注释的例子：`internal/aio/ring_fallback_other.go:105-109` 那一段（解释为什么**绝不能**用 `os.NewFile(fd)` 包装后再丢——会给调用方持有的同一个 fd 挂 finalizer，GC 一跑就关掉别人的 fd）。
 
 ### gbp-031 · Interface Design (Small Interfaces First)（HIGH）— **适用**
 
@@ -42,14 +42,14 @@
 **对 taihu：适用，且本仓库有大量正例。** 编译期断言实测 8 处：
 
 ```go
-internal/cluster/kv_tikv.go:30           var _ KV = (*TiKVKV)(nil)
-internal/cluster/kv_mem.go:16            var _ KV = (*MemoryKV)(nil)
-internal/transport/protocol/protocol.go:191  var _ ByteReader = netpoll.Reader(nil)
-internal/transport/protocol/protocol.go:192  var _ ByteReader = (*SliceReader)(nil)
-internal/rpcclient/objectstore.go:37     var _ ObjectStore = (*Storage)(nil)
-internal/metastore/kv_pebble.go:31       var _ Store = (*pebbleStore)(nil)
-pkg/taihu-client/storage.go:49           var _ rpcclient.ObjectStore = (*Storage)(nil)
-examples/taihu-client/main.go:40         var _ clusterClient = (*taihuclient.Storage)(nil)
+internal/cluster/kv_tikv.go:30              var _ KV = (*TiKVKV)(nil)
+internal/cluster/kv_mem.go:16               var _ KV = (*MemoryKV)(nil)
+internal/transport/protocol/protocol.go:191 var _ ByteReader = netpoll.Reader(nil)
+internal/transport/protocol/protocol.go:192 var _ ByteReader = (*SliceReader)(nil)
+internal/rpcclient/objectstore.go:37        var _ ObjectStore = (*Storage)(nil)
+internal/metastore/kv_pebble.go:23          var _ Store = (*pebbleStore)(nil)
+pkg/taihu-client/storage.go:50              var _ rpcclient.ObjectStore = (*Storage)(nil)
+examples/taihu-client/main.go:41            var _ clusterClient = (*taihuclient.Storage)(nil)
 ```
 
 **注意 `internal/transport/protocol/protocol.go:191` 那处的形态与其余 7 处不同**：它断言的是**标准库/上游类型** `netpoll.Reader` 满足本地接口 `ByteReader`，其余断言的是本仓库自己的类型满足接口。两者都是断言，但 `netpoll.Reader(nil)` 是**类型转换写法**而非 `(*T)(nil)`——统计时不要把这一处当成「类型转换」误判掉。
@@ -60,17 +60,18 @@ examples/taihu-client/main.go:40         var _ clusterClient = (*taihuclient.Sto
 
 **规则**：接收者命名 1-2 字母（`c` / `r` / `b`），**同一类型指针/值接收者不要混用**；反例是 `func (this *Consumer)` / `func (self *Reader)`。
 
-**对 taihu：适用，当前符合。** 实测接收者命名分布：
+**对 taihu：适用，当前符合。** 2026-10-02 实测接收者命名分布（含 examples，排除测试；旧版只扫 internal/cmd/pkg，数字勿跨口径比较）：
 
 | 字母 | 次数 | | 字母 | 次数 |
 |---|---|---|---|---|
-| `s` | 114 | | `a` | 12 |
-| `c` | 51 | | `p` | 10 |
-| `r` | 44 | | `w` | 7 |
-| `k` | 30 | | `b` | 6 |
-| `m` | 28 | | `it` / `rc` | 5 / 4 |
-| `d` | 18 | | （其余） | ≤4 |
-| `f` | 13 | | | |
+| `s` | 159 | | `a` | 14 |
+| `c` | 70 | | `p` | 10 |
+| `r` | 44 | | `b` | 8 |
+| `m` | 42 | | `it` | 5 |
+| `f` | 36 | | `t` / `rc` / `ch` | 4 / 4 / 4 |
+| `k` | 31 | | （其余） | ≤3 |
+| `w` | 22 | | | |
+| `d` | 21 | | | |
 
 **要点一**：`this` / `self` / `me` **零出现**——不要引入。
 **要点二**：同一类型的接收者字母**恒定**。`*Storage` 的方法全用 `s`，`*Client` 全用 `c`；换一个方法改成 `st` 是违规。
@@ -80,14 +81,14 @@ examples/taihu-client/main.go:40         var _ clusterClient = (*taihuclient.Sto
 
 **规则**：结构体初始化**一律用字段名**，不用位置字面量；反例是 `User{"John", "john@example.com", 25, true}` 依赖字段顺序。
 
-**对 taihu：适用，当前符合。** 本 spec 曾记下一处真实偏离，现已订正——`internal/aio/aio_uring_params_linux.go` 原有 17 处位置式字面量，全部补上字段名：
+**对 taihu：适用，当前符合（0 处）。** 本 spec 曾记下一处真实偏离，现已订正并在文件布局重构中被**重写了一遍**——旧文件 `aio_uring_params_linux.go`（已删除，勿按此路径查找）里的 17 处位置式字面量，现位于 `internal/aio/ring_uring_linux.go` 且**全部带字段名**：
 
-| 原位置 | 条数 | 原形态 |
+| 现位置 | 条数 | 现形态 |
 |---|---|---|
-| `internal/aio/aio_uring_params_linux.go`（`uringRingFields`） | 13 | `{"sq_off.head", true, p.SQOff.Head, 4}`（4 字段） |
-| `internal/aio/aio_uring_params_linux.go`（`verifyUringRing` 内匿名校验 struct） | 4 | `{"sq_off.ring_mask", u32At(...), p.SQEntries - 1}`（3 字段） |
+| `internal/aio/ring_uring_linux.go:160-172`（`uringRingFields` 表） | 13 | `{name: "sq_off.head", sq: true, off: p.SQOff.Head, width: 4}` |
+| `internal/aio/ring_uring_linux.go:210-213`（`verifyUringRing` 内匿名校验 struct） | 4 | `{name: "sq_off.ring_mask", got: u32At(...), want: p.SQEntries - 1}` |
 
-**它当初为什么是问题**：这些字面量的字段顺序**必须**与 `uringRingField` 的定义一致；一旦有人调整了结构体字段顺序，这 17 处会**静默错位**——字段类型恰好都能兼容时编译器不会报错，运行时的断言就成了假的。而 `aio_uring_params_linux.go` 恰恰是靠这组断言校验 io_uring 结构体布局的，断言本身错了比没有断言更糟。**新增同类表时必须带字段名。**
+**它当初为什么是问题**：这些字面量的字段顺序**必须**与结构体定义一致；一旦有人调整字段顺序，这 17 处会**静默错位**——字段类型恰好都能兼容时编译器不会报错，运行时的断言就成了假的。而这里恰恰是靠这组断言校验 io_uring 结构体布局的，断言本身错了比没有断言更糟。重构后（commit `5dc2294` 起的 aio 文件布局收敛，旧文件已删除）两表都改为字段名形式，**新增同类表必须带字段名。**
 
 核实命令：见本文件末尾的「核查脚本」（现应为 0 处）。
 
@@ -97,10 +98,10 @@ examples/taihu-client/main.go:40         var _ clusterClient = (*taihuclient.Sto
 
 **对 taihu：适用，本仓库主流正是这个形态**：
 
-- `internal/storage/storage.go:31` — `NewStorage(ctx, rocksdbDir, nvmePath, l, opts ...Option)`
-- `internal/device/device.go:74` — `NewDevice(ctx, nvmePath, segSize, opts ...Option)`
+- `internal/storage/storage.go:40` — `NewStorage(ctx, rocksdbDir, nvmePath, l, opts ...Option)`
+- `internal/device/device.go:73` — `NewDevice(ctx, nvmePath, segSize, opts ...Option)`
 
-**已知的一处不一致**：`internal/aio` 用的是 `Options` **结构体**（`NewWithOptions(maxEvents int, o Options)`），不是变参 `Option`。
+**已知的一处不一致**：`internal/aio` 用的是 `Options` **结构体**（`internal/aio/aio.go:149` 的 `NewWithOptions(o Options, devPath string)`），不是变参 `Option`。
 
 **本 spec 不裁定这个不一致**（两种都是合法设计，结构体形态在参数少且必填时更清晰），但**要知道它是个例外**——新写配置 API 时默认用变参 `Option`，用结构体要能说出理由。
 
@@ -108,11 +109,11 @@ examples/taihu-client/main.go:40         var _ clusterClient = (*taihuclient.Sto
 
 **规则**：用 `defer` 做资源释放与解锁；注意 LIFO 顺序、参数在 `defer` 时求值（`defer fmt.Println(i)` 打印的是当时的 `i`）、循环内 `defer` 会累积需抽成独立函数。
 
-**对 taihu：适用。** `defer` 的非测试出现数是 **138**（含测试为 330）——核实命令：`grep -rnE '^[[:space:]]*defer ' --include='*.go' internal cmd pkg | grep -v _test.go`。**注意用这条命令**：`grep -rn 'defer '` 不加行首锚点会把注释与字符串里的 "defer" 也算进去，而 `\b` 在 BSD grep 上不可靠。
+**对 taihu：适用。** `defer` 的非测试出现数是 **170**（含测试为 422；含 examples）——核实命令：`grep -rnE '^[[:space:]]*defer ' --include='*.go' internal cmd pkg examples | grep -v _test.go`。**注意用这条命令**：`grep -rn 'defer '` 不加行首锚点会把注释与字符串里的 "defer" 也算进去，而 `\b` 在 BSD grep 上不可靠。
 
 **要点一**：`Lock()` 后**立刻** `defer Unlock()`。手写 `Unlock` 只在有**必须提前解锁的分支**时可接受，且每条返回路径都要覆盖——见 [concurrency/](../concurrency/index.md) 的 gbp-027。
 
-**要点二（本仓库踩过的坑）**：`defer` 在**循环内**会累积到函数返回才执行。`internal/aio` 的 `SubmitReadBatch` 一族是循环提交，若在循环里 `defer` 释放资源，会在批大小 4096 时一口气攒 4096 个待释放对象。
+**要点二（本仓库踩过的坑）**：`defer` 在**循环内**会累积到函数返回才执行。`SubmitReadBatch` 一族（三个后端各一份，如 `internal/aio/ring_uring_linux.go:489`、`internal/aio/ring_libaio_linux.go:86`）是循环提交，若在循环里 `defer` 释放资源，会在大批处理时一口气攒上千个待释放对象。
 
 **要点三**：用 `t.Cleanup` 而不是 `defer` 的场景见 [testing/](../testing/index.md) 的 gbp-043。
 
@@ -124,7 +125,7 @@ examples/taihu-client/main.go:40         var _ clusterClient = (*taihuclient.Sto
 
 上游原文断言「**边遍历边 `delete` 是未定义行为**，需先收集 key」。**这是错的**：Go 语言规范明确允许在 `range` 期间删除元素（只是**新增**的条目不保证被遍历到）。
 
-**为什么必须剔除**：照抄这半句会把本仓库**正确**的代码判成违规——`internal/cluster/kv_mem.go:52`、`internal/aio/aio_fallback_other.go:161`、`internal/device/device.go:161` 都有在 `range` 中 `delete` 的正确写法。
+**为什么必须剔除**：照抄这半句会把本仓库**正确**的代码判成违规——`internal/cluster/kv_mem.go:52`、`internal/aio/ring_fallback_other.go:161`、`internal/device/device.go:154` 都有在 `range` 中 `delete` 的正确写法。
 
 **保留的是前半**：预分配。见 [performance/](../performance/index.md) 的 gbp-048。
 
@@ -134,7 +135,7 @@ examples/taihu-client/main.go:40         var _ clusterClient = (*taihuclient.Sto
 
 **对 taihu：适用。**
 
-**要点一**：本仓库大量使用零值可用的并发原语（22 个 `sync.Mutex` / `RWMutex` 字段多数嵌在结构体里，靠零值就绪）。**新增锁字段不要写构造函数初始化它**——那就等于说它的零值不可用。
+**要点一**：本仓库大量使用零值可用的并发原语（23 个 `sync.Mutex` / `RWMutex` 字段含个别同模式局部变量，多数嵌在结构体里，靠零值就绪）。**新增锁字段不要写构造函数初始化它**——那就等于说它的零值不可用。
 
 **要点二**：本仓库的锁多数**不内嵌**而是命名（`mu sync.Mutex`），这一点与 gbp-027 的「不要内嵌」一致。
 
@@ -162,12 +163,12 @@ examples/taihu-client/main.go:40         var _ clusterClient = (*taihuclient.Sto
 
 | 类别 | 数量 | 位置 |
 |---|---|---|
-| 编译期断言 | 6 | `internal/aio/aio_uring_uapi_linux.go:112-117`，形态 `_ = [1]byte{}[unsafe.Sizeof(ioUringSQE{})-ioUringSQESize]` |
-| error 丢弃 | 6 | `unix.Close` ×2：`internal/aio/probe_linux.go:31`、`internal/aio/aio_uring_linux.go:122`。`unix.Munmap` ×4：`internal/aio/aio_uring_linux.go:173`、`internal/aio/aio_uring_linux.go:214`、`internal/aio/aio_uring_linux.go:217`、`internal/aio/aio_uring_linux.go:220` |
+| 编译期断言 | 6 | `internal/aio/ring_uring_linux.go:135-140`，形态 `_ = [1]byte{}[unsafe.Sizeof(ioUringSQE{})-ioUringSQESize]` |
+| error 丢弃 | 6 | `unix.Close` ×2：`internal/aio/probe_linux.go:33`（`defer func` 内）、`internal/aio/ring_uring_linux.go:341`。`unix.Munmap` ×4：`internal/aio/ring_uring_linux.go:392`、`:433`、`:436`、`:439` |
 
 **断言那 6 处的形态要注意**：它**不是** `_ = unsafe.Sizeof(...)`（那样写不构成断言，编译器会直接优化掉），而是 `_ = [1]byte{}[size - want]` ——**用数组下标越界把「结构体大小不符」变成编译错误**。用 `grep '_ = unsafe.Sizeof'` 找它们是找不到的（命中 0）。
 
-全仓非测试 `_ = ` 共 **139** 处（`grep -rn '_ = ' --include='*.go' internal pkg cmd | grep -v _test.go`）。
+全仓非测试 `_ = ` 共 **166** 处（`grep -rn '_ = ' --include='*.go' internal pkg cmd examples | grep -v _test.go`）。
 
 ---
 
@@ -176,20 +177,23 @@ examples/taihu-client/main.go:40         var _ clusterClient = (*taihuclient.Sto
 本层涉及的两类机械核查，用下面的脚本一次跑完（仓库根执行）：
 
 ```bash
-# gbp-029：缩写写法（应全大写）
-for w in ClientID ClientId ServerID ServerId HTTPUrl HTTPURL; do
-  printf '%-10s %s\n' "$w" "$(grep -rhoE "\b$w\b" --include='*.go' internal pkg cmd | wc -l)"
+# gbp-029：缩写写法（应全大写；独立缩写词口径）
+for w in ClientID ClientId; do
+  printf '%-10s %s\n' "$w" "$(grep -rhoE "\b$w\b" --include='*.go' internal pkg cmd examples | wc -l)"
+done
+for w in ID JSON API; do
+  printf '%-6s %s\n' "$w" "$(grep -rhoE "\b$w\b" --include='*.go' internal pkg cmd examples | grep -v _test.go | wc -l)"
 done
 
 # gbp-032：接收者命名（应全是 1-2 字母）
-grep -rhoE '^func \([a-zA-Z_]+ \*?[A-Za-z]+\)' --include='*.go' internal pkg cmd \
+grep -rhoE '^func \([a-zA-Z_]+ \*?[A-Za-z]+\)' --include='*.go' internal pkg cmd examples \
   | grep -v _test | sed -E 's/^func \(([a-zA-Z_]+) .*/\1/' | sort | uniq -c | sort -rn
 
-# gbp-031：编译期断言清单
-grep -rn 'var _ [A-Za-z.]* = ' --include='*.go' internal pkg cmd | grep -v _test.go
+# gbp-031：编译期断言清单（2026-10-02：8 条真断言；objectstore.go:15 是注释，不计）
+grep -rn 'var _ [A-Za-z.]* = ' --include='*.go' internal pkg cmd examples | grep -v _test.go
 
 # gbp-033：位置式结构体字面量（应为 0 处）
 # 模式只锚到第一个字段就停 —— `{` 之后可能是 true/false，也可能是 u32At(...)
 # 早先写成 `\{"[a-z_.]+", (true|false),` 只能命中 13 处，漏掉匿名校验 struct 那 4 条
-grep -rnE '\{"[a-z_.]+", ' --include='*.go' internal cmd pkg | grep -v _test.go
+grep -rnE '\{"[a-z_.]+", ' --include='*.go' internal cmd pkg examples | grep -v _test.go
 ```

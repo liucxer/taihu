@@ -22,21 +22,21 @@ Makefile  README.md  LICENSE  go.mod  go.sum  AGENTS.md
 |---|---|---|
 | `/cmd` | ✅ `cmd/taihu/` | 适用，见下 |
 | `/internal` | ✅ `internal/` | 适用，见下 |
-| `/pkg` | ✅ `pkg/taihu-client/` | 适用，见下 |
+| `/pkg` | ✅ `pkg/ierr/` + `pkg/taihu-client/` | 适用（语义收窄），见下 |
 | `/configs` | ✅ `configs/` | 适用，见下 |
 | `/scripts` | ✅ `scripts/` | 适用，见下 |
 | `/test` | ✅ `test/e2e/` | 适用，见下 |
 | `/examples` | ✅ `examples/` | 适用 |
 | `/third_party` | ✅ `third_party/shmipc-go/` | 适用 |
-| `/docs` | ⚠️ `doc/`（单数） | **既有例外**，见下 |
+| `/doc` 对应 `/docs` | ⚠️ `doc/`（单数） | **既有例外**，见下 |
+| `/web` | ⚠️ 前端在 `internal/web/static/` | **不设顶层 `/web`**，见下 |
 | `/api` | ❌ 无 | 不适用（无 OpenAPI/JSON schema/协议定义文件） |
-| `/web` | ❌ 无 | 不适用（无 Web 前端、无模板、无 SPA） |
 | `/init` | ❌ 无 | 不适用（无 systemd/supervisord 配置入库） |
 | `/build` | ❌ 无 | 不适用（无容器/发行包配置、无 CI 配置） |
 | `/deployments` | ❌ 无 | 不适用（部署配置不入库，见下） |
 | `/tools` | ❌ 无 | 不适用（无 Go 支持工具；Python 运维脚本归 `/scripts`，见下） |
 | `/githooks` | ❌ 无 | 不适用（无 git hooks） |
-| `/assets` | ❌ 无 | 不适用（无图片/logo 等静态资产） |
+| `/assets` | ❌ 无 | 不适用（无图片/logo 等静态资产；唯一的前端资产内嵌于 `internal/web/static/`） |
 | `/website` | ❌ 无 | 不适用（无独立站点） |
 | `/vendor` | ❌ 无 | 不适用（用 module proxy，见下） |
 | **`/src`** | ❌ 无 | ✅ **本条是禁令，本仓库遵守**，见下 |
@@ -76,9 +76,9 @@ func main() { os.Exit(run(os.Args[1:])) }
 
 目录名 `cmd/taihu/` 与可执行文件名 `taihu` 一致 ✓。
 
-**⚠️ 一处需要说明的张力：`cmd/taihu/cmd/` 有 2469 行非测试代码。**
+**⚠️ 一处需要说明的张力：`cmd/taihu/cmd/` 有 3036 行非测试代码（2026-10-02 数；含 `web.go` 管理面装配）。**
 
-严格按「不要把大量代码放进应用目录」读，这 2469 行是超标的。**本 spec 的裁决是保留现状**，理由：
+严格按「不要把大量代码放进应用目录」读，这 3036 行是超标的。**本 spec 的裁决是保留现状**，理由：
 
 1. `/cmd` 那条规则的**判据**是它自己给的——「代码能否被别的项目 import？能 → `/pkg`；不能且不想被别人复用 → `/internal`」。`cmd/taihu/cmd/` 里的内容是 **CLI 命令定义**（`key.go` / `cluster.go` / `bench_*.go` 等），**没有外部调用方**，属于「不想被复用」。
 2. 按第 1 条的判据，它确实**可以**移到 `/internal`。但它是 **CLI 的表示层**——`root.go` 定义 cobra 命令树、`server.go` 定义启动参数、`helpers.go` 定义输出格式。放进 `internal/` 会让「引擎内部机制」与「命令行界面」混在同一个目录下，反而削弱 `internal/` 按机制分层的清晰度（见 [ddd/](../ddd/index.md) 对分层的那段）。
@@ -90,9 +90,9 @@ func main() { os.Exit(run(os.Args[1:])) }
 
 **规则**：私有代码，Go 编译器强制不可外部导入；可按需加 `internal/app`（应用）与 `internal/pkg`（共享私有库）的细分，**但这是可选的、不是必须的**。
 
-**对 taihu：适用。** `internal/{aio,benchkit,bufpool,cluster,device,ierr,layout,metastore,rpcclient,storage,transport,version}` 扁平一层，**不采用 `internal/app` + `internal/pkg` 的细分**——project-layout 原文写明「It's not required (especially for smaller projects)」，本仓库有 Makefile 门禁保证依赖方向（见 [ddd/](../ddd/index.md)），细分不带来额外保证。
+**对 taihu：适用。** `internal/{aio,benchkit,bufpool,cluster,device,layout,metastore,rpcclient,storage,transport,version,web}` 扁平一层，**不采用 `internal/app` + `internal/pkg` 的细分**——project-layout 原文写明「It's not required (especially for smaller projects)」，本仓库有 Makefile 门禁保证依赖方向（见 [ddd/](../ddd/index.md)），细分不带来额外保证。
 
-**`internal/` 的语义在本仓库比 project-layout 说的更强**：它不只是「不想被外部导入」，还是 **Makefile 两条门禁的管辖范围**——`internal/` 不得依赖 `pkg/`。**新增包时要知道自己进了这个管辖范围。**
+**`internal/` 的语义在本仓库比 project-layout 说的更强**：它不只是「不想被外部导入」，还是 **Makefile 两条门禁的管辖范围**——`internal/` 不得依赖 `pkg/`（唯一例外 `pkg/ierr`，理由见下节）。**新增包时要知道自己进了这个管辖范围。**
 
 ### `/pkg` — 适用，但本仓库的语义比规则更窄
 
@@ -100,13 +100,20 @@ func main() { os.Exit(run(os.Args[1:])) }
 
 **对 taihu：适用，且本仓库把范围收得更窄。**
 
-`pkg/` 下**只有一个包**：`pkg/taihu-client/`（包名 `taihuclient`，目录名带连字符、包名不能带）。
+`pkg/` 下**只有两个包**，分两类：
 
-**本仓库对 `/pkg` 的约束严于 project-layout**：project-layout 只说「外部可用的库」，本仓库另有 `check-sdk-only` 门禁——**`pkg/` 不得直接依赖存储引擎**（`internal/{storage,device,aio,bufpool,layout}`，测试除外），只应依赖 `transport` / `cluster` / `metastore` / `ierr` / `version`。
+| 包 | 类别 | 为什么在 pkg/ |
+|---|---|---|
+| `pkg/taihu-client/`（包名 `taihuclient`） | 对外 SDK | 外部调用方唯一入口 |
+| `pkg/ierr/` | 引擎与 SDK **共享的错误事实源** | SDK 库代码直接 import（`pkg/taihu-client/storage.go:14`），外部调用方用同一批 sentinel `errors.Is`；它是 `check-layering` 允许 `internal/ → pkg/` 的**唯一例外** |
+
+**本仓库对 `/pkg` 的约束严于 project-layout**：project-layout 只说「外部可用的库」，本仓库另有 `check-sdk-only` 门禁——`pkg/` 不得直接依赖存储引擎（`internal/{storage,device,aio,bufpool,layout}`，测试除外），SDK 库代码只应依赖 `internal/{cluster,rpcclient,version}` 与 `pkg/ierr`。
 
 **这条约束的方向是不可逆的**：一旦 `pkg/` 依赖了引擎内部，SDK 就被绑死在服务端实现上，外部调用方也就继承了那层依赖。
 
-**所以新增 `pkg/` 下的包之前要问**：它是不是**面向外部调用方**的？不是 → 放 `internal/`。判据与门禁一致，不是风格偏好。
+**一个来回过的先例（新增 pkg 包前必读）**：`bufpool` 2026-09-24 曾以「SDK 可复用同一对齐缓冲」为由从 `internal/bufpool` 迁至 `pkg/bufpool`，但该复用**始终没有发生**——12 个引用方全是引擎内部与 CLI，SDK 零引用。2026-10-02 迁回 `internal/bufpool`，门禁恢复单例外（`pkg/ierr`）。**「外部将来可能用」不足以进 `pkg/`；要有真实的外部 import。**
+
+**所以新增 `pkg/` 下的包之前要问**：它是不是**已有外部调用方**（含 SDK 库代码直接 import）的？不是 → 放 `internal/`。判据与门禁一致，不是风格偏好。
 
 ### `/configs` — 适用
 
@@ -164,7 +171,20 @@ test/e2e/harness_test.go   doc.go
 **两条本仓库特有的约束**（都已在 Makefile 与 spec 里落实）：
 
 1. **`check-fmt` 排除 `third_party/`** —— 保持与上游一致的格式，不纳入本地 gofmt 校验。
-2. **`testify` 只在这个 fork 里用**，自有代码零引用（见 [testing/](../testing/index.md) 的 gbp-046）。
+2. **`testify` 只在这个 fork 里用**，自有代码零引用（2026-10-02：全仓 13 个引用文件全在 `third_party/`，见 [testing/](../testing/index.md) 的 gbp-046）。
+
+### `/web` 不设顶层 — 前端是服务端包的内嵌资产
+
+**规则**：`/web` 放专门面向 Web 的应用（SPA、模板、静态前端工程）。
+
+**对 taihu：不设顶层 `/web`，前端资产放在 `internal/web/static/`。** 这是 2026-10-02 新有的裁决（commit `6ae80b5` 引入管理 Web 前，本仓库无任何前端）。
+
+判据是**前端是不是独立工程**：
+
+- project-layout 的 `/web` 设想的是独立构建/独立部署的前端（node 工程、打包产物、自己的依赖清单），顶层目录是它的工程根；
+- 本仓库的前端只有三个手写静态文件（`internal/web/static/{index.html,app.js,style.css}`），无构建步骤、无 npm 依赖，经 `//go:embed` 编进服务端二进制（`internal/web/web.go:22-23`），与 HTTP handler **同包同生命周期**演进——路由改了端点，前端同一天改，放在一起才能一起被 review。
+
+**若哪天前端长成独立工程**（引入框架/构建链/独立发版），再按 project-layout 建顶层 `/web`，并让 embed 指向构建产物。在此之前不要新建 `/web`。
 
 ### `/docs` vs 本仓库的 `doc/` — **既有例外，不改**
 
@@ -200,13 +220,13 @@ doc/{README.md, 设计文档/, 性能测试报告/, 部署记录/}
 | 目录 | 不适用原因 |
 |---|---|
 | `/api` | 规则是「OpenAPI/Swagger 规格、JSON schema、协议定义文件」。本仓库的协议定义**在 Go 代码里**（`internal/transport/protocol/protocol.go` 的 `ErrCode` 与二进制帧格式），不存在独立的规格文件 |
-| `/web` | 无 Web 前端、无模板、无 SPA |
+| `/web` | 前端存在但**内嵌在服务端包**（`internal/web/static/` 三个手写静态文件 + `go:embed`），不是独立前端工程——裁决见上文专节 |
+| `/assets` | 无图片、logo 等静态资产；唯一前端资产已随 `internal/web/static/` 内嵌 |
 | `/init` | 无 systemd / upstart / sysv / supervisord 配置入库——本仓库的部署配置**刻意不入库**（见 `/deployments` 行） |
 | `/build` | 规则管的是「打包与 CI」：容器配置放 `/build/package`、CI 配置放 `/build/ci`。本仓库**没有容器化配置、没有 CI 配置** |
 | `/deployments` | 无 docker-compose / k8s / helm / terraform。本仓库的部署走 `doc/部署记录/`（**过程记录**，不是可执行的编排配置） |
 | `/tools` | 定义明确要求是**能 import 本项目 `/pkg`、`/internal` 的 Go 工具**。本仓库无此类工具；Python 运维脚本归 `/scripts` |
 | `/githooks` | 无 git hooks |
-| `/assets` | 无图片、logo 等静态资产 |
 | `/website` | 无独立站点（文档就在仓库里，用 GitHub 渲染） |
 | `/vendor` | **刻意的**：规则原文即「若 module proxy 满足你的需求，你根本不需要 `vendor` 目录」。本仓库用 module proxy，`go.sum` 保证可复现性 |
 | — | （第 11 个是上一节已单独裁决的 `/src`——那是**禁令**，不是缺的目录） |
@@ -232,7 +252,12 @@ doc/{README.md, 设计文档/, 性能测试报告/, 部署记录/}
 > **来源：本仓库自定** —— 这是本 spec 里唯一的自拟规则（收编门槛见[根 index](../index.md) 的「三个来源」）。
 > project-layout 只覆盖顶层目录，gbp 的九个类别里没有「包内文件组织」这一类，**两个上游都不管这件事**。
 > 它管的是「文件摆在哪」，与上面的顶层目录同题，所以放在本层。
-> 做法不是新发明的：`internal/aio/aio_internal.go:9-14` 与同文件 `:34` 的注释里已经写明了同一个判据（后者说明探测结论缓存的平台无关部分也放在对外面文件之外的同一文件），这里只是把它升格为规则。
+>
+> **规则身世的变迁（2026-10-02 订正，务必知道）**：本规则 2026-09 从 `internal/aio` 的
+> `aio_internal.go` 注释升格而来。该文件此后在 commit `5dc2294`（aio 文件布局收敛）中被
+> 删除——aio 刻意改成「单入口文件 + 文末『包内私有』节」，即**规则的起源包自己选择了
+> 单一性、放弃了纯粹性**（其包注释 `internal/aio/aio.go:23-27` 明确记录这一选择）。
+> 规则保留：仍有 4 个包严格符合（见现状表），且对**新增包**有效；但不要再把 aio 当正例引用。
 
 ## 规则
 
@@ -243,11 +268,11 @@ doc/{README.md, 设计文档/, 性能测试报告/, 部署记录/}
 | **① 单一性** | 该包**全部包级导出**（`func` / `type` / `var` / `const`）都定义在**同一个**文件里 |
 | **② 纯粹性** | 那个文件里**不得有任何未导出的顶层声明**——未导出的类型 / 常量 / 变量 / 函数一律在别的文件 |
 
-**文件命名：与包同名。** 实测：本仓库**包级导出只落在一个文件的 7 个包里，6 个都用 `<包名>.go`** —— `aio.go` / `bufpool.go` / `ierr.go` / `layout.go` / `protocol.go` / `version.go`。唯一例外是 `cmd/taihu/cmd`（包名 `cmd`，主文件叫 `root.go`，那是 cobra 的惯例）。**新增包时用 `<包名>.go`，不要另起 `api.go` / `public.go` / `export.go`。**
+**文件命名：与包同名。** 2026-10-02 实测：包级导出只落在一个文件的 10 个包里，9 个用 `<包名>.go`——`aio.go` / `bufpool.go` / `device.go` / `ierr.go` / `layout.go` / `metastore.go` / `protocol.go` / `version.go` / `web.go`。唯一例外是 `cmd/taihu/cmd`（包名 `cmd`，主文件叫 `root.go`，那是 cobra 的惯例）。**新增包时用 `<包名>.go`，不要另起 `api.go` / `public.go` / `export.go`。**
 
 ## 为什么值得
 
-1. **读一个包只要读一个文件**就知道它的全部对外契约，不必在实现细节里挑出可导出的部分。这是最初的动机（`internal/aio/aio_internal.go:12-14` 写的就是这句）。
+1. **读一个包只要读一个文件**就知道它的全部对外契约，不必在实现细节里挑出可导出的部分。
 2. **「这个符号能不能改」变成一次查找**：在对外面文件里 → 破坏性变更；不在 → 内部实现。Go 没有工具能回答「有没有包外调用方」，靠读代码猜不可靠，靠一个固定的文件位置才可靠。
 3. **纯粹性让规则可机械核查**：对外面文件里出现小写开头的顶层声明就是错——**不需要判断「这个未导出符号重不重要」**。少了这条判据，「哪些未导出符号该挪走」每次都要吵一遍。
 
@@ -255,53 +280,62 @@ doc/{README.md, 设计文档/, 性能测试报告/, 部署记录/}
 
 ### 例外一 · 实现导出接口的方法（硬性，无法避免）
 
-Go 不允许实现导出接口的方法私有。`internal/aio` 的 `Ring` 接口（`internal/aio/aio.go:64-91`）声明了 `SubmitRead` / `SubmitWrite` / `Wait` / `Close`，所以三个后端类型上的同名方法**必须**导出：
+Go 不允许实现导出接口的方法私有。`internal/aio` 的 `Ring` 接口（`internal/aio/aio.go:67` 起）声明了 `SubmitRead` / `SubmitWrite` / `Wait` / `Close`，所以三个后端类型上的同名方法**必须**导出：
 
-| 文件 | 导出方法 | **包级导出** |
+| 文件 | 导出方法（receiver 方法） | **包级导出** |
 |---|---|---|
-| `internal/aio/aio_libaio_linux.go` | 6 个（`SubmitRead:72` … `Close:229`） | **0** |
-| `internal/aio/aio_fallback_other.go` | 6 个 | **0** |
-| `internal/aio/aio_uring_linux.go` | 6 个 | **0** |
-| `internal/aio/aio_uring_params_linux.go` | 1 个（`uringParamError.Error:103`） | **0** |
+| `internal/aio/ring_libaio_linux.go` | 6 个 | **0** |
+| `internal/aio/ring_fallback_other.go` | 6 个 | **0** |
+| `internal/aio/ring_uring_linux.go` | 7 个（含 `uringParamError.Error`，类型定义在 `:230`） | **0** |
 
-**关键在最后一列**：这四个文件**一个包级导出都没有**——它们是「未导出类型 + 导出方法」。所以 `internal/aio` 的对外面**确实就是 `aio.go` 一个文件**（14 个包级导出、0 个未导出顶层声明，见 `internal/aio/aio.go:23-26` 的包注释）。
-
-**统计时的坑**：按「文件里有几个大写开头的名字」数，会把上面这 19 个接口方法算成「导出面分散在 5 个文件」——**结论是错的**。判据是**包级导出**，方法不计。
+**关键在最后一列**：这三个文件**一个包级导出都没有**——它们是「未导出类型 + 导出方法」。判据是**包级导出**，方法不计；按「文件里有几个大写开头的名字」数会误判成「导出面分散在 3 个文件」。
 
 ### 例外二 · `_` 声明
 
 `var _ ByteReader = netpoll.Reader(nil)` 这类**没有名字**的顶层声明不计入「未导出声明」：它必须**紧挨着被断言的接口**才有意义，为了「纯粹性」把它挪走是更糟的选择。实例：`internal/transport/protocol/protocol.go:191-192` 紧跟在同一文件 `:184` 的 `ByteReader` 之后。（`_` 的三种合法用法见 [idiomatic/](../idiomatic/index.md) 的 gbp-039。）
 
-### 例外三 · `reexport.go`
+### 例外三 · `reexport.go` 与零逻辑转调
 
-`internal/rpcclient/reexport.go`（14 个导出）与 `pkg/taihu-client/reexport.go`（8 个导出）是**逐层转指上游类型与错误**的文件，两者都是 **0 个未导出顶层声明**，符合纯粹性。
+reexport 文件**逐层转指上游类型与错误**，当前三个，全部 0 个未导出顶层声明，符合纯粹性：
 
-**允许存在，但要守住形态**：里面只许出现 **type alias 与 `= upstream.Err` 形式的变量 / 常量**，**不许出现函数体**。实测两处都符合——14 个导出是 4 `type` + 5 `var` + 5 `const`，8 个导出是 3 `type` + 5 `var`，**`func` 数都是 0**。一旦有人在 `reexport.go` 里写了函数，它就从「投影」变成了「第二个契约来源」，那时应当拆成一个正经的包。
+- `internal/rpcclient/reexport.go`（16 个导出）；
+- `pkg/taihu-client/reexport.go`（10 个导出）；
+- `pkg/taihu-client/kv_reexport.go`（2 个导出，兼容旧对接面）。
 
-## 当前状态（2026-09-22 实测，AST 判定）
+**允许的内容**：type alias、`= upstream.Err` 形式的变量 / 常量，以及**零逻辑转调构造函数**——函数体只有一条 `return upstream.Xxx(args...)`，参数原样透传。正例两处：
+
+- `internal/rpcclient/reexport.go:72` 的 `NewFdBuf`（`FdBuf.release` 未导出，包外无法用字面量构造，只能提供转调入口）；
+- `pkg/taihu-client/kv_reexport.go:15` 的 `NewTiKVKV`（旧对接面兼容入口，注释已标注新代码用 `NewFromTiKV`）。
+
+**禁止的内容**：分支、转换、聚合等任何真实逻辑。一旦 reexport 文件里出现「第二步动作」，它就从「投影」变成了「第二个契约来源」，那时应当拆成一个正经的包。
+
+## 当前状态（2026-10-02 实测，AST 判定）
 
 | 状态 | 包（E = 包级导出数，U = 未导出顶层声明数） |
 |---|---|
-| ✅ **两条都符合** | `internal/aio`(14E)、`internal/ierr`(8E)、`internal/layout`(5E)、`internal/transport/protocol`(65E) |
-| ⚠️ **单一但不纯** | `pkg/bufpool`(4E/11U)、`internal/version`(3E/1U)、`cmd/taihu/cmd`(1E/6U) |
-| ⚠️ **按主题拆成多个纯导出文件** | `internal/cluster`(7 文件)、`pkg/taihu-client`(4 文件) |
-| ❌ **导出散在实现文件里** | `internal/storage`(3 文件)、`internal/transport`(8)、`internal/rpcclient`(7)、`internal/metastore`(3)、`internal/device`(4)、`internal/benchkit`(2) |
+| ✅ **两条都符合** | `internal/layout`(5E)、`internal/metastore`(14E)、`internal/transport/protocol`(65E)、`pkg/ierr`(26E) |
+| ⚠️ **单一但不纯** | `internal/aio`(11E/8U，**起源包刻意偏离**，包注释有「包内私有」节)、`internal/device`(9E/12U)、`internal/bufpool`(4E/11U)、`internal/version`(3E/1U)、`internal/web`(21E/5U，**见下：新包欠债**)、`cmd/taihu/cmd`(1E/6U) |
+| ⚠️ **按主题拆成多个纯导出文件** | `internal/cluster`(7 文件：6 纯 + `kv_tikv.go` 3E/7U)、`pkg/taihu-client`(5 文件) |
+| ❌ **导出散在实现文件里** | `internal/transport`(8)、`internal/rpcclient`(7)、`internal/benchkit`(2)、`internal/storage`(2：主文件 `storage.go` 11E 已纯，仅 `read.go` 漏 1E/1U) |
 
-**这条规则不追溯既有代码。** 让 8 个包返工是大范围移动，收益只是文件摆放——**本轮不要求改**。它对**新增代码**生效：
+**这条规则不追溯既有代码。** 大范围移动换文件摆放不划算。它对**新增代码**生效：
 
 - **新增导出名** → 放进该包**已有**的对外面文件；**不要新开**一个只放导出名的文件。
 - **新增未导出名** → **不要**放进对外面文件，哪怕只有 3 行。
 - **新增一个包** → 一开始就按本规则建：`<包名>.go` 只放导出名。
 
-**三种偏差的处置方向不同，不要一律返工：**
+**`internal/web` 是一笔明确的新包欠债**（2026-10-02 记录）：它是规则成文后第一个新增的包，但没有起步即合规——`web.go` 混着 5 个未导出声明（`staticFS` 嵌裁变量 + `writeJSON` / `writeErr` / `errStringf` / `apiStatus`，见 `internal/web/web.go:23`、`:254-282`）。收敛方向无需决策、仅欠移动：四个输出/错误辅助挪进 `handlers.go`，`staticFS` 挪进一个小文件（如 `static.go`）。**下次改 `internal/web` 时顺手完成，不要在 `web.go` 里继续加未导出声明。**
 
-- **`internal/cluster`：有意设计，跟着它自己的分法走。** 它把导出面按主题拆进 6 个**纯导出**文件（`capacity.go` 5E / `client.go` 8E / `instance.go` 4E / `kv.go` 6E / `kv_mem.go` 2E / `register.go` 5E），只有实现文件 `kv_tikv.go`（3E/6U）混着未导出名。它牺牲了「一个文件读完全部契约」，换来「按主题定位」。**本规则不要求它改**；新增导出名时**跟着它自己的主题走**，不要混进实现文件。
-- **`internal/storage` 一类：正在往规则方向走，只是没走完。** 判据是它们的**主文件已经是纯导出的**——`internal/storage/storage.go` 有 5 个包级导出、**0 个未导出**。所以这 8 个包的偏差只是**有导出名落在了别的文件里**（`storage` 的导出分在 `storage.go`(5E) / `compact.go`(4E) / `options.go`(3E/2U)）。**新增导出名时放进主文件，不要放进 `compact.go` 这类实现文件**——这是不必返工也能逐步收敛的路径。
-- **`pkg/bufpool` / `internal/version` / `cmd/taihu/cmd`：差的只是纯粹性。** 导出已经集中在一个文件，只是该文件里还混着未导出声明。**新增未导出名时不要往那个文件里加**即可。
+**各类偏差的处置方向不同，不要一律返工：**
+
+- **`internal/aio`：刻意的单入口，不要替它「纠正」。** 包注释已声明私有节的位置，这是与本规则平行的另一种成文选择。新增导出/私有名都进 `aio.go` 时跟随它文末的「包内私有」分节。
+- **`internal/cluster`：有意设计，跟着它自己的分法走。** 6 个纯导出文件按主题拆（`client.go` 8E / `kv.go` 6E / `capacity.go` 5E / `register.go` 5E / `instance.go` 4E / `kv_mem.go` 2E），实现文件 `kv_tikv.go`(3E/7U) 是唯一混合点。新增导出名**跟着主题走**，不要混进实现文件。
+- **`internal/storage`：差一步走完。** 主文件 `storage.go`(11E) 已纯，只有 `read.go` 漏了 1 个导出。下次碰 `read.go` 时把那个导出名挪进 `storage.go` 即可。
+- **`internal/device` / `internal/bufpool` / `internal/version` / `cmd/taihu/cmd`：差的只是纯粹性。** 导出已集中在一个文件，新增未导出名时**不要往那个文件里加**。
 
 ## 核查脚本（正则在这里不可靠，必须用 AST）
 
-**`grep` 数不出这件事。** 块形式的声明里，名字前面**没有关键字**：`internal/ierr/ierr.go:9-27` 的 8 个 sentinel 全在 `var ( ... )` 块里，换行后是 `\tErrNotFound = errors.New(...)`——任何 `^var [A-Z]` 模式的 grep 都**一条也匹配不到**，会得出「该包 0 个导出」的错误结论。**这个坑必须记住**：同类命令在别的层（如 [performance/](../performance/index.md)）能凑合用，是因为那些规则数的东西不藏在块里。
+**`grep` 数不出这件事。** 块形式的声明里，名字前面**没有关键字**：`pkg/ierr/ierr.go:9-64` 的 26 个 sentinel 全在 `var ( ... )` 块里，换行后是 `\tErrNotFound = errors.New(...)`——任何 `^var [A-Z]` 模式的 grep 都**一条也匹配不到**，会得出「该包 0 个导出」的错误结论。**这个坑必须记住**：同类命令在别的层（如 [performance/](../performance/index.md)）能凑合用，是因为那些规则数的东西不藏在块里。
 
 正确的数法用 `go/ast`。存成 `/tmp/apidump/main.go`：
 

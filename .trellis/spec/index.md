@@ -34,18 +34,18 @@
 
 | 层 | 对应 gbp 类别 | 条数 | 对 taihu 的适用度 |
 |---|---|---|---|
-| [framework/](./framework/index.md) | Framework Selection | 4 | **4 条全不适用**（无 HTTP 服务端） |
+| [framework/](./framework/index.md) | Framework Selection | 4 | **2 条不适用 / 1 条意图适用（暂无 middleware）/ 1 条部分且有真实偏离**（数据面无 HTTP；管理面 `internal/web/` 有 HTTP，刻意只用标准库） |
 | [database/](./database/index.md) | Database & ORM | 5 | **5 条全不适用**（本仓库是存储引擎本身） |
 | [ddd/](./ddd/index.md) | DDD Project Structure | 6 | **6 条全不适用**（分层与门禁冲突） |
 | [error/](./error/index.md) | Error Handling | 6 | 5 条适用 / 1 条部分 |
 | [concurrency/](./concurrency/index.md) | Concurrency Patterns | 7 | 6 条适用 / 1 条偏离 |
 | [idiomatic/](./idiomatic/index.md) | Idiomatic Go | 11 | 11 条全部适用 |
-| [testing/](./testing/index.md) | Testing Practices | 7 | 4 条适用 / 3 条偏离 |
+| [testing/](./testing/index.md) | Testing Practices | 7 | 2 条适用 / 1 条部分 / 2 条不适用 / 2 条刻意偏离 |
 | [performance/](./performance/index.md) | Performance Optimization | 2 | 2 条全部适用 |
 | [lint/](./lint/index.md) | Lint & Toolchain | 5 | **2 条已是门禁** / 3 条未引入 |
 | [layout/](./layout/index.md) | （来源为 project-layout + **自定 1 条**） | 20 目录 + 1 条 | 9 采用 / 10 不适用 / 1 不该有 |
 
-**前三个层整层不适用，为什么还要留着？** 因为它们记录的是**否决理由**，不是空模板。下一轮谁再提「要不要上 Gin」「要不要按 DDD 分层」，理由在这儿，不必重新论证一遍。删掉这三层等于把已经做过的工作丢掉。
+**`database/` 与 `ddd/` 两层整层不适用，`framework/` 大部分不适用——为什么还要留着？** 因为它们记录的是**否决理由**，不是空模板。下一轮谁再提「要不要上 Gin / Kratos」「要不要按 DDD 分层」「要不要上 GORM」，理由在这儿，不必重新论证一遍。`framework/` 尤其注意：2026-10-02 管理面 `internal/web/` 落地后该层已**按两个面重裁**——「全不适用」的旧结论只对数据面成立，删掉等于丢掉这次裁决的来龙去脉。
 
 ## 适用性的判据
 
@@ -59,8 +59,8 @@
 | 无 wire | `grep -rl 'google/wire' --include='*.go' internal cmd pkg examples` | 0 |
 | 无 goose | `grep -rl 'goose' --include='*.go' internal cmd pkg examples` | 0 |
 | 无 errgroup | `grep -rl 'errgroup' --include='*.go' internal cmd pkg examples` | 0 |
-| `net/http` 仅用于 pprof | `grep -rn 'net/http' --include='*.go' internal cmd pkg examples` | 1 处：`cmd/taihu/cmd/server.go:13-14` |
-| testify 只在 fork 里 | `grep -rl 'stretchr/testify' --include='*.go' .` | 10 个文件，**全在 `third_party/shmipc-go/`** |
+| `net/http` 的分布 | `grep -rln 'net/http' --include='*.go' internal cmd pkg examples` | **6 个文件**：管理面 `internal/web/{web,handlers,key_handlers,web_test}.go` + 装配 `cmd/taihu/cmd/web.go`，另 `cmd/taihu/cmd/server.go` 用于 pprof。**数据面不碰 HTTP**（自实现二进制帧） |
+| testify 只在 fork 里 | `grep -rl 'stretchr/testify' --include='*.go' .` | 13 个文件，**全在 `third_party/shmipc-go/`**，自有代码 0 |
 | 自有代码无 benchmark | `grep -rn 'func Benchmark' --include='*_test.go' internal cmd pkg` | 0 |
 
 ## 怎么用
@@ -73,11 +73,11 @@
 
 规则里的 `file:line` 引用一律用**反引号包裹的仓库根相对路径**，例如 `internal/aio/aio.go:63-64`。不要用 Markdown 链接做跨层引用（链接改不动行号，反引号路径可以被脚本校验）。
 
-**但脚本只验「存在与范围」，不验「内容」。** `.trellis/tasks/archive/2026-09/09-21-spec-upstream-alignment/research/verify_spec_refs.py` 查得出引用到不存在的文件、或行号超出文件长度，**查不出行号指错了行**——重排代码后 `internal/aio/aio_libaio_linux.go:49` 从 `mu` 变成了 `ctx`，脚本照样报「有效」，因为第 49 行确实存在。
+**但脚本只验「存在与范围」，不验「内容」。** `.trellis/tasks/archive/2026-09/09-21-spec-upstream-alignment/research/verify_spec_refs.py` 查得出引用到不存在的文件、或行号超出文件长度，**查不出行号指错了行**——比如想引用 `ctx` 字段而写成 `internal/aio/ring_libaio_linux.go:49`，脚本照样报「有效」，因为第 49 行确实存在，但那一行实际是常量声明 `opcodePwrite uint16 = 1`，`ctx` 现在在 `:51`。
 
-**所以改完被引用的文件，必须逐条核对引用落在的内容**，不能只看脚本的绿字。这不是理论风险：2026-09-22 把两个 sentinel 挪进 `internal/ierr` 后（`internal/aio/aio.go` 少了 7 行），脚本报「有效 71 条、越界 0 条」，而实际有 **10 处**指向了错误的行。核对办法：把引用与它指向的那一行内容并排打印出来看（见 [layout/](./layout/index.md) 的核查脚本，同一套 AST 思路）。
+**所以改完被引用的文件，必须逐条核对引用落在的内容**，不能只看脚本的绿字。这不是理论风险，已经踩过两次：2026-09-22 归并 sentinel（`internal/aio/aio.go` 少了 7 行；ierr 当时在 `internal/ierr`，2026-09-24 再迁入 `pkg/ierr`），脚本报「有效 71 条、越界 0 条」，而实际有 **10 处**指向了错误的行；2026-10-02 对 18 个文件统一 `gofmt -w` 又让一大批锚点平移。核对办法：把引用与它指向的那一行内容并排打印出来看（见 [layout/](./layout/index.md) 的核查脚本，同一套 AST 思路）。
 
 **另外两条格式约束，直接决定引用能不能被校验：**
 
-1. **一律写仓库根相对路径，不要只写文件名。** 校验脚本的 `is_ref` 要求 token 含 `/`（这是为了不把泛指的文件名当引用），所以 `aio_libaio_linux.go:49` 这种写法**会被整个跳过**——等于没有人校验它。在同一个表格里已经给过全路径、后续只写文件名「省地方」也不行，一样逃掉。
+1. **一律写仓库根相对路径，不要只写文件名。** 校验脚本的 `is_ref` 要求 token 含 `/`（这是为了不把泛指的文件名当引用），所以 `ring_libaio_linux.go:49` 这种写法**会被整个跳过**——等于没有人校验它。在同一个表格里已经给过全路径、后续只写文件名「省地方」也不行，一样逃掉。
 2. **行号只写 `:N` 或 `:N-M` 两种形式。** 脚本的 token 正则不认逗号形式：`:269,310,313,316` 连范围都匹配不上，同样会被跳过。多个行号就写多条引用。

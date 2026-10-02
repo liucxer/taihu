@@ -9,15 +9,16 @@
 
 | 项 | 数量 | 核实命令 |
 |---|---|---|
-| 非测试代码的 goroutine 启动点 | **35** | `grep -rnE '^\s*go [a-zA-Z(]' --include='*.go' internal cmd pkg \| grep -v _test.go` |
-| channel 总数（非测试 `make(chan ...)`） | **32** | `grep -rn 'make(chan ' --include='*.go' internal cmd pkg \| grep -v _test.go` |
-| ├ 无缓冲（`make(chan struct{})`） | 16 | `grep -rn 'make(chan struct{})' --include='*.go' internal cmd pkg \| grep -v _test.go` |
-| └ 有缓冲 | 16（其中**仅 1 处**缓冲 > 1，见 gbp-024） | 总数减去无缓冲 |
-| `sync.Mutex` / `RWMutex` 字段 | 20 | `grep -rn 'sync\.Mutex\|sync\.RWMutex' --include='*.go' internal cmd pkg \| grep -v _test.go` |
+| 非测试代码的 goroutine 启动点 | **40** | `grep -rnE '^\s*go [a-zA-Z(]' --include='*.go' internal cmd pkg \| grep -v _test.go` |
+| channel 总数（非测试 `make(chan ...)`，按行） | **34 行 / 35 个 make** | `grep -rn 'make(chan ' --include='*.go' internal cmd pkg \| grep -v _test.go`（`internal/transport/frame.go:53` 一行含两个 make） |
+| ├ 无缓冲 | 17 行：`struct{}{}` 16 行 + `chan string` 1 行（`pkg/taihu-client/storage.go:483`） | `grep -rn 'make(chan struct{})' ...` |
+| ├ 缓冲 1 | 11 行（error ×3、result ×2、os.Signal ×2、aio.Event ×2、shmBatchResult ×1、`struct{},1` ×1） | 见 gbp-024 全表 |
+| └ 缓冲 > 1 | **7 个**：6 个有论证（信号量/批大小/背压），**1 个无论证（4096）** | 见 gbp-024 |
+| `sync.Mutex` / `RWMutex` 字段（含少量同名局部变量，同模式计数） | 23 | `grep -rn 'sync\.Mutex\|sync\.RWMutex' --include='*.go' internal cmd pkg \| grep -v _test.go` |
 
-**35 个启动点每一个都要能说清「谁等它、怎么停」**——这是本层最重的一条（gbp-022）。
+**40 个启动点每一个都要能说清「谁等它、怎么停」**——这是本层最重的一条（gbp-022）。
 
-**统计时的一个坑（我自己踩过）**：只 grep `go func(` 会得到 **15**，**漏掉 20 个**。因为本仓库大量使用**方法调用形式**的启动：`go s.handlePut(c, st)`、`go b.run(b.queues[i])`、`go conn.readLoop()`、`go m.loop()`、`go d.pump()`、`go c.run()`、`go s.acceptLoop()`、`go cluster.RunHeartbeat(...)`。**用上面表格里的 `^\s*go [a-zA-Z(]` 那个模式**，别用 `go func(`。
+**统计时的一个坑（我自己踩过）**：只 grep `go func(` 会得到 **20**，**漏掉另外 20 个**。因为本仓库大量使用**方法调用形式**的启动：`go s.handlePut(c, st)`、`go b.run(b.queues[i])`、`go conn.readLoop()`、`go m.loop()`、`go d.pump()`、`go c.run()`、`go s.acceptLoop()`、`go cluster.RunHeartbeat(...)`。**用上面表格里的 `^\s*go [a-zA-Z(]` 那个模式**，别用 `go func(`。
 
 ## 逐条裁决
 
@@ -33,11 +34,13 @@
 
 **答不上第 3 问的，要么补 join 点，要么在代码注释里写明为什么不需要**——「它很短」不是理由，除非你能指出限死它存活期的那行代码。
 
-**正例**：`pkg/taihu-client/index.go:46-51` —— `start()` 起 `go m.loop()`，`loop()` 第一行就是 `defer close(m.done)`，`done` 是对外可等的 join 点；停止信号走 `stopCh`。
+**正例**：`pkg/taihu-client/index.go:44-50` —— `start()` 起 `go m.loop()`，`loop()` 第一行就是 `defer close(m.done)`，`done` 是对外可等的 join 点；停止信号走 `stopCh`。
 
-**第二类正例（不是 WaitGroup，但同样答得上来）**：`internal/transport/server.go:140-154` 有 8 处 `go s.handleXxx(c, st)`——**每个请求一个 goroutine**，且**没有 `wg.Add`**。它的第 3 问答案是**流生命周期**：存活期由 `st`（一个请求/响应流）限死，停止信号是 `st.done` / `c.closed`（`:127-135` 的 `select` 就在等这两个），收尾走 `internal/transport/server.go:161` 的 `endStream(st)` 注销流。
+**第二类正例（不是 WaitGroup，但同样答得上来）**：`internal/transport/server.go:146-160` 有 8 处 `go s.handleXxx(c, st)`——**每个请求一个 goroutine**，且**没有 `wg.Add`**。它的第 3 问答案是**流生命周期**：存活期由 `st`（一个请求/响应流）限死，停止信号是 `st.done` / `c.closed`（`internal/transport/server.go:133-138` 的 `select` 就在等这两个），收尾走各 handler 第一行的 `defer c.endStream(st)`（如 `internal/transport/server.go:229`）注销流。
 
 **这个例子说明第 3 问不必然等于「有个 `WaitGroup`」**——但必须有一个**能等的东西**。这里的代价是**进程退出时不保证在途请求全部收尾**，这是服务端关停路径要单独处理的事，不是随手能改的性质。
+
+**第三类正例（进程级信号 goroutine，join 点是进程本身）**：`cmd/taihu/cmd/web.go:87-93` 用 `go func()` 等 `SIGINT/SIGTERM` 再触发关停，没有 WaitGroup。它的三问答案是：存活期 = 进程存活期；停止信号 = 它自己等的那一个系统信号；谁等它 = 没有人也不需要——它不持有需收尾的资源，活干到进程结束。**只有这种「无状态、生命周期等于进程」的信号 goroutine 可以不设 join 点**，普通 worker 不适用此豁免。
 
 **注意**：`select` 里有 `ctx.Done()` 不等于满足本条——**没有 join 点的 goroutine，调用方无论如何都等不到它结束**，进程退出时它的收尾工作可能被截断。
 
@@ -63,7 +66,18 @@
 
 **处置**：要么在 `pkg/taihu-client/index.go:39` 补一行论证（例如「批写入上限 × 实例数」这类可推导的依据），要么把它降到 1 并改用批量语义显式控制。**本 spec 不替你选**，但**不能不选**。
 
-**其余 15 处非测试有缓冲 channel 缓冲都是 1，符合本条。** 它们集中在 `internal/transport`（`make(chan error, 1)` 三处、`make(chan shmBatchResult, 1)`）与 `internal/device`（`make(chan aio.Event, 1)` 两处）。**`1` 是「通知」语义**——正是规则选型表里的「通知 = 1」，不需要论证。
+**合规的 6 个 >1 缓冲**（都能对应规则选型表里的「信号量 = N / 批量 = 批大小」，且代码里有命名或注释）：
+
+| 位置 | 缓冲 | 语义 |
+|---|---|---|
+| `internal/transport/frame.go:53`（`streamInCap`，常量在 `internal/transport/frame.go:31-32`） | 8 | 每流投递缓冲，注释写明「读循环背压到流处理器消费速度」——显式背压论证 |
+| `internal/transport/batch.go:97` | `batchCap*2` | 批大小语义（writeTask 队列） |
+| `internal/transport/batch.go:188` | `batchCap*2` | 批大小语义（deleteTask 队列） |
+| `internal/transport/server_shm_linux.go:122` | `target*2` | 批大小语义（shm 批处理 worker） |
+| `internal/benchkit/run.go:105` | `cfg.Threads` | 信号量语义（worker 回收槽） |
+| `cmd/taihu/cmd/bench_storage.go:136` | `c.threads` | 同上 |
+
+**缓冲为 1 的 11 行**是「通知」语义——正是规则选型表里的「通知 = 1」，不需要论证：`make(chan error, 1)` 三处（`internal/transport/server.go:302`、`internal/transport/batch.go:197`、`internal/transport/server_shm_linux.go:706`）、`make(chan result, 1)` 两处（`internal/cluster/kv_tikv.go:111`、`cmd/taihu/cmd/helpers.go:55`）、`make(chan aio.Event, 1)` 两处（`internal/device/device.go:243`、`:829`）、`make(chan os.Signal, 1)` 两处（`cmd/taihu/cmd/web.go:88`、`cmd/taihu/cmd/server.go:260`）、`make(chan shmBatchResult, 1)`（`internal/transport/server_shm_linux.go:183`）、`make(chan struct{}, 1)`（`internal/aio/ring_fallback_other.go:41`）。
 
 **测试文件里的缓冲不适用本条的论证要求**（`transport_batch_test.go` 的 `int, 8` / `int, 4` 是构造批次场景用的）。
 
@@ -75,7 +89,7 @@
 
 **要点**：`WithTimeout` / `WithCancel` 的返回值 `cancel` **必须 `defer cancel()`**，否则 `context` 泄漏（`govet` 的 `lostcancel` 能抓，见 [lint/](../lint/index.md) 的 gbp-051）。
 
-**一条本仓库特有的提醒**：`internal/aio` 的 `Ring.Wait` **不接 `context`**，超时走自己的 `timeout *time.Duration` 参数（`internal/aio/aio.go` 的接口声明）。改那一层时不要「顺手统一成 context」——异步 IO 的提交与完成不走 context 模型。
+**一条本仓库特有的提醒**：`internal/aio` 的 `Ring.Wait` **不接 `context`**，超时走自己的 `timeout *time.Duration` 参数（接口声明在 `internal/aio/aio.go:90`）。改那一层时不要「顺手统一成 context」——异步 IO 的提交与完成不走 context 模型。
 
 ### gbp-026 · errgroup Concurrency Control（HIGH）— **不适用**
 
@@ -83,7 +97,7 @@
 
 **对 taihu：不适用（未引入）。** `grep -rl 'errgroup' --include='*.go' internal cmd pkg examples` → 0，`golang.org/x/sync` 不是直接依赖。
 
-本仓库的并发任务收敛走**自实现的机制**：`internal/transport` 的 batch workers、`internal/device` 的单一完成泵、`internal/benchkit` 的分片 worker（`internal/benchkit/run.go:94` 靠 `fin` channel 回收、`internal/benchkit/run.go:171` 靠 `wg.Done()`）。这些都有各自的错误聚合与取消路径。
+本仓库的并发任务收敛走**自实现的机制**：`internal/transport` 的 batch workers、`internal/device` 的单一完成泵、`internal/benchkit` 的分片 worker（`internal/benchkit/run.go:105-114` 靠 `fin` channel 回收第一个错误、`internal/benchkit/run.go:198-200` 与 `:248` 靠 `WaitGroup` 回收全部 worker）。这些都有各自的错误聚合与取消路径。
 
 **要不要引入 errgroup？** 本 spec 不裁决。但**如果引入**，必须说明它与现有收敛机制的关系——两套并存比用哪一套更糟。
 
@@ -91,7 +105,7 @@
 
 **规则**：正确使用 `Mutex` / `RWMutex` / `Once` / `Pool` / `Map`；`Lock` 后 `defer Unlock`。
 
-**对 taihu：适用。** 20 处 `sync.Mutex` / `RWMutex` 字段。
+**对 taihu：适用。** 23 处 `sync.Mutex` / `RWMutex`（含个别同模式局部变量）。
 
 **要点一（与 gbp-035 同源）**：`Lock()` 之后**立刻** `defer Unlock()`。手写 `Unlock` 只在一种情况下可接受：**中间有必须提前解锁的分支**，且每一条返回路径都覆盖到了。
 
@@ -103,9 +117,9 @@ if done { mu.Unlock(); return }
 mu.Unlock()
 ```
 
-**要点二（本仓库特有）**：锁字段必须有**保护范围注释**。20 处里已有写法可参照（如 `internal/aio/aio_libaio_linux.go:52` 的 `mu sync.Mutex // 保护 seq 与 iocb 复用`）。**没有注释的锁，下一个人不敢动它**——他无法判断改变临界区是否安全。
+**要点二（本仓库特有）**：锁字段必须有**保护范围注释**。23 处里已有写法可参照（如 `internal/aio/ring_libaio_linux.go:54` 的 `mu sync.Mutex // 保护 seq 与 iocb 复用`，另见 `internal/aio/ring_uring_linux.go:281`、`internal/device/device.go:56`）。**没有注释的锁，下一个人不敢动它**——他无法判断改变临界区是否安全。
 
-**要点三**：`sync.Pool` 在本仓库是**被明确否决过的**——`pkg/bufpool/bufpool.go:10-14` 记录了实测依据（GC 清空导致 4M/8M 大缓冲每轮重分配）。若要在这里重新提议 `sync.Pool`，先读那段。
+**要点三**：`sync.Pool` 在本仓库是**被明确否决过的**——`internal/bufpool/bufpool.go:13-16` 记录了实测依据（GC 清空导致 4M/8M 大缓冲每轮重分配，实测读路径冷分配约占服务端 CPU 36%，故用自管理 freelist）。若要在这里重新提议 `sync.Pool`，先读那段。
 
 ### gbp-028 · Race Detection（CRITICAL）— **不适用（当前未启用，是已知缺口）**
 
@@ -113,7 +127,7 @@ mu.Unlock()
 
 **对 taihu：当前未启用。** `Makefile` 里 `race` 零命中（`grep -c 'race' Makefile` → 0）。
 
-**这是本层唯一的已知缺口**，且对存储引擎来说不是小事——20 把锁、**35** 个 goroutine 启动点、32 个 channel，正是 race detector 最有价值的场景。
+**这是本层唯一的已知缺口**，且对存储引擎来说不是小事——23 把锁、**40** 个 goroutine 启动点、34 行 channel 声明，正是 race detector 最有价值的场景。
 
 **为什么现在没上**：`internal/aio` 的 Linux 路径带 `unsafe`（结构体 size/offset 断言、`uringRing` 的字段布局）与 io_uring 的 mmap 共享内存，race detector 在这些区域会产生大量误报或直接不适配。**这是一个需要单独论证的改动，不是「在 Makefile 里加个 `-race`」那么简单。**
 

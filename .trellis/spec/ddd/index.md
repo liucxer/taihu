@@ -10,7 +10,7 @@ gbp 这一类的前提是「你有一个业务领域要建模」。taihu 是存�
 **决定性的一条是 gbp-010。** 它要求按 `cmd/ internal/{domain,application,infrastructure,interfaces} pkg/` 分层，而 taihu 的首层目录是：
 
 ```
-internal/{aio,benchkit,bufpool,cluster,device,ierr,layout,metastore,rpcclient,storage,transport,version}
+internal/{aio,benchkit,bufpool,cluster,device,layout,metastore,rpcclient,storage,transport,version,web}
 ```
 
 **这是按「资源与机制」分层，不是按「业务域职责」分层。** `internal/aio` 是异步 IO 后端，`internal/device` 是块设备，`internal/layout` 是磁盘格式——每个名字都对应一个**物理对象或机制**，不是一层职责。
@@ -20,11 +20,11 @@ internal/{aio,benchkit,bufpool,cluster,device,ierr,layout,metastore,rpcclient,st
 这不是「风格不同」，是**会打起来**。仓库当前有两道 Makefile 门禁：
 
 ```make
-check-layering:    # internal/ 不得依赖 pkg/（pkg/ 只放客户端 SDK）
+check-layering:    # internal/ 不得依赖 pkg/，唯一白名单 pkg/ierr（引擎与 SDK 共享的错误事实源）
 check-sdk-only:    # pkg/ 不得直接依赖引擎内部（storage/device/aio/bufpool/layout），测试除外
 ```
 
-它们编码的是 taihu 真实的依赖方向：**引擎在内，SDK 在外，方向单一**。
+它们编码的是 taihu 真实的依赖方向：**引擎在内，SDK 在外，方向单一**。`pkg/ierr` 是唯一白名单，因为它不是 SDK 的私有物，而是引擎与 SDK **共享的错误事实源**（见 [error/](../error/index.md)）；这不改变方向，只说明「事实源」可以横跨内外。
 
 若改成 gbp-010 的 `domain / application / infrastructure / interfaces`：
 
@@ -64,7 +64,7 @@ check-sdk-only:    # pkg/ 不得直接依赖引擎内部（storage/device/aio/bu
 
 **规则**：接口层把外部请求转成应用层的 command/query；正例是 Gin handler + DTO + `ShouldBindJSON`。
 
-**对 taihu：不适用。** 无 HTTP 接口层。外部请求的入口是**二进制帧解析**（`internal/transport/protocol`），取参方式是按偏移读字节，不是 JSON 绑定。
+**对 taihu：不适用——现在有 HTTP 了，但它仍然不是 DDD 的 interface 层。** 2026-10-02 起有两个对外入口：数据面是**二进制帧解析**（`internal/transport/protocol`，按偏移读字节），管理面是 `internal/web` 的 HTTP JSON 端点（17 条路由）。管理面形态上接近 gbp 设想的 interface 层，实质不是：handler 全部依赖本包的 `Service` 接口（`internal/web/web.go:38-53`，14 个方法），而该接口的实现直接编排 `internal/storage` / `internal/cluster` 等机制包——**中间没有 application 层，也没有 DTO ↔ domain entity 转换**（没有业务实体可转）。它是「管理操作的远程面板」，不是「领域用例的入口」。所以本条结论不变；若哪天 `Service` 背后长出独立的用例编排层，再重新裁决。
 
 ### gbp-015 · Dependency Injection Patterns（HIGH）
 
