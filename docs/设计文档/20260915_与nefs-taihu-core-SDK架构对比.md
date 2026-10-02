@@ -320,7 +320,7 @@ SDK/
 | 维度 | 当前工程 | core |
 |---|---|---|
 | 控制面 | cobra 子命令 + pprof（自动端口） | essdcli / deployer / volumemanager |
-| 指标 | 测试报告体系（doc/性能测试报告） | metrics/meter + 文档体系 |
+| 指标 | 测试报告体系（docs/性能测试报告） | metrics/meter + 文档体系 |
 
 ### 4.8 IO 流程逐跳对比（Go vs core）
 

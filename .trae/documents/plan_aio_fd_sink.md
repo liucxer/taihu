@@ -49,7 +49,7 @@
 - `internal/aio/aio.go` 自身注释（文件头、Options、Ring 接口）。
 - `.trellis/spec/`：`layout/index.md`（:258-268 方法表与行号）、`concurrency/index.md`（:78、:106）、`idiomatic/index.md`（:36、:103、:115-116、:166）、`index.md`（:74-83 引用格式示例）、`error/index.md:62`、`testing/index.md`（:58/:101/:131）——行号位移，逐条重核。
 - `.trellis/tasks/09-22-aio-spec-conformance/design.md:135`「签名与语义全部不动」与现状矛盾：加括注说明「后续 fd 下沉重构已改动接口」，不改历史结论文字。
-- `doc/设计文档/20260914_io_uring可行性分析与改造方案.md`（:59/:65/:204/:208/:212/:220/:234/:445/:446）、`REFACTOR_DEVICE_BATCH.md`（:46/:74/:164-167）、`DESIGN_IO_PIPELINE.md:208`、`.trae/documents/aio-device-integration.md`（:11/:14）——签名/措辞改写 + 行号重指。
+- `docs/设计文档/20260914_io_uring可行性分析与改造方案.md`（:59/:65/:204/:208/:212/:220/:234/:445/:446）、`REFACTOR_DEVICE_BATCH.md`（:46/:74/:164-167）、`DESIGN_IO_PIPELINE.md:208`、`.trae/documents/aio-device-integration.md`（:11/:14）——签名/措辞改写 + 行号重指。
 - `project_memory.md` Engineering Conventions：补「aio Ring 构造时绑定设备 fd（Options.FD），Submit*/Batch 不再带 fd」条目。
 
 ## 验证

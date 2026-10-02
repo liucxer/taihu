@@ -111,7 +111,7 @@
 - `go test -bench` 压不满真实 IO：它的循环里没有真实块设备的队列深度、没有 `O_DIRECT` 的对齐开销、没有 io_uring 的提交/完成批处理。
 - 本仓库有 **shm 与 TCP 两条数据面**，`go test -bench` 覆盖不了。
 
-**所以「加个 benchmark」在这里不是补测试，是换个测不准的工具。** 要量化性能，用 `internal/benchkit`，报告格式参照 `doc/性能测试报告/`。
+**所以「加个 benchmark」在这里不是补测试，是换个测不准的工具。** 要量化性能，用 `internal/benchkit`，报告格式参照 `docs/性能测试报告/`。
 
 ### gbp-045 · Integration Testing Guidelines（HIGH）— **部分适用**
 

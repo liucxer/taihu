@@ -12,7 +12,7 @@
 ## 本仓库的实际顶层
 
 ```
-cmd/  configs/  doc/  examples/  internal/  pkg/  scripts/  test/  third_party/
+cmd/  configs/  docs/  examples/  internal/  pkg/  scripts/  test/  third_party/
 Makefile  README.md  LICENSE  go.mod  go.sum  AGENTS.md
 ```
 
@@ -28,7 +28,7 @@ Makefile  README.md  LICENSE  go.mod  go.sum  AGENTS.md
 | `/test` | ✅ `test/e2e/` | 适用，见下 |
 | `/examples` | ✅ `examples/` | 适用 |
 | `/third_party` | ✅ `third_party/shmipc-go/` | 适用 |
-| `/doc` 对应 `/docs` | ⚠️ `doc/`（单数） | **既有例外**，见下 |
+| `/docs` | ✅ `docs/` | 适用（统一文档目录），见下 |
 | `/web` | ⚠️ 前端在 `internal/web/static/` | **不设顶层 `/web`**，见下 |
 | `/api` | ❌ 无 | 不适用（无 OpenAPI/JSON schema/协议定义文件） |
 | `/init` | ❌ 无 | 不适用（无 systemd/supervisord 配置入库） |
@@ -186,27 +186,27 @@ test/e2e/harness_test.go   doc.go
 
 **若哪天前端长成独立工程**（引入框架/构建链/独立发版），再按 project-layout 建顶层 `/web`，并让 embed 指向构建产物。在此之前不要新建 `/web`。
 
-### `/docs` vs 本仓库的 `doc/` — **既有例外，不改**
+### `/docs` — **统一文档目录**
 
 **规则**：`/docs` 放设计与用户文档（godoc 之外的）。
 
-**对 taihu：偏离——本仓库用单数 `doc/`。**
+**对 taihu：适用——全部文档统一收敛到 `docs/`。**
 
 ```
-doc/{README.md, 设计文档/, 性能测试报告/, 部署记录/}
+docs/{README.md, 设计文档/, 性能测试报告/, 部署记录/, e2e/, sdk/}
 ```
 
-**裁决：保留 `doc/`，不改为 `docs/`。** 理由是这不是空白目录而是**已有 4 个子目录的既成事实**，改名要动大量交叉引用的路径（README、设计文档之间、`.trae/` 等处），**收益是把一个目录名从单数变复数**。
+**历史**：原 `doc/`（设计文档/性能测试报告/部署记录 + 索引）已于 2026-10-02 合并进 `docs/`，与既有的 `docs/e2e/`、`docs/sdk/` 统一为单一文档入口。
 
-**新增文档时的规则**：**放进 `doc/` 下，不要新建 `docs/`**。出现了两个相近目录比单数/复数的差异更糟。
+**新增文档时的规则**：**放进 `docs/` 下对应子目录**，不要新建 `doc/` 或其它文档目录。
 
-**`doc/` 的分工**（与 spec 的区别，不要混）：
+**`docs/` 的分工**（与 spec 的区别，不要混）：
 
 | 目录 | 内容 |
 |---|---|
-| `doc/设计文档/` | **当时为什么这么定**——决策记录 |
-| `doc/性能测试报告/` | 性能数据与结论 |
-| `doc/部署记录/` | 部署过程记录 |
+| `docs/设计文档/` | **当时为什么这么定**——决策记录 |
+| `docs/性能测试报告/` | 性能数据与结论 |
+| `docs/部署记录/` | 部署过程记录 |
 | `.trellis/spec/` | **改动时必须遵守的规则** |
 
 **spec ≠ 设计文档**：spec 是规则，设计文档是理由。两者不合并、不互相搬运。
@@ -224,7 +224,7 @@ doc/{README.md, 设计文档/, 性能测试报告/, 部署记录/}
 | `/assets` | 无图片、logo 等静态资产；唯一前端资产已随 `internal/web/static/` 内嵌 |
 | `/init` | 无 systemd / upstart / sysv / supervisord 配置入库——本仓库的部署配置**刻意不入库**（见 `/deployments` 行） |
 | `/build` | 规则管的是「打包与 CI」：容器配置放 `/build/package`、CI 配置放 `/build/ci`。本仓库**没有容器化配置、没有 CI 配置** |
-| `/deployments` | 无 docker-compose / k8s / helm / terraform。本仓库的部署走 `doc/部署记录/`（**过程记录**，不是可执行的编排配置） |
+| `/deployments` | 无 docker-compose / k8s / helm / terraform。本仓库的部署走 `docs/部署记录/`（**过程记录**，不是可执行的编排配置） |
 | `/tools` | 定义明确要求是**能 import 本项目 `/pkg`、`/internal` 的 Go 工具**。本仓库无此类工具；Python 运维脚本归 `/scripts` |
 | `/githooks` | 无 git hooks |
 | `/website` | 无独立站点（文档就在仓库里，用 GitHub 渲染） |
@@ -296,16 +296,14 @@ Go 不允许实现导出接口的方法私有。`internal/aio` 的 `Ring` 接口
 
 ### 例外三 · `reexport.go` 与零逻辑转调
 
-reexport 文件**逐层转指上游类型与错误**，当前三个，全部 0 个未导出顶层声明，符合纯粹性：
+reexport 文件**逐层转指上游类型与错误**，当前两个，全部 0 个未导出顶层声明，符合纯粹性：
 
 - `internal/rpcclient/reexport.go`（16 个导出）；
-- `pkg/taihu-client/reexport.go`（10 个导出）；
-- `pkg/taihu-client/kv_reexport.go`（2 个导出，兼容旧对接面）。
+- `pkg/taihu-client/reexport.go`（10 个导出）。
 
 **允许的内容**：type alias、`= upstream.Err` 形式的变量 / 常量，以及**零逻辑转调构造函数**——函数体只有一条 `return upstream.Xxx(args...)`，参数原样透传。正例两处：
 
-- `internal/rpcclient/reexport.go:72` 的 `NewFdBuf`（`FdBuf.release` 未导出，包外无法用字面量构造，只能提供转调入口）；
-- `pkg/taihu-client/kv_reexport.go:15` 的 `NewTiKVKV`（旧对接面兼容入口，注释已标注新代码用 `NewFromTiKV`）。
+- `internal/rpcclient/reexport.go:72` 的 `NewFdBuf`（`FdBuf.release` 未导出，包外无法用字面量构造，只能提供转调入口）。
 
 **禁止的内容**：分支、转换、聚合等任何真实逻辑。一旦 reexport 文件里出现「第二步动作」，它就从「投影」变成了「第二个契约来源」，那时应当拆成一个正经的包。
 
