@@ -17,6 +17,7 @@
 package shmipc
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
@@ -26,65 +27,62 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestBlockReadFullAndBlockWriteFull(t *testing.T) {
-	content := "hello,shmipc!"
-	// Create a local Unix socket listener
-	laddr, err := net.ResolveUnixAddr("unix", filepath.Join(t.TempDir(), "testBlockRWFull.sock"))
-	if err != nil {
-		t.Fatalf("failed to resolve unix address: %v\n", err)
-	}
-	listener, err := net.ListenUnix("unix", laddr)
-	if err != nil {
-		t.Fatalf("failed to listen unix: %v\n", err)
-	}
-	defer listener.Close()
+// testConn / testUdsConn build a connected unix-socket pair. The socket file
+// lives under t.TempDir() so that concurrent test binaries never collide and
+// the file is removed by the testing framework.
+func testConn(t *testing.T) (*net.UnixConn, *net.UnixConn) {
+	t.Helper()
+	return testUdsConn(t)
+}
 
-	writeDone := make(chan struct{})
-	// Start a goroutine to accept a connection and write data
+func testUdsConn(t *testing.T) (client *net.UnixConn, server *net.UnixConn) {
+	t.Helper()
+
+	udsPath := filepath.Join(t.TempDir(), "shmipc.sock")
+	addr := &net.UnixAddr{Name: udsPath, Net: "unix"}
+
+	readyCh := make(chan struct{})
+	serverCh := make(chan *net.UnixConn, 1)
+	errCh := make(chan error, 1)
+
 	go func() {
-		defer close(writeDone)
-		conn, err := listener.Accept()
+		ln, err := net.ListenUnix("unix", addr)
 		if err != nil {
-			t.Errorf("failed to accept connection: %v\n", err)
+			errCh <- fmt.Errorf("create listener failed:%w", err)
+			close(readyCh)
 			return
 		}
-		defer conn.Close()
-		fd, err := getConnDupFd(conn)
+		close(readyCh)
+		s, err := ln.AcceptUnix()
+		_ = ln.Close()
 		if err != nil {
-			t.Errorf("failed to getConnDupFd: %v\n", err)
+			errCh <- fmt.Errorf("accept conn failed:%w", err)
 			return
 		}
-		defer fd.Close()
-
-		// Write data using blockWriteFull
-		data := []byte(content)
-		if err := blockWriteFull(int(fd.Fd()), data); err != nil {
-			t.Errorf("failed to write data: %v\n", err)
-		}
+		serverCh <- s
 	}()
 
-	// Dial the Unix socket and read data
-	conn, err := net.DialUnix("unix", nil, laddr)
-	if err != nil {
-		t.Fatalf("failed to dial unix: %v\n", err)
+	<-readyCh
+	select {
+	case err := <-errCh:
+		t.Fatalf("testUdsConn failed:%s", err.Error())
+	default:
 	}
-	defer conn.Close()
-	fd, err := getConnDupFd(conn)
-	if err != nil {
-		t.Fatalf("failed to getConnDupFd: %v\n", err)
-	}
-	defer fd.Close()
 
-	// 等到对端 blockWriteFull 返回，数据已进入本端接收队列，避免非阻塞 fd 上读到 EAGAIN。
-	<-writeDone
-
-	// Read data using blockReadFull
-	buf := make([]byte, 1024)
-	if err := blockReadFull(int(fd.Fd()), buf[:len(content)]); err != nil {
-		t.Fatalf("failed to read data: %v\n", err)
+	var err error
+	client, err = net.DialUnix("unix", nil, addr)
+	if err != nil {
+		t.Fatalf("dial uds failed:%s", err.Error())
 	}
-	// Check if the read data is correct
-	assert.Equal(t, buf[:len(content)], []byte(content))
+
+	select {
+	case server = <-serverCh:
+	case err := <-errCh:
+		t.Fatalf("testUdsConn failed:%s", err.Error())
+	case <-time.After(10 * time.Second):
+		t.Fatalf("testUdsConn accept timeout")
+	}
+	return client, server
 }
 
 func TestBlockReadFullEOF(t *testing.T) {

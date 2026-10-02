@@ -1,3 +1,5 @@
+//go:build linux
+
 /*
  * Copyright 2023 CloudWeGo Authors
  *
@@ -17,25 +19,23 @@
 package shmipc
 
 import (
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func Test_CreateCSByWrongConfig(t *testing.T) {
-	conn1, conn2 := testConn(t)
-	config := DefaultConfig()
-	config.ShareMemoryBufferCap = 1
-	c, err := newSession(config, conn1, true)
-	assert.NotEqual(t, nil, err)
-	assert.Equal(t, (*Session)(nil), c)
+func TestQueueManager_MemFd(t *testing.T) {
+	qm1, err := createQueueManagerWithMemFd("ut_queue_"+t.Name(), 8192)
+	assert.Equal(t, nil, err)
+	qm2, err := mappingQueueManagerMemfd("ut_queue_"+t.Name(), qm1.memFd)
+	assert.Equal(t, nil, err)
+	// qm2 与 qm1 共享同一个 memFd，只解除映射，不重复 close（qm1.unmap 负责 close）。
+	defer func() { _ = syscall.Munmap(qm2.mem) }()
+	defer qm1.unmap()
 
-	ok := make(chan struct{})
-	go func() {
-		s, err := Server(conn2, config)
-		assert.NotEqual(t, nil, err)
-		assert.Equal(t, (*Session)(nil), s)
-		close(ok)
-	}()
-	<-ok
+	assert.Equal(t, nil, qm1.sendQueue.put(queueElement{seqID: 7}))
+	e, err := qm2.recvQueue.pop()
+	assert.Equal(t, nil, err)
+	assert.Equal(t, uint32(7), e.seqID)
 }

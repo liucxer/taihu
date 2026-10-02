@@ -1,3 +1,5 @@
+//go:build linux
+
 /*
  * Copyright 2023 CloudWeGo Authors
  *
@@ -17,11 +19,8 @@
 package shmipc
 
 import (
-	"fmt"
 	"io"
 	"math/rand"
-	"net"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
@@ -32,64 +31,8 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// testConn / testUdsConn build a connected unix-socket pair. The socket file
-// lives under t.TempDir() so that concurrent test binaries never collide and
-// the file is removed by the testing framework.
-func testConn(t *testing.T) (*net.UnixConn, *net.UnixConn) {
-	t.Helper()
-	return testUdsConn(t)
-}
-
-func testUdsConn(t *testing.T) (client *net.UnixConn, server *net.UnixConn) {
-	t.Helper()
-
-	udsPath := filepath.Join(t.TempDir(), "shmipc.sock")
-	addr := &net.UnixAddr{Name: udsPath, Net: "unix"}
-
-	readyCh := make(chan struct{})
-	serverCh := make(chan *net.UnixConn, 1)
-	errCh := make(chan error, 1)
-
-	go func() {
-		ln, err := net.ListenUnix("unix", addr)
-		if err != nil {
-			errCh <- fmt.Errorf("create listener failed:%w", err)
-			close(readyCh)
-			return
-		}
-		close(readyCh)
-		s, err := ln.AcceptUnix()
-		_ = ln.Close()
-		if err != nil {
-			errCh <- fmt.Errorf("accept conn failed:%w", err)
-			return
-		}
-		serverCh <- s
-	}()
-
-	<-readyCh
-	select {
-	case err := <-errCh:
-		t.Fatalf("testUdsConn failed:%s", err.Error())
-	default:
-	}
-
-	var err error
-	client, err = net.DialUnix("unix", nil, addr)
-	if err != nil {
-		t.Fatalf("dial uds failed:%s", err.Error())
-	}
-
-	select {
-	case server = <-serverCh:
-	case err := <-errCh:
-		t.Fatalf("testUdsConn failed:%s", err.Error())
-	case <-time.After(10 * time.Second):
-		t.Fatalf("testUdsConn accept timeout")
-	}
-	return client, server
-}
-
+// testConf / testClientServerConfig create a real client/server session pair backed by
+// shared memory. Linux-only (shm/memfd/eventfd).
 func testConf() *Config {
 	conf := DefaultConfig()
 	conf.MemMapType = MemMapTypeMemFd

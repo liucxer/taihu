@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -48,21 +47,6 @@ func TestQueueManager_CreateMapping(t *testing.T) {
 	assert.Equal(t, nil, qm2.sendQueue.put(queueElement{}))
 	_, err = qm1.recvQueue.pop()
 	assert.Equal(t, nil, err)
-}
-
-func TestQueueManager_MemFd(t *testing.T) {
-	qm1, err := createQueueManagerWithMemFd("ut_queue_"+t.Name(), 8192)
-	assert.Equal(t, nil, err)
-	qm2, err := mappingQueueManagerMemfd("ut_queue_"+t.Name(), qm1.memFd)
-	assert.Equal(t, nil, err)
-	// qm2 与 qm1 共享同一个 memFd，只解除映射，不重复 close（qm1.unmap 负责 close）。
-	defer func() { _ = syscall.Munmap(qm2.mem) }()
-	defer qm1.unmap()
-
-	assert.Equal(t, nil, qm1.sendQueue.put(queueElement{seqID: 7}))
-	e, err := qm2.recvQueue.pop()
-	assert.Equal(t, nil, err)
-	assert.Equal(t, uint32(7), e.seqID)
 }
 
 func TestQueueOperate(t *testing.T) {
